@@ -5,5 +5,8 @@ cfgdir=$(dirname $mydir)
 
 for main in $(find $cfgdir/pgrapher -name '*wct-*.jsonnet') ; do
     echo $main
-    jsonnet -J $cfgdir $main > /dev/null
+    jsonnet -J $cfgdir $main > /dev/null || exit -1
 done
+
+
+    

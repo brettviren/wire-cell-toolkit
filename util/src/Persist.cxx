@@ -220,7 +220,9 @@ std::string WireCell::Persist::evaluate_jsonnet_text(const std::string& text,
 
 WireCell::Persist::Parser::Parser(const std::vector<std::string>& load_paths,
                                   const externalvars_t& extvar,
-                                  const externalvars_t& extcode)
+                                  const externalvars_t& extcode,
+                                  const externalvars_t& tlavar,
+                                  const externalvars_t& tlacode)
 {
     m_jsonnet.init();
 
@@ -245,6 +247,15 @@ WireCell::Persist::Parser::Parser(const std::vector<std::string>& load_paths,
     // external code
     for (auto& vv : extcode) {
         m_jsonnet.bindExtCodeVar(vv.first, vv.second);
+    }
+
+    // tla variables
+    for (auto& vv : tlavar) {
+        m_jsonnet.bindTlaVar(vv.first, vv.second);
+    }
+    // tla code
+    for (auto& vv : tlacode) {
+        m_jsonnet.bindTlaCodeVar(vv.first, vv.second);
     }
 }
             

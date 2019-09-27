@@ -1,2 +1,21 @@
+# cfg is not a normal WCT package so this file is more hacked up.
+
 bld.install_files('${PREFIX}/share/wirecell',
                   ['vector.jsonnet', 'wirecell.jsonnet'])
+
+
+for totest in bld.path.ant_glob('test/test*.jsonnet'):
+    bld(features="test_scripts",
+        ut_cwd   = bld.path, 
+        test_scripts_source = totest,
+        test_scripts_template = "pwd && jsonnet -J %s ${SCRIPT}" % bld.path)
+
+for totest in bld.path.ant_glob('test/test*.sh') + bld.path.ant_glob('test/test*.py'):
+    interp = "${BASH}"
+    if totest.abspath().endswith(".py"):
+        interp = "${PYTHON}"
+    #print 'Building %s test %s script: %s using %s' % (name, interp, test_script, test_use)
+    bld(features="test_scripts",
+        ut_cwd   = bld.path, 
+        test_scripts_source = totest,
+        test_scripts_template = "pwd && " + interp + " ${SCRIPT}")
