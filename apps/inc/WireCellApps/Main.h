@@ -58,6 +58,13 @@ namespace WireCell {
         /// files (via std.extVar())
         void add_code(const std::string& name, const std::string& value);
 
+        /// Bind a Top-Level argument variable to a string value.
+        void add_tlavar(const std::string& name, const std::string& value);
+
+        /// Bind a Top-Level argument variable to a code value.
+        void add_tlacode(const std::string& name, const std::string& value);
+
+
         /// Add an element to the configuration path in which
         /// configuration files may be found.
         void add_path(const std::string& dirname);
@@ -88,7 +95,7 @@ namespace WireCell {
     private:
         ConfigManager m_cfgmgr;
         std::vector<std::string> m_plugins, m_apps, m_cfgfiles, m_load_path;
-        Persist::externalvars_t m_extvars, m_extcode;
+        Persist::externalvars_t m_extvars, m_extcode, m_tlavars, m_tlacode;
         Log::logptr_t l;
 
     };

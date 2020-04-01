@@ -60,6 +60,8 @@ int Main::cmdline(int argc, char* argv[])
 //	("jsonpath,j", po::value< vector<string> >(),"specify a JSON path=value")
 	("ext-str,V", po::value< vector<string> >(),"specify a Jsonnet external variable=value")
 	("ext-code,C", po::value< vector<string> >(),"specify a Jsonnet external variable=code")
+	("tla-str", po::value< vector<string> >(),"specify a Jsonnet top level argument variable=value")
+	("tla-code", po::value< vector<string> >(),"specify a Jsonnet top level argument variable=code")
 	("path,P", po::value< vector<string> >(),"add to JSON/Jsonnet search path")
     ;    
 
@@ -98,6 +100,21 @@ int Main::cmdline(int argc, char* argv[])
             add_code(vv[0], vv[1]);
         }
     }
+    // Get any TLA variables
+    if (opts.count("tla-str")) {
+        for (auto vev : opts["tla-str"].as< vector<string> >()) {
+            auto vv = String::split(vev, "=");
+            add_tlavar(vv[0], vv[1]);
+        }
+    }
+    // And any TLA code
+    if (opts.count("tla-code")) {
+        for (auto vev : opts["tla-code"].as< vector<string> >()) {
+            auto vv = String::split(vev, "=");
+            add_tlacode(vv[0], vv[1]);
+        }
+    }
+
     // fixme: these aren't yet supported.
     // if (opts.count("jsonpath")) { 
     //     jsonpath_vars = opts["jsonpath"].as< vector<string> >();
@@ -187,6 +204,16 @@ void Main::add_code(const std::string& name, const std::string& value)
     m_extcode[name] = value;
 }
 
+void Main::add_tlavar(const std::string& name, const std::string& value)
+{
+    m_tlavars[name] = value;
+}
+
+void Main::add_tlacode(const std::string& name, const std::string& value)
+{
+    m_tlacode[name] = value;
+}
+
 void Main::add_path(const std::string& dirname)
 {
     m_load_path.push_back(dirname);
@@ -197,7 +224,7 @@ void Main::initialize()
 {
     for (auto filename : m_cfgfiles) {
         l->info("loading config file {} ...", filename);
-        Persist::Parser p(m_load_path, m_extvars, m_extcode);
+        Persist::Parser p(m_load_path, m_extvars, m_extcode, m_tlavars, m_tlacode);
         Json::Value one = p.load(filename); // throws
         m_cfgmgr.extend(one);
         l->info("...done");

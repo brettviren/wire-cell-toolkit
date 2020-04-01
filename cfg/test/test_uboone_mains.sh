@@ -3,9 +3,12 @@
 testdir=$(dirname $(readlink -f $BASH_SOURCE))
 topdir=$(dirname $testdir)
 
+ubdir=$topdir/pgrapher/experiment/uboone
+
 failed=""
-for try in $topdir/pgrapher/experiment/uboone/{wct,wcls}-*.jsonnet
+for thing in wcls-sim-drift wcls-sim-drift-simchannel wcls-sim wcls-sim-nf-sp
 do
+    try="$ubdir/${thing}.jsonnet"
     echo $try
     time jsonnet -J $topdir $try >/dev/null
     if [ "$?" != "0" ] ; then

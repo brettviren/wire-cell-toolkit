@@ -50,3 +50,4 @@ clusters-*.json
 *.zip
 data
 calgrind.*
+callgrind.out*
