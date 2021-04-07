@@ -43,7 +43,6 @@ namespace WireCell {
             const Waveform::realseq_t& waveform() const { return m_waveform; };
             int waveform_pad() const { return m_waveform_pad; };
 
-            const Waveform::compseq_t& long_aux_spectrum();
             const Waveform::realseq_t& long_aux_waveform() const { return m_long_waveform; };
             int long_aux_waveform_pad() const { return m_long_waveform_pad; };
 
@@ -99,6 +98,7 @@ namespace WireCell {
             typedef std::vector<region_indices_t> wire_region_indicies_t;
             const wire_region_indicies_t& bywire_map() const { return m_bywire; }
             std::pair<int, int> closest_wire_impact(double relpitch) const;
+            const std::vector<IImpactResponse::pointer>& irs() const { return m_ir; }
 
            private:
             std::string m_frname;
