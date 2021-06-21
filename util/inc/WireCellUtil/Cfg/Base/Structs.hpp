@@ -2,15 +2,15 @@
  * This file is 100% generated.  Any manual edits will likely be lost.
  *
  * This contains struct and other type definitions for shema in 
- * namespace WireCellUtil::Cfg.
+ * namespace WireCellUtil::Cfg::Base.
  */
-#ifndef WIRECELLUTIL_CFG_STRUCTS_HPP
-#define WIRECELLUTIL_CFG_STRUCTS_HPP
+#ifndef WIRECELLUTIL_CFG_BASE_STRUCTS_HPP
+#define WIRECELLUTIL_CFG_BASE_STRUCTS_HPP
 
 #include <cstdint>
 
 
-namespace WireCellUtil::Cfg {
+namespace WireCellUtil::Cfg::Base {
 
     // @brief A spacial distance
     using Distance = double;
@@ -47,6 +47,6 @@ namespace WireCellUtil::Cfg {
     using Time = double;
 
 
-} // namespace WireCellUtil::Cfg
+} // namespace WireCellUtil::Cfg::Base
 
-#endif // WIRECELLUTIL_CFG_STRUCTS_HPP
+#endif // WIRECELLUTIL_CFG_BASE_STRUCTS_HPP

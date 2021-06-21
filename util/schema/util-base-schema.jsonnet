@@ -1,6 +1,6 @@
 local wcc = import "cfgschema.jsonnet";
 
-local f = wcc("Util");
+local f = wcc("Util", "Base");
 local s = f.schema;
 
 local hier = {

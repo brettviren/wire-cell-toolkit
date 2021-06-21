@@ -7,15 +7,17 @@
 
 export MOO_LOAD_PATH=$HOME/dev/moo/examples/jsoncpp:$HOME/dev/wct/cfg
 
-
 set -x
-for Pkg in Util Gen
-do
-    pkg="${Pkg,,}"
-    in="$pkg/schema/${pkg}-schema.jsonnet"
+do_one () {
+    local Pkg=$1; shift
+    local Comp=$1; shift
+    
+    local pkg="${Pkg,,}"
+    local comp="${Comp,,}"
+    in="$pkg/schema/${pkg}-${comp}-schema.jsonnet"
 
-    fpath="WireCell${Pkg}/Cfg"
-    dpath="WireCell${Pkg}.Cfg"
+    fpath="WireCell${Pkg}/Cfg/${Comp}"
+    dpath="WireCell${Pkg}.Cfg.${Comp}"
     outdir="$pkg/inc/$fpath"
     mkdir -p "$outdir"
 
@@ -34,4 +36,8 @@ do
         -A os="$in" \
         render omodel.jsonnet onljs.hpp.j2 \
         > $outdir/Nljs.hpp
-done
+}
+
+
+do_one Util Base
+do_one Gen TrackDepos

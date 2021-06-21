@@ -1,5 +1,15 @@
 local wc = import "wirecell.jsonnet";
-function(s, t) {
+local moo = import "moo.jsonnet";
+
+// We will use util types
+local util_seq = import "util-base-schema.jsonnet";
+local t = moo.oschema.hier(util_seq).WireCellUtil.Cfg.Base;
+
+local wcc = import "cfgschema.jsonnet";
+local f = wcc("Gen","TrackDepos");
+local s = f.schema;
+
+local hier = {
     charge: s.number("Charge", "f8",
                      doc="Amount of charge per some unit"),
 
@@ -14,7 +24,7 @@ function(s, t) {
     tracks: s.sequence("Tracks", self.track,
                        doc="A sequence of tracks"),
 
-    cfg: s.record("TrackDepos", [
+    cfg: s.record("Config", [
         s.field("step_size", t.Distance, 1.0*wc.mm,
                 doc="Distance along track between two neighboring depos."),
         s.field("clight", t.Normalized, 1.0,
@@ -24,4 +34,5 @@ function(s, t) {
         s.field("tracks", self.tracks,
                 doc="Description of tracks on which to generate depos.")
     ], "Configuration for TrackDepos component")
-}
+};
+util_seq + f.build(hier)

@@ -11,12 +11,12 @@ name and the component class name.
 local moo = import "moo.jsonnet";
 
 // the main output object:
-function (pkg) {
+function (pkg, comp) {
 
-    // Set path convention.  This reflects in things outside of
-    // codegen control so do not change it unless you really know what
-    // you are getting into.
-    path: ["WireCell"+pkg, "Cfg"],
+    // Set path convention incorporating package and component names.
+    // This reflects in things outside of codegen control so do not
+    // change it unless you really know what you are getting into.
+    path: ["WireCell"+pkg, "Cfg", comp],
 
     // A schema factory used to make types "in" a package
     // namespace.  Use this in a "working object" context to
