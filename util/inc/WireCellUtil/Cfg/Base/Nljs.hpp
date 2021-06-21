@@ -2,18 +2,18 @@
  * This file is 100% generated.  Any manual edits will likely be lost.
  *
  * This contains functions struct and other type definitions for shema in 
- * namespace WireCellUtil::Cfg to be serialized via nlohmann::json.
+ * namespace WireCellUtil::Cfg::Base to be serialized via nlohmann::json.
  */
-#ifndef WIRECELLUTIL_CFG_NLJS_HPP
-#define WIRECELLUTIL_CFG_NLJS_HPP
+#ifndef WIRECELLUTIL_CFG_BASE_NLJS_HPP
+#define WIRECELLUTIL_CFG_BASE_NLJS_HPP
 
 // My structs
-#include "WireCellUtil/Cfg/Structs.hpp"
+#include "WireCellUtil/Cfg/Base/Structs.hpp"
 
 
 #include <nlohmann/json.hpp>
 
-namespace WireCellUtil::Cfg {
+namespace WireCellUtil::Cfg::Base {
 
     using data_t = nlohmann::json;
     
@@ -44,6 +44,6 @@ namespace WireCellUtil::Cfg {
             j.at("head").get_to(obj.head);    
     }
     
-} // namespace WireCellUtil::Cfg
+} // namespace WireCellUtil::Cfg::Base
 
-#endif // WIRECELLUTIL_CFG_NLJS_HPP
+#endif // WIRECELLUTIL_CFG_BASE_NLJS_HPP

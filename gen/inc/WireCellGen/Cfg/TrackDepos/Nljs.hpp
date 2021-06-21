@@ -2,20 +2,20 @@
  * This file is 100% generated.  Any manual edits will likely be lost.
  *
  * This contains functions struct and other type definitions for shema in 
- * namespace WireCellGen::Cfg to be serialized via nlohmann::json.
+ * namespace WireCellGen::Cfg::TrackDepos to be serialized via nlohmann::json.
  */
-#ifndef WIRECELLGEN_CFG_NLJS_HPP
-#define WIRECELLGEN_CFG_NLJS_HPP
+#ifndef WIRECELLGEN_CFG_TRACKDEPOS_NLJS_HPP
+#define WIRECELLGEN_CFG_TRACKDEPOS_NLJS_HPP
 
 // My structs
-#include "WireCellGen/Cfg/Structs.hpp"
+#include "WireCellGen/Cfg/TrackDepos/Structs.hpp"
 
 // Nljs for externally referenced schema
-#include "WireCellUtil/Cfg/Nljs.hpp"
+#include "WireCellUtil/Cfg/Base/Nljs.hpp"
 
 #include <nlohmann/json.hpp>
 
-namespace WireCellGen::Cfg {
+namespace WireCellGen::Cfg::TrackDepos {
 
     using data_t = nlohmann::json;
     
@@ -34,14 +34,14 @@ namespace WireCellGen::Cfg {
             j.at("ray").get_to(obj.ray);    
     }
     
-    inline void to_json(data_t& j, const TrackDepos& obj) {
+    inline void to_json(data_t& j, const Config& obj) {
         j["step_size"] = obj.step_size;
         j["clight"] = obj.clight;
         j["group_time"] = obj.group_time;
         j["tracks"] = obj.tracks;
     }
     
-    inline void from_json(const data_t& j, TrackDepos& obj) {
+    inline void from_json(const data_t& j, Config& obj) {
         if (j.contains("step_size"))
             j.at("step_size").get_to(obj.step_size);    
         if (j.contains("clight"))
@@ -52,6 +52,6 @@ namespace WireCellGen::Cfg {
             j.at("tracks").get_to(obj.tracks);    
     }
     
-} // namespace WireCellGen::Cfg
+} // namespace WireCellGen::Cfg::TrackDepos
 
-#endif // WIRECELLGEN_CFG_NLJS_HPP
+#endif // WIRECELLGEN_CFG_TRACKDEPOS_NLJS_HPP
