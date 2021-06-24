@@ -34,7 +34,7 @@ namespace WireCellGen::Cfg::TrackDepos {
     // @brief A sequence of tracks
     using Tracks = std::vector<WireCellGen::Cfg::TrackDepos::Track>;
 
-    // @brief 
+    // @brief Configuration for TrackDepos component
     struct Config {
 
         // @brief Distance along track between two neighboring depos.
