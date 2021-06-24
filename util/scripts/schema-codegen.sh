@@ -21,21 +21,36 @@ do_one () {
     outdir="$pkg/inc/$fpath"
     mkdir -p "$outdir"
 
+    local out="$outdir/Structs.hpp"
+    echo "Generating $out"
     moo -g '/lang:ocpp.jsonnet' \
         -M $HOME/dev/wct/cfg \
         -M $HOME/dev/wct/util/schema \
         -A path="$dpath" \
         -A os="$in" \
         render omodel.jsonnet ostructs.hpp.j2 \
-        > $outdir/Structs.hpp
+        > $out
 
+    out="$outdir/Nljs.hpp"
+    echo "Generating $out"
     moo -g '/lang:ocpp.jsonnet' \
         -M $HOME/dev/wct/cfg \
         -M $HOME/dev/wct/util/schema \
         -A path="$dpath" \
         -A os="$in" \
         render omodel.jsonnet onljs.hpp.j2 \
-        > $outdir/Nljs.hpp
+        > $out
+
+    out="$pkg/schema/WireCell${Pkg}_Cfg_${Comp}.jsonnet"
+    echo "Generating $out"
+    moo \
+        -T $HOME/dev/wct/util/schema \
+        -M $HOME/dev/wct/cfg \
+        -M $HOME/dev/wct/util/schema \
+        -A path="$dpath" \
+        -A os="$in" \
+        render omodel.jsonnet wct-cfg-ctor.jsonnet.j2 \
+        > $out
 }
 
 

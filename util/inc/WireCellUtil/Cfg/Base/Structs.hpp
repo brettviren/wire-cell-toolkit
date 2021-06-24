@@ -9,12 +9,20 @@
 
 #include <cstdint>
 
+#include <string>
 
 namespace WireCellUtil::Cfg::Base {
+
+    // @brief A simple counting number
+    using Count = int32_t;
+
 
     // @brief A spacial distance
     using Distance = double;
 
+
+    // @brief A code-friendly identifier
+    using Ident = std::string;
 
     // @brief A real number in [0,1]
     using Normalized = double;

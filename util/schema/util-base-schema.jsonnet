@@ -1,9 +1,16 @@
 local wcc = import "cfgschema.jsonnet";
 
+local moo = import "moo.jsonnet";
 local f = wcc("Util", "Base");
 local s = f.schema;
 
 local hier = {
+    ident: s.string("Ident", pattern=moo.re.ident_only,
+                    doc="A code-friendly identifier"),
+
+    count: s.number("Count", "i4",
+                    doc="A simple counting number"),
+
     distance: s.number("Distance", "f8",
                        doc="A spacial distance"),
     time: s.number("Time", "f8",

@@ -166,7 +166,7 @@ WireCell<Pkg>.Cfg.<Component>.[...]
 ** Create helpers
 
 WCT support provides a Jsonnet function to provide some helper
-functionswhich we do as:
+functions which we do as:
 
 #+begin_src jsonnet
 local wcc = import "cfgschema.jsonnet";
@@ -371,6 +371,72 @@ void Gen::TrackDepos::configure(const Configuration& cfg)
 
 - Use ~m_cfg.<param>~ directly where you may previously have used a
   "loose" ~m_<param>~.
+
+
+* Configuration objects
+
+We may use the schema to facilitate creating configuration objects
+following a /valid by construction/ pattern.  To do this we use a ~moo~
+feature to generate Jsonnet functions which can construct an instance
+of a type described by ~moo~ schema.  Details are found at
+https://brettviren.github.io/moo/examples/jsonnet/
+
+As discussed there, mapping schema namespace path to file system path
+locating Jsonnet files is not (yet) generally well handled.  It
+requires matching patterns inside the templates to whatever outside
+file system layouts are desired by the project.  To bake in WCT's
+patterns we copy the ~moo~ templates locally:
+
+- [[file:wct-cfg-ctor-macros.jsonnet]] holds Jinja macros for rendering each moo schema class into a coresponding constructor function
+- [[file:wct-cfg-ctor.jsonnet]] holds the main file template which iterates over the schema sequence
+
+We have added to the ~schema-codegen.sh~ script a call to ~moo~ to render
+each schema into these constructor function files.
+
+In [[file:../../gen/schema/test-trackdepos.jsonnet]] is an example main
+WCT configuration file that defines the ~TrackDepos~ configuration using
+the generated constructor functions.  Importing the generated files
+illustrates the chosen naming convention for mapping the schema paths:
+
+#+begin_src jsonnet
+local ucb = import "WireCellUtil_Cfg_Base.jsonnet";
+local b = ucb.WireCellUtil.Cfg.Base;
+local gtd = import "WireCellGen_Cfg_TrackDepos.jsonnet";
+local td = gtd.WireCellGen.Cfg.TrackDepos;
+#+end_src
+
+The schema paths are also reflected in where in the Jsonnet data
+structure the constructor functions are located.
+
+We'll use the constructors to build up the track list from rays of
+points: 
+
+#+begin_src jsonnet
+local stubby = b.Ray(tail=wc.point(1000.0, 3.0, 100.0, wc.mm),
+                    head=wc.point(1100.0, 3.0, 200.0, wc.mm));
+local tracklist = [
+    td.Track(time=1*wc.ms, charge=-5000, ray=stubby),
+];
+#+end_src
+
+And, finally a "pnode" with the ~TrackDepos~ configuration object.
+
+#+begin_src jsonnet
+local depos = g.pnode({
+    type: 'TrackDepos',
+    data: td.Config(tracks=tracklist),
+}, nin=0, nout=1);
+#+end_src
+
+The rest of the test file is constructed in the usual (old) way.
+
+Testing:
+
+#+begin_example
+❯ jsonnet -J cfg -J util/schema gen/schema/test-trackdepos.jsonnet
+❯ wcsonnet -P cfg -P util/schema  gen/schema/test-trackdepos.jsonnet
+❯ wire-cell -P cfg -P util/schema -c gen/schema/test-trackdepos.jsonnet
+#+end_example
 
 
 * Committing changes to repo
