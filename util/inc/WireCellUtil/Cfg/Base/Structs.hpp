@@ -9,6 +9,7 @@
 
 #include <cstdint>
 
+#include <vector>
 #include <string>
 
 namespace WireCellUtil::Cfg::Base {
@@ -20,6 +21,9 @@ namespace WireCellUtil::Cfg::Base {
     // @brief A spacial distance
     using Distance = double;
 
+
+    // @brief A general boolean flag
+    using Flag = bool;
 
     // @brief A code-friendly identifier
     using Ident = std::string;
@@ -51,9 +55,23 @@ namespace WireCellUtil::Cfg::Base {
         Point head = {};
     };
 
+    // @brief A speed in units distance per time
+    using Speed = double;
+
+
+    // @brief A sampling period
+    using Tick = double;
+
+
     // @brief A temporal duration
     using Time = double;
 
+
+    // @brief A component type name identifier
+    using TypeName = std::string;
+
+    // @brief A sequence of component type name identifiers
+    using TypeNames = std::vector<WireCellUtil::Cfg::Base::TypeName>;
 
 } // namespace WireCellUtil::Cfg::Base
 

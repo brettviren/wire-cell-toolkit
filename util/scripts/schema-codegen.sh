@@ -56,3 +56,4 @@ do_one () {
 
 do_one Util Base
 do_one Gen TrackDepos
+do_one Gen Ductor

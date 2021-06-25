@@ -54,6 +54,31 @@ void Gen::TrackDepos::configure(const Configuration& cfg)
     for (auto& track : m_cfg.tracks) {
         add_track(track.time, ray2ray(track.ray), track.charge);
     }
+
+    apply_grouping();
+}
+
+void Gen::TrackDepos::apply_grouping()
+{
+    if (m_depos.empty() or m_cfg.group_time <= 0.0) {
+        m_depos.push_back(nullptr);
+        return;
+    }
+    std::deque<WireCell::IDepo::pointer> grouped;
+    double now = m_depos.front()->time();
+    double end = now + m_cfg.group_time;
+    for (auto depo : m_depos) {
+        if (depo->time() < end) {
+            grouped.push_back(depo);
+            continue;
+        }
+        grouped.push_back(nullptr);
+        now = depo->time();
+        end = now + m_cfg.group_time;
+        grouped.push_back(depo);
+    }
+    grouped.push_back(nullptr);
+    m_depos = grouped;
 }
 
 static std::string dump(IDepo::pointer d)
@@ -68,6 +93,8 @@ void Gen::TrackDepos::add_track(double time, WireCell::Ray ray, double charge)
 {
     log->debug("add_track({} us, ({} -> {})cm, {})", time / units::us, ray.first / units::cm, ray.second / units::cm,
              charge);
+    // store this only to facilitate unit tests
+    m_tracks.emplace_back(time, ray, charge);
 
     const WireCell::Vector dir = WireCell::ray_unit(ray);
     const double length = WireCell::ray_length(ray);
@@ -93,6 +120,7 @@ void Gen::TrackDepos::add_track(double time, WireCell::Ray ray, double charge)
 
     // earliest first
     std::sort(m_depos.begin(), m_depos.end(), ascending_time);
+
     log->debug("depos: {} over {}mm", m_depos.size(), length / units::mm);
 
     // n.b. weirdly for a long time this handling of group time was in
@@ -134,4 +162,8 @@ bool Gen::TrackDepos::operator()(output_pointer& out)
     return true;
 }
 
-//WireCell::IDepo::vector Gen::TrackDepos::depos() { return WireCell::IDepo::vector(m_depos.begin(), m_depos.end()); }
+WireCell::IDepo::vector Gen::TrackDepos::depos() {
+    return WireCell::IDepo::vector(m_depos.begin(), m_depos.end());
+}
+
+

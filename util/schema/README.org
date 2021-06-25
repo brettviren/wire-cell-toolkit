@@ -224,21 +224,20 @@ Here,
 - we make a /sequence/ of ~Track~ type called ~Tracks~
 
 The example goes on to create the "main" configuration object which we
-will by convention always call ~Config~.  This convention is not
-critical but it helps to identify the resulting type when used later
-in hand-written C++.
+will by convention always call ~Config~.  This convention is 
+enforced by ~component()~:
 
 #+begin_src jsonnet
-  cfg: s.record("Config", [
-            s.field("step_size", t.Distance, 1.0*wc.mm,
-                doc="Distance along track between two neighboring depos."),
-        s.field("clight", t.Normalized, 1.0,
-                doc="Fraction of speed of light at which track progresses"),
-        s.field("group_time", t.Time, -1,
-                doc="If positive, chunk the depos into groups spaning this amount of time with an EOS delimiting each group.  O.w. all depos are sent out as a stream."),
-        s.field("tracks", self.tracks,
-                doc="Description of tracks on which to generate depos.")
-    ], "Configuration for TrackDepos component")
+  cfg: s.component([
+      s.field("step_size", t.Distance, 1.0*wc.mm,
+              doc="Distance along track between two neighboring depos."),
+      s.field("clight", t.Normalized, 1.0,
+              doc="Fraction of speed of light at which track progresses"),
+      s.field("group_time", t.Time, -1,
+              doc="If positive, chunk the depos into groups spaning this amount of time with an EOS delimiting each group.  O.w. all depos are sent out as a stream."),
+      s.field("tracks", self.tracks,
+              doc="Description of tracks on which to generate depos.")
+  ], "Configuration for TrackDepos component")
 #+end_src
 
 As a touchstone, it may be helpful to know that one artifact finally
@@ -267,6 +266,15 @@ things need to be understood.
    used.
 2) the output of ~f.build(hier)~ is appended.  This will convert the
    values of the "working object" into a sequence in the proper order.
+3) if the schema does not require defining novel types besides the
+   component then a "working object" is not required and the
+   post-processing part of the file may be simplified:
+
+#+begin_src jsonnet
+util_seq + [s.component([...fields...], doc="...")]
+#+end_src   
+
+
 
 * Testing a schema
 
@@ -315,6 +323,15 @@ here, we say a few points
 If all goes well you will see a C++ header file printed to stdout.
 
 * Refactoring the component
+
+#+begin_caution
+Number one rule: resist the temptation to change any code except that
+which pertains to internal storage of configuration information.
+
+Number two rule: do not change the existing set of parameters, their
+names nor their types from what is expected by old (non-schema)
+configuration files.
+#+end_caution
 
 In general, the details of the "best" refactoring is left to the
 developer but some guidelines will help.  Refer to ~TrackDepos.h~ and
@@ -371,6 +388,70 @@ void Gen::TrackDepos::configure(const Configuration& cfg)
 
 - Use ~m_cfg.<param>~ directly where you may previously have used a
   "loose" ~m_<param>~.
+
+More detailed suggested steps follow.
+
+** Defining the schema
+
+
+1. Create ~<pkg>-<component>-schema.jsonnet~ file.
+2. Copy-paste initial ~local import~ boiler plate lines from an existing file.
+   - likely need ~wirecell.jsonnet~, ~util-base-schema.jsonnet~ and ~cfgschema.jsonent~
+3. start ~local hier = { cfg: s.component([ ... ]) };~ block.
+4. In ~...~ copy-paste the body of the C++ component ~default_configuration()~ method
+5. Edit line by line to convert each setting to ~s.field()~.
+   - Preserve the name of the config parameter (not any data member name)
+   - Preserve any literal default value set in the original C++.
+6. Go though each initialization of a data member in the C++ constructor and assure its default is transferred to the ~default=~ argument to ~s.field()~.  
+7. Go through each data member definition in class definition ~.h~ file and assure the *type* is transferred to the ~s.field()~ line.
+8. Go through the *body* of the component class to find any parameters are accessed from the JSON object which are not initialized in ~default_configuration()~.  There are several components that follow this pattern.
+9. Test basic Jsonnet comm piling (see below)
+10. Add ~do_one~ line to ~schema-codegen.sh~
+
+#+begin_info
+When setting default values in schema with literal numbers always use the units provided by ~wirecell.jsonnet~.
+#+end_info
+
+#+begin_tip
+As done for the initial definition of the ~s.field()~ list, it is helpful to copy-paste the body of ~configure()~, the "loose" config related class members from ~.h~ and any initialization from the constructor temporarily into the Jsonnet file.  As information from each line of pasted C++ is translated to Jsonnet, delete it.
+#+end_tip
+
+For basic Jsonnet compiling test run something like:
+
+#+begin_example
+❯ moo -M cfg -M util/schema compile gen/schema/<pkg>-<component>-schema.jsonnet
+#+end_example
+
+This essentially runs the Jsonnet compiler with some additional
+built-in ~import~ search paths.
+
+** Factoring the C++ component
+
+In ~.h~:
+
+1. Delete all "loose" data members holding configuration parameter from component class definition.
+   - Some data members may be derived from config parameters.  Leave them in as-is.
+2. Add a new ~m_cfg~ which is of type of the generated configuration struct
+3. Add ~#include "WireCell<Pkg>/Cfg/<Component>/Structs.hpp"~
+
+
+In ~.cxx~:   
+
+1. Add code shown below near top
+2. Forward any configuration default settings passed by constructor to setting attributes of ~m_cfg~
+3. Delete body of ~default_configuration()~ and replace it with boilerplate that converts ~m_cfg~ to JSON object
+   - leave any code unrelated to constructing default as-is
+4. Delete body of ~configure()~ and replace it with boilerplate to set ~m_cfg~ from JSON object.
+   - leave any code unrelated to setting config as-is
+   - if any "loose" data members are derived from configuration params, set them here via the just refreshed ~m_cfg~ attributes.
+5. Go through the body of ~operator()~ and any other methods and replace any use of old "loose" data members holding config parameter values with ~m_cfg.<param>~
+
+#+begin_src c++
+#include "WireCellUtil/nljs2jcpp.hpp" // remove when ditch JsonCPP
+#include "WireCell<Pkg>/Cfg/<Component>/Nljs.hpp"~
+using nljs_t = WireCell<Pkg>::Cfg::<Component>::data_t;
+#+end_src
+
 
 
 * Configuration objects
