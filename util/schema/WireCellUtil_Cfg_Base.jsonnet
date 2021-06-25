@@ -18,6 +18,10 @@
     // A spacial distance
     Distance(val) :: assert(std.type(val)=='number'); val,
 
+    // Construct Flag (boolean)
+    // A general boolean flag
+    Flag(val) :: assert(std.type(val)=='boolean');assert(val == true || val == false) val,
+
     // Construct Ident (string)
     // A code-friendly identifier
     Ident(val) :: assert(std.type(val)=='string'); val,
@@ -47,9 +51,25 @@
         },
     }.res,
 
+    // Construct Speed (number)
+    // A speed in units distance per time
+    Speed(val) :: assert(std.type(val)=='number'); val,
+
+    // Construct Tick (number)
+    // A sampling period
+    Tick(val) :: assert(std.type(val)=='number'); val,
+
     // Construct Time (number)
     // A temporal duration
     Time(val) :: assert(std.type(val)=='number'); val,
+
+    // Construct TypeName (string)
+    // A component type name identifier
+    TypeName(val) :: assert(std.type(val)=='string'); val,
+
+    // Construct TypeNames (sequence)
+    // A sequence of component type name identifiers
+    TypeNames(val) :: assert(std.type(val)=='array'); [$.WireCellUtil.Cfg.Base.TypeName(v) for v in val],
 
      }  }  } 
 }

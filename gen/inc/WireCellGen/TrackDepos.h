@@ -30,8 +30,17 @@ namespace WireCell {
             /// ISourceNode
             virtual bool operator()(IDepo::pointer& out);
 
+          public:
+            // Expose for use by unit tests
+            WireCell::IDepo::vector depos();
+            void add_track(double time, WireCell::Ray ray, double dedx = -1.0);
+            using track_t = std::tuple<double, Ray, double>;
+            std::vector<track_t> tracks() const { return m_tracks; }
+
           private:
-            using track_t = WireCellGen::Cfg::TrackDepos::Track;
+
+            void apply_grouping();
+
             using config_t = WireCellGen::Cfg::TrackDepos::Config;
             config_t m_cfg;
 
@@ -41,8 +50,6 @@ namespace WireCell {
             std::vector<track_t> m_tracks; // keep to enable testing
             std::deque<WireCell::IDepo::pointer> m_depos;
 
-            // WireCell::IDepo::vector depos();
-            void add_track(double time, WireCell::Ray ray, double dedx = -1.0);
         };
 
     }  // namespace Gen
