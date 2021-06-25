@@ -12,6 +12,8 @@
 #include "WireCellAux/Logger.h"
 #include <unordered_map>
 
+#include "WireCellGen/Cfg/AnodePlane/Structs.hpp"
+
 namespace WireCell {
     namespace Gen {
 
@@ -26,7 +28,7 @@ namespace WireCell {
             virtual WireCell::Configuration default_configuration() const;
 
             /// IAnodePlane interface
-            virtual int ident() const { return m_ident; }
+            virtual int ident() const { return m_cfg.ident; }
             virtual int nfaces() const { return m_faces.size(); }
             virtual IAnodeFace::pointer face(int ident) const;
             virtual IAnodeFace::vector faces() const { return m_faces; }
@@ -35,8 +37,10 @@ namespace WireCell {
             virtual IChannel::pointer channel(int chident) const;
             virtual IWire::vector wires(int channel) const;
 
-           private:
-            int m_ident;
+        private:
+            using config_t = WireCellGen::Cfg::AnodePlane::Config;
+            config_t m_cfg;
+
             IAnodeFace::vector m_faces;
 
             std::unordered_map<int, int> m_c2wpid;

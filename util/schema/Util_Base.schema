@@ -1,3 +1,4 @@
+// -*- jsonnet -*- 
 local wcc = import "cfgschema.jsonnet";
 
 local moo = import "moo.jsonnet";
@@ -16,6 +17,7 @@ local hier = {
 
     tn: s.string("TypeName", pattern=tnre,
                  doc="A component type name identifier"),
+
     tns: s.sequence("TypeNames", self.tn,
                     doc="A sequence of component type name identifiers"),
 

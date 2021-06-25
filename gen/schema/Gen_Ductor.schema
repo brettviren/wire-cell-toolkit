@@ -1,6 +1,7 @@
+// -*- jsonnet -*-
 local moo = import "moo.jsonnet";
 local wc = import "wirecell.jsonnet";
-local util_seq = import "util-base-schema.jsonnet";
+local util_seq = import "Util_Base.schema";
 local t = moo.oschema.hier(util_seq).WireCellUtil.Cfg.Base;
 
 local wcc = import "cfgschema.jsonnet";
