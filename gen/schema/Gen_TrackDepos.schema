@@ -11,13 +11,11 @@ local f = wcc("Gen","TrackDepos");
 local s = f.schema;
 
 local hier = {
-    charge: s.number("Charge", "f8",
-                     doc="Amount of charge per some unit"),
 
     track: s.record("Track", [
         s.field("time", t.Time, 0.0,
                 doc="Absolute time at the start of the track"),
-        s.field("charge", self.charge, -1.0,
+        s.field("charge", t.Charge, -1.0,
                 doc="If negative, number of electrons per depo, else electrons per track"),
         s.field("ray", t.Ray,
                 doc="The ray defining the track endpoints"),

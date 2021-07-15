@@ -14,6 +14,10 @@
 
 namespace WireCellUtil::Cfg::Base {
 
+    // @brief Amount of charge per some unit
+    using Charge = double;
+
+
     // @brief A simple counting number
     using Count = int32_t;
 
@@ -21,6 +25,12 @@ namespace WireCellUtil::Cfg::Base {
     // @brief A spacial distance
     using Distance = double;
 
+
+    // @brief Something resembling a file system tree path name
+    using Filename = std::string;
+
+    // @brief A filename with NPZ extension
+    using FilenameNPZ = std::string;
 
     // @brief A general boolean flag
     using Flag = bool;
@@ -55,9 +65,19 @@ namespace WireCellUtil::Cfg::Base {
         Point head = {};
     };
 
+    // @brief A multiplicative scaling factor
+    using Scaling = double;
+
+
     // @brief A speed in units distance per time
     using Speed = double;
 
+
+    // @brief A simple identifying tag associated with some data
+    using Tag = std::string;
+
+    // @brief A sequence of tags
+    using Tags = std::vector<WireCellUtil::Cfg::Base::Tag>;
 
     // @brief A sampling period
     using Tick = double;

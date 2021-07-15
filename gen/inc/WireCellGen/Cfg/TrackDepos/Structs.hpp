@@ -14,10 +14,6 @@
 
 namespace WireCellGen::Cfg::TrackDepos {
 
-    // @brief Amount of charge per some unit
-    using Charge = double;
-
-
     // @brief 
     struct Track {
 
@@ -25,7 +21,7 @@ namespace WireCellGen::Cfg::TrackDepos {
         WireCellUtil::Cfg::Base::Time time = 0.0;
 
         // @brief If negative, number of electrons per depo, else electrons per track
-        Charge charge = -1.0;
+        WireCellUtil::Cfg::Base::Charge charge = -1.0;
 
         // @brief The ray defining the track endpoints
         WireCellUtil::Cfg::Base::Ray ray = {};

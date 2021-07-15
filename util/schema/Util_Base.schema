@@ -1,3 +1,11 @@
+/* Hand-written base schema
+ * 
+ * Before making a novel type local to a component schema, consider
+ * using one from here and if none fit consider if the nove type is
+ * general enough that it should be added.  Note, types are novel
+ * based on the semantic meaning and not their underlying type.
+ */
+
 // -*- jsonnet -*- 
 local wcc = import "cfgschema.jsonnet";
 
@@ -24,6 +32,9 @@ local hier = {
     count: s.number("Count", "i4",
                     doc="A simple counting number"),
 
+    charge: s.number("Charge", "f8",
+                     doc="Amount of charge per some unit"),
+
     distance: s.number("Distance", "f8",
                        doc="A spacial distance"),
 
@@ -39,6 +50,19 @@ local hier = {
     normalized: s.number("Normalized", "f8",
                          s.nc(minimum=0.0, maximum=1.0),
                          doc="A real number in [0,1]"),
+
+    scaling: s.number("Scaling", "f8",
+                      doc="A multiplicative scaling factor"),
+
+    tag: s.string("Tag", pattern=moo.re.ident_only,
+                  doc="A simple identifying tag associated with some data"),
+    tags: s.sequence("Tags", self.tag,
+                     doc="A sequence of tags"),
+
+    filename: s.string("Filename", pattern="$(%s)^"%moo.re.hierpath,
+                       doc="Something resembling a file system tree path name"),
+    npzfilename: s.string("FilenameNPZ", pattern="$(%s).npz$" % moo.re.hierpath,
+                       doc="A filename with NPZ extension"),
 
     point: s.record("Point", [
         s.field("x", self.distance, doc="X coordinate"),
