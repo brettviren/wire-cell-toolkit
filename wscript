@@ -35,6 +35,8 @@ def build(bld):
 
     if "MOO" in bld.env:
         for schema in bld.srcnode.ant_glob("*/schema/*.schema"):
+            if schema.name.startswith("build"):
+                continue
             do_schema(bld, schema)
         bld.add_group()         # make sure this is done first
 
@@ -43,6 +45,7 @@ def build(bld):
 def do_schema(bld, schema):
 
     schema_path = schema.abspath()
+    print("generating schema:",schema_path)
     Pkg, Comp = os.path.splitext(os.path.basename(schema_path))[0].split("_")
 
     params=dict(Pkg=Pkg, pkg=Pkg.lower(), Comp=Comp, top=bld.srcnode.abspath())
@@ -72,7 +75,7 @@ def do_schema(bld, schema):
         source=src, target=[out])
 
 
-    out='{pkg}/schema/WireCell{Pkg}_Cfg_{Comp}.jsonnet'.format(**params)
+    out='cfg/schema/{pkg}/{Comp}.jsonnet'.format(**params)
     out = bld.srcnode.make_node(out)
     bld(rule="""${{MOO}} \
     -T {top}/util/schema -M {top}/cfg -M {top}/util/schema \

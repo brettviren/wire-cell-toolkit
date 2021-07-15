@@ -1,12 +1,27 @@
-{% macro ctor_namespace_beg(model) %}
-{{ ": {".join(model.path) }}: {
+{% macro ctor_extref(path, delim='_') %}
+{% set p = path.split('.') %}
+{{ p[0][8:]|lower }}{{delim}}{{ p[2] }}
 {%- endmacro -%}
+
+{% macro ctor_typepath(typeref, delim='.') %}
+{% set p = typeref.split('.') %}
+{{ p[0][8:]|lower }}{{delim}}{{ p[2:]|join(delim) }}
+{%- endmacro -%}
+
+{% macro ctor_dotpath(path, delim='.') %}
+{{ path[0][8:]|lower }}{{delim}}{{ path[2] }}
+{%- endmacro -%}
+
+{% macro ctor_namespace_beg(path) %}
+{{ path[0][8:]|lower }}: { {{ path[2] }}: {
+{%- endmacro -%}
+
 {% macro ctor_namespace_end(model) %}
-{% for p in model.path %} } {% endfor %}
+} }, // {{ ctor_dotpath(model.path) }}
 {%- endmacro -%}
 
 {% macro ctor_boolean(model, t) %}
-{{ t.name }}(val) :: assert(std.type(val)=='boolean');assert(val == true || val == false) val,
+{{ t.name }}(val) :: assert(std.type(val)=='boolean');assert(val == true || val == false); val,
 {%- endmacro -%}
 
 {# fixme: add checks for pattern/format #}
@@ -30,7 +45,7 @@
 {%- endmacro -%}
 
 {% macro ctor_sequence(model, s) %}
-{{ s.name }}(val) :: assert(std.type(val)=='array'); [$.{{s["items"]}}(v) for v in val],
+{{ s.name }}(val) :: assert(std.type(val)=='array'); [$.{{ ctor_typepath(s["items"]) }}(v) for v in val],
 {%- endmacro -%}
 
 {% macro ctor_field_default_eq(model, field) %}
@@ -46,7 +61,7 @@
     assert(std.setMember(std.type(obj), ["null", "object"])),
     res: if std.type(obj) == 'object' then obj else {
         {% for f in r.fields %}
-        {{f.name}}: $.{{f.item}}({{f.name}}),
+        {{f.name}}: $.{{ ctor_typepath(f.item) }}({{f.name}}),
         {% endfor %}
     },
 }.res,

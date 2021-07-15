@@ -10,11 +10,12 @@
 #include <json/json.h>
 
 
+using nljs_t = nlohmann::json;
+
 // nljs converters need to be in in the namespace of the user data
 // which here is JsonCPP so we use its ns:
 namespace Json {
 
-    using nljs_t = nlohmann::json;
 
     // To nlohmann::json
     inline void to_json(nljs_t& nljs, const Value& jval) {
