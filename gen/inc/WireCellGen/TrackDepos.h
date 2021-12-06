@@ -8,6 +8,8 @@
 
 #include "WireCellGen/Cfg/TrackDepos/Structs.hpp"
 
+#include "WireCellGen/Cfg/TrackDepos/Structs.hpp"
+
 #include <tuple>
 #include <deque>
 
@@ -46,6 +48,8 @@ namespace WireCell {
             config_t m_cfg;
 
             int m_count;
+            Log::logptr_t l;
+
             std::vector<track_t> m_tracks; // keep to enable testing
             std::deque<WireCell::IDepo::pointer> m_depos;
 

@@ -19,9 +19,15 @@ using namespace std;
 using namespace WireCell;
 
 Gen::TrackDepos::TrackDepos(double stepsize, double clight)
+<<<<<<< HEAD
     : Aux::Logger("TrackDepos", "gen")
     , m_cfg{stepsize, clight}
     , m_count(0)
+=======
+    : m_cfg{stepsize, clight}
+    , m_count(0)
+    , l(Log::logger("sim"))
+>>>>>>> mine/cfgschema
 {
 
 }
@@ -91,10 +97,18 @@ static std::string dump(IDepo::pointer d)
 
 void Gen::TrackDepos::add_track(double time, WireCell::Ray ray, double charge)
 {
+<<<<<<< HEAD
     log->debug("add_track({} us, ({} -> {})cm, {})", time / units::us, ray.first / units::cm, ray.second / units::cm,
              charge);
     // store this only to facilitate unit tests
     m_tracks.emplace_back(time, ray, charge);
+=======
+    // store this only to facilitate unit tests
+    m_tracks.emplace_back(time, ray, charge);
+
+    l->debug("add_track({} us, ({} -> {})cm, {})", time / units::us, ray.first / units::cm, ray.second / units::cm,
+             charge);
+>>>>>>> mine/cfgschema
 
     const WireCell::Vector dir = WireCell::ray_unit(ray);
     const double length = WireCell::ray_length(ray);

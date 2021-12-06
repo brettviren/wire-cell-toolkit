@@ -111,6 +111,7 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
     nljs_t nljs = cfg;
     m_cfg = nljs.get<config_t>();
 
+<<<<<<< HEAD
     if (not good_faces(m_cfg.faces)) {
         l->critical("at least one or two faces need to be defined");
         THROW(ValueError() << errmsg{"AnodePlane: error in faces configuration"});
@@ -119,6 +120,16 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
     // get wire schema
     if (m_cfg.wire_schema.empty()) {
         log->critical("\"wire_schema\" parameter must specify an IWireSchema component");
+=======
+
+    if (not good_faces(m_cfg.faces)) {
+        l->critical("at least one or two faces need to be defined");
+        THROW(ValueError() << errmsg{"AnodePlane: error in faces configuration"});
+    }
+
+    if (m_cfg.wire_schema.empty()) {
+        l->critical("\"wire_schema\" parameter must specify an IWireSchema component");
+>>>>>>> mine/cfgschema
         THROW(ValueError() << errmsg{"\"wire_schema\" parameter must specify an IWireSchema component"});
     }
     auto iws = Factory::find_tn<IWireSchema>(m_cfg.wire_schema);  // throws if not found
@@ -147,6 +158,7 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
         const auto& cfg_face = m_cfg.faces[iface];
         if (null_face(cfg_face)) {
             sensitive_face = false;
+<<<<<<< HEAD
             log->debug("anode {} face {} is not sensitive", m_ident, iface);
         }
         const double response_x = jface["response"].asDouble();
@@ -154,6 +166,15 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
         const double cathode_x = jface["cathode"].asDouble();
         log->debug("X planes: \"cathode\"@ {}m, \"response\"@{}m, \"anode\"@{}m", cathode_x / units::m,
                  response_x / units::m, anode_x / units::m);
+=======
+            l->debug("anode {} face {} is not sensitive", m_cfg.ident, iface);
+        }
+        const double response_x = cfg_face.response;
+        const double anode_x = cfg_face.anode;
+        const double cathode_x = cfg_face.cathode;
+        l->debug("AnodePlane: X planes: \"cathode\"@ {}m, \"response\"@{}m, \"anode\"@{}m",
+                 cathode_x / units::m, response_x / units::m, anode_x / units::m);
+>>>>>>> mine/cfgschema
 
         IWirePlane::vector planes(nplanes);
         // note, WireSchema requires U/V/W plane ordering in a face.
