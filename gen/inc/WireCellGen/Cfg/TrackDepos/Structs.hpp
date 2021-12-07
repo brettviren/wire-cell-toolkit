@@ -15,7 +15,8 @@
 namespace WireCellGen::Cfg::TrackDepos {
 
     // @brief 
-    struct Track {
+    struct Track 
+    {
 
         // @brief Absolute time at the start of the track
         WireCellUtil::Cfg::Base::Time time = 0.0;
@@ -31,7 +32,8 @@ namespace WireCellGen::Cfg::TrackDepos {
     using Tracks = std::vector<WireCellGen::Cfg::TrackDepos::Track>;
 
     // @brief Configuration for TrackDepos component
-    struct Config {
+    struct Config 
+    {
 
         // @brief Distance along track between two neighboring depos.
         WireCellUtil::Cfg::Base::Distance step_size = 1.0;

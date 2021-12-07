@@ -8,24 +8,29 @@
 #define WIRECELLGEN_ANODEPLANE
 
 #include "WireCellIface/IAnodePlane.h"
-#include "WireCellIface/IConfigurable.h"
 #include "WireCellAux/Logger.h"
-#include <unordered_map>
+#include "WireCellAux/Configurable.h"
 
-#include "WireCellGen/Cfg/AnodePlane/Structs.hpp"
+#include "WireCellGen/Cfg/AnodePlane/Nljs.hpp"
+
+#include <unordered_map>
 
 namespace WireCell {
     namespace Gen {
 
+        using WireCellGen::Cfg::AnodePlane::Config;
+
         class AnodePlane : public Aux::Logger,
-                           public IAnodePlane, public IConfigurable {
+                           public Aux::Configurable<Config>,
+                           public IAnodePlane {
            public:
             AnodePlane();
             virtual ~AnodePlane() {}
 
-            // IConfigurable interface
+            // Normally, we should not provide this method but we must do some kludge.
             virtual void configure(const WireCell::Configuration& config);
-            virtual WireCell::Configuration default_configuration() const;
+            // virtual WireCell::Configuration default_configuration() const;
+            virtual void configured();
 
             /// IAnodePlane interface
             virtual int ident() const { return m_cfg.ident; }
@@ -38,8 +43,8 @@ namespace WireCell {
             virtual IWire::vector wires(int channel) const;
 
         private:
-            using config_t = WireCellGen::Cfg::AnodePlane::Config;
-            config_t m_cfg;
+            // using config_t = WireCellGen::Cfg::AnodePlane::Config;
+            // config_t m_cfg;
 
             IAnodeFace::vector m_faces;
 

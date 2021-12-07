@@ -14,7 +14,8 @@
 namespace WireCellGen::Cfg::Ductor {
 
     // @brief Ductor configuration
-    struct Config {
+    struct Config 
+    {
 
         // @brief Depo truncation bound in number of Gaussian standard deviations
         WireCellUtil::Cfg::Base::Count nsigma = 3;

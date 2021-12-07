@@ -247,7 +247,7 @@ ITrace::vector Gen::DepoSplat::process_face(IAnodeFace::pointer face, const IDep
     std::unordered_map<int, std::vector<float> > chch;
 
     // tick-edged bins
-    Binning tbins(m_cfg.readout_time / m_cfg.tick, m_start_time, m_start_time + m_cfg.readout_time);
+    Binning tbins(m_readout_time / m_tick, m_start_time, m_start_time + m_readout_time);
 
     int iplane = -1;
     for (auto plane : face->planes()) {
@@ -280,8 +280,8 @@ ITrace::vector Gen::DepoSplat::process_face(IAnodeFace::pointer face, const IDep
 
             if (true) {
                 int nrebin = 1;
-                double time_slice_width = nrebin * m_cfg.drift_speed * m_cfg.tick; // units::mm
-                double add_sigma_L = 1.428249 * time_slice_width / nrebin / (m_cfg.tick / units::us); // units::mm
+                double time_slice_width = nrebin * m_drift_speed * m_tick; // units::mm
+                double add_sigma_L = 1.428249 * time_slice_width / nrebin / (m_tick / units::us); // units::mm
                 sigma_L = sqrt(pow(depo->extent_long(), 2) + pow(add_sigma_L, 2));  // / time_slice_width;
             }
 
@@ -299,13 +299,13 @@ ITrace::vector Gen::DepoSplat::process_face(IAnodeFace::pointer face, const IDep
 
             // l->info("final: sigma_L: {} sigma_T: {}", sigma_L, sigma_T);
 
-            const double tsig = sigma_L / m_cfg.drift_speed;
+            const double tsig = sigma_L / m_drift_speed;
             const double psig = sigma_T;
 
-            const double pwid = m_cfg.nsigma * psig;
+            const double pwid = m_nsigma * psig;
             const double pcen = pimpos->distance(depo->pos());
 
-            const double twid = m_cfg.nsigma * tsig;
+            const double twid = m_nsigma * tsig;
             const double tcen = depo->time();
 
             const int pbeg = std::max(wbins.bin(pcen - pwid), 0);
@@ -332,7 +332,7 @@ ITrace::vector Gen::DepoSplat::process_face(IAnodeFace::pointer face, const IDep
             Gen::GausDesc pitch_desc(pcen, psig);
 
             auto gd = std::make_shared<Gen::GaussianDiffusion>(depo, time_desc, pitch_desc);
-            gd->set_sampling(tbins, wbins, m_cfg.nsigma, 0, 1);
+            gd->set_sampling(tbins, wbins, m_nsigma, 0, 1);
             const auto patch = gd->patch();
 
 

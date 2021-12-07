@@ -15,7 +15,8 @@
 namespace WireCellGen::Cfg::AnodePlane {
 
     // @brief Interesting drift positions on one anode face
-    struct Face {
+    struct Face 
+    {
 
         // @brief Active volume boundary along drift direction near wires
         WireCellUtil::Cfg::Base::Distance anode = 0.0;
@@ -31,7 +32,8 @@ namespace WireCellGen::Cfg::AnodePlane {
     using Faces = std::vector<WireCellGen::Cfg::AnodePlane::Face>;
 
     // @brief Configuration for AnodePlane
-    struct Config {
+    struct Config 
+    {
 
         // @brief Identifier of wire plane as used in wire file
         WireCellUtil::Cfg::Base::Count ident = 0;

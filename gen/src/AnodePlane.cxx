@@ -14,10 +14,6 @@
 #include "WireCellUtil/NamedFactory.h"
 #include "WireCellUtil/String.h"
 
-#include "WireCellUtil/nljs2jcpp.hpp" // remove when ditch JsonCPP
-#include "WireCellGen/Cfg/AnodePlane/Nljs.hpp"
-using nljs_t = WireCellGen::Cfg::AnodePlane::data_t;
-
 #include <string>
 
 WIRECELL_FACTORY(AnodePlane, WireCell::Gen::AnodePlane,
@@ -30,17 +26,10 @@ using WireCell::String::format;
 
 Gen::AnodePlane::AnodePlane()
   : Aux::Logger("AnodePlane", "geom")
-  , m_ident(0)
 {
 }
 
 const int default_nimpacts = 10;
-
-WireCell::Configuration Gen::AnodePlane::default_configuration() const
-{
-    nljs_t nljs = m_cfg;
-    return nljs.get<Json::Value>();
-}
 
 struct channel_wire_collector_t {
     // To deal with wrapped wires we need to temporarily hold on to
@@ -86,13 +75,19 @@ bool good_faces(const Faces& faces)
 
 void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
 {
+    // Note, normally we would NOT implment configure() and instead
+    // leave the work all to the Aux::Configurable<Config> base class.
+    // However, here we do some special "live" rewriting of the
+    // configuration object in order to provide some backward
+    // compatibility to older configuration schema.
+
     WireCell::Configuration cfg = ccfg;
 
     // A kludge to continue to support prior configuration promise
     { 
         auto& jfaces = cfg["faces"];
         if (jfaces.isNull() or jfaces.empty() or (jfaces[0].isNull() and jfaces[1].isNull())) {
-            l->critical("at least two faces need to be defined, got:\n{}", jfaces);
+            log->critical("at least two faces need to be defined, got:\n{}", jfaces);
             THROW(ValueError() << errmsg{"AnodePlane: error in configuration"});
         }
         for (int ind=0; ind<2; ++ind) {
@@ -106,30 +101,19 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
             }
         }
     }
+    Aux::Configurable<Config>::configure(cfg);
+}
 
-    // now on to new style config processing
-    nljs_t nljs = cfg;
-    m_cfg = nljs.get<config_t>();
-
-<<<<<<< HEAD
+void Gen::AnodePlane::configured()
+{
     if (not good_faces(m_cfg.faces)) {
-        l->critical("at least one or two faces need to be defined");
+        log->critical("at least one or two faces need to be defined");
         THROW(ValueError() << errmsg{"AnodePlane: error in faces configuration"});
     }
 
     // get wire schema
     if (m_cfg.wire_schema.empty()) {
         log->critical("\"wire_schema\" parameter must specify an IWireSchema component");
-=======
-
-    if (not good_faces(m_cfg.faces)) {
-        l->critical("at least one or two faces need to be defined");
-        THROW(ValueError() << errmsg{"AnodePlane: error in faces configuration"});
-    }
-
-    if (m_cfg.wire_schema.empty()) {
-        l->critical("\"wire_schema\" parameter must specify an IWireSchema component");
->>>>>>> mine/cfgschema
         THROW(ValueError() << errmsg{"\"wire_schema\" parameter must specify an IWireSchema component"});
     }
     auto iws = Factory::find_tn<IWireSchema>(m_cfg.wire_schema);  // throws if not found
@@ -138,7 +122,7 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
     // keep track which channels we know about in this anode.
     m_channels.clear();
 
-    const WireSchema::Anode& ws_anode = ws_store.anode(m_cfg.ident);
+    const WireSchema::Anode& ws_anode = ws_store.anode(ident());
 
     std::vector<WireSchema::Face> ws_faces = ws_store.faces(ws_anode);
     const size_t nfaces = ws_faces.size();
@@ -155,26 +139,15 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
 
         // location of imaginary boundary planes
         bool sensitive_face = true;
-        const auto& cfg_face = m_cfg.faces[iface];
-        if (null_face(cfg_face)) {
+        const auto& face = m_cfg.faces[iface];
+        if (null_face(face)) {
             sensitive_face = false;
-<<<<<<< HEAD
-            log->debug("anode {} face {} is not sensitive", m_ident, iface);
+            log->debug("anode {} face {} is not sensitive", ident(), iface);
         }
-        const double response_x = jface["response"].asDouble();
-        const double anode_x = get(jface, "anode", response_x);
-        const double cathode_x = jface["cathode"].asDouble();
-        log->debug("X planes: \"cathode\"@ {}m, \"response\"@{}m, \"anode\"@{}m", cathode_x / units::m,
-                 response_x / units::m, anode_x / units::m);
-=======
-            l->debug("anode {} face {} is not sensitive", m_cfg.ident, iface);
-        }
-        const double response_x = cfg_face.response;
-        const double anode_x = cfg_face.anode;
-        const double cathode_x = cfg_face.cathode;
-        l->debug("AnodePlane: X planes: \"cathode\"@ {}m, \"response\"@{}m, \"anode\"@{}m",
-                 cathode_x / units::m, response_x / units::m, anode_x / units::m);
->>>>>>> mine/cfgschema
+        log->debug("X planes: \"cathode\"@ {}m, \"response\"@{}m, \"anode\"@{}m",
+                   face.cathode / units::m,
+                   face.response / units::m,
+                   face.anode / units::m);
 
         IWirePlane::vector planes(nplanes);
         // note, WireSchema requires U/V/W plane ordering in a face.
@@ -182,7 +155,7 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
         for (size_t iplane = 0; iplane < nplanes; ++iplane) {
             const auto& ws_plane = ws_planes[iplane];
 
-            WirePlaneId wire_plane_id(iplane2layer[iplane], iface, m_cfg.ident);
+            WirePlaneId wire_plane_id(iplane2layer[iplane], iface, ident());
             if (wire_plane_id.index() < 0) {
                 log->critical("Bad wire plane id: {}", wire_plane_id.ident());
                 THROW(ValueError() << errmsg{format("bad wire plane id: %d", wire_plane_id.ident())});
@@ -219,7 +192,7 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
 
             const double pitchmin = wire_pitch_dirs.second.dot(wires[0]->center() - plane_center);
             const double pitchmax = wire_pitch_dirs.second.dot(wires[nwires - 1]->center() - plane_center);
-            const Vector pimpos_origin(response_x, plane_center.y(), plane_center.z());
+            const Vector pimpos_origin(face.response, plane_center.y(), plane_center.z());
 
             log->debug("face:{}, plane:{}, origin:{} mm", iface, iplane, pimpos_origin / units::mm);
 
@@ -258,10 +231,10 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& ccfg)
                 else if (std::fabs(pitch_dir.y()) > 0.999)
                     pext = Point(0, 0.5 * mean_pitch, 0);
 
-                Point p1(anode_x, std::min(v1.y(), v2.y()), std::min(v1.z(), v2.z()));
+                Point p1(face.anode, std::min(v1.y(), v2.y()), std::min(v1.z(), v2.z()));
                 p1 += pext * (-1.0);
                 bb(p1);
-                Point p2(cathode_x, std::max(v1.y(), v2.y()), std::max(v1.z(), v2.z()));
+                Point p2(face.cathode, std::max(v1.y(), v2.y()), std::max(v1.z(), v2.z()));
                 p2 += pext;
                 bb(p2);
                 bbvols.push_back(bb);

@@ -43,7 +43,8 @@ namespace WireCellUtil::Cfg::Base {
 
 
     // @brief A Cartesian point in 3-space.
-    struct Point {
+    struct Point 
+    {
 
         // @brief X coordinate
         Distance x = 0.0;
@@ -56,7 +57,8 @@ namespace WireCellUtil::Cfg::Base {
     };
 
     // @brief A directed line segment in 3-space
-    struct Ray {
+    struct Ray 
+    {
 
         // @brief Start point
         Point tail = {};

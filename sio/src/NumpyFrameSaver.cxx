@@ -80,7 +80,7 @@ bool Sio::NumpyFrameSaver::operator()(const IFrame::pointer& inframe, IFrame::po
     l->debug(ss.str());
 
     for (auto tag : m_cfg.frame_tags) {
-        auto traces = aux::tagged_traces(inframe, tag);
+        auto traces = Aux::tagged_traces(inframe, tag);
         l->debug("NumpyFrameSaver: save {} tagged as {}", traces.size(), tag);
         if (traces.empty()) {
             l->warn("NumpyFrameSaver: no traces for tag: \"{}\"", tag);
@@ -98,7 +98,7 @@ bool Sio::NumpyFrameSaver::operator()(const IFrame::pointer& inframe, IFrame::po
         l->debug("NumpyFrameSaver: saving ncols={} nrows={}", ncols, nrows);
 
         Array::array_xxf arr = Array::array_xxf::Zero(nrows, ncols) + m_cfg.baseline;
-        aux::fill(arr, traces, channels.begin(), chend, tbinmm.first);
+        Aux::fill(arr, traces, channels.begin(), chend, tbinmm.first);
         arr = arr * m_cfg.scale + m_cfg.offset;
 
         {  // the 2D frame array
