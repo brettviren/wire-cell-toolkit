@@ -7,10 +7,6 @@
 #include "WireCellUtil/Testing.h"
 #include "WireCellUtil/Persist.h"
 
-#include "WireCellUtil/nljs2jcpp.hpp" // remove when ditch JsonCPP
-#include "WireCellGen/Cfg/TrackDepos/Nljs.hpp"
-using nljs_t = WireCellGen::Cfg::TrackDepos::data_t;
-
 #include <sstream>
 
 WIRECELL_FACTORY(TrackDepos, WireCell::Gen::TrackDepos, WireCell::IDepoSource, WireCell::IConfigurable)
@@ -20,10 +16,11 @@ using namespace WireCell;
 
 Gen::TrackDepos::TrackDepos(double stepsize, double clight)
     : Aux::Logger("TrackDepos", "gen")
-    , m_cfg{stepsize, clight}
     , m_count(0)
 {
-
+    // Allow override of schema defaults for purpose of unit tests
+    m_cfg.step_size = stepsize;
+    m_cfg.clight = clight;
 }
 
 Gen::TrackDepos::~TrackDepos()
@@ -31,35 +28,12 @@ Gen::TrackDepos::~TrackDepos()
 }
 
 
-Configuration Gen::TrackDepos::default_configuration() const
+void Gen::TrackDepos::configured()
 {
-    nljs_t nljs = m_cfg;
-    return nljs.get<Json::Value>();
-}
-
-// wart: translate from schema/codegen rep of a ray to hand-written
-template <typename RAY>
-WireCell::Ray ray2ray(const RAY& ray)
-{
-    return WireCell::Ray(
-        WireCell::Point(ray.tail.x, ray.tail.y, ray.tail.z),
-        WireCell::Point(ray.head.x, ray.head.y, ray.head.z));
-}
-
-void Gen::TrackDepos::configure(const Configuration& cfg)
-{
-    nljs_t nljs = cfg;
-    m_cfg = nljs.get<config_t>();
-
     for (auto& track : m_cfg.tracks) {
-        add_track(track.time, ray2ray(track.ray), track.charge);
+        add_track(track.time, make_ray(track.ray), track.charge);
     }
 
-    apply_grouping();
-}
-
-void Gen::TrackDepos::apply_grouping()
-{
     if (m_depos.empty() or m_cfg.group_time <= 0.0) {
         m_depos.push_back(nullptr);
         return;
@@ -84,15 +58,20 @@ void Gen::TrackDepos::apply_grouping()
 static std::string dump(IDepo::pointer d)
 {
     std::stringstream ss;
-    ss << "q=" << d->charge() / units::eplus << "eles, t=" << d->time() / units::us << "us, r=" << d->pos() / units::mm
+    ss << "q=" << d->charge() / units::eplus << "eles, "
+       << "t=" << d->time() / units::us
+       << "us, r=" << d->pos() / units::mm
        << "mm";
     return ss.str();
 }
 
 void Gen::TrackDepos::add_track(double time, WireCell::Ray ray, double charge)
 {
-    log->debug("add_track({} us, ({} -> {})cm, {})", time / units::us, ray.first / units::cm, ray.second / units::cm,
-             charge);
+    log->debug("add_track({} us, ({} -> {})cm, {})",
+               time / units::us,
+               ray.first / units::cm, ray.second / units::cm,
+               charge);
+
     // store this only to facilitate unit tests
     m_tracks.emplace_back(time, ray, charge);
 

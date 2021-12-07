@@ -10,32 +10,35 @@
 #include <tuple>
 #include <sstream>
 
-#include "WireCellUtil/nljs2jcpp.hpp" // remove when ditch JsonCPP
-#include "WireCellSio/Cfg/NumpyFrameSaver/Nljs.hpp"
-
 WIRECELL_FACTORY(NumpyFrameSaver, WireCell::Sio::NumpyFrameSaver, WireCell::IFrameFilter, WireCell::IConfigurable)
 
 using namespace WireCell;
 using WireCell::Numpy::save2d;
 
 Sio::NumpyFrameSaver::NumpyFrameSaver()
-  : m_save_count(0)
-  , l(Log::logger("io"))
+    : Aux::Logger("NumpyFrameSaver", "sio")
 {
 }
 
 Sio::NumpyFrameSaver::~NumpyFrameSaver() {}
 
-WireCell::Configuration Sio::NumpyFrameSaver::default_configuration() const
-{
-    nljs_t nljs = m_cfg;
-    return nljs.get<Json::Value>();
-}
+// WireCell::Configuration Sio::NumpyFrameSaver::default_configuration() const
+// {
+//     nljs_t nljs = m_cfg;
+//     return nljs.get<Json::Value>();
+// }
 
-void Sio::NumpyFrameSaver::configure(const WireCell::Configuration& config)
+// void Sio::NumpyFrameSaver::configure(const WireCell::Configuration& config)
+// {
+//     nljs_t nljs = config;
+//     m_cfg = nljs.get<config_t>();
+//     if (m_cfg.frame_tags.empty()) {
+//         // internally we use an empty tag to mean all tags
+//         m_cfg.frame_tags.push_back("");
+//     }
+// }
+void Sio::NumpyFrameSaver::configured()
 {
-    nljs_t nljs = config;
-    m_cfg = nljs.get<config_t>();
     if (m_cfg.frame_tags.empty()) {
         // internally we use an empty tag to mean all tags
         m_cfg.frame_tags.push_back("");
@@ -45,7 +48,7 @@ void Sio::NumpyFrameSaver::configure(const WireCell::Configuration& config)
 bool Sio::NumpyFrameSaver::operator()(const IFrame::pointer& inframe, IFrame::pointer& outframe)
 {
     if (!inframe) {
-        l->debug("NumpyFrameSaver: EOS");
+        log->debug("EOS at call={}", m_save_count);
         outframe = nullptr;
         return true;
     }
@@ -77,13 +80,13 @@ bool Sio::NumpyFrameSaver::operator()(const IFrame::pointer& inframe, IFrame::po
             ss << " \"" << ft << "\"";
         }
     }
-    l->debug(ss.str());
+    log->debug(ss.str());
 
     for (auto tag : m_cfg.frame_tags) {
         auto traces = Aux::tagged_traces(inframe, tag);
-        l->debug("NumpyFrameSaver: save {} tagged as {}", traces.size(), tag);
+        log->debug("NumpyFrameSaver: save {} tagged as {}", traces.size(), tag);
         if (traces.empty()) {
-            l->warn("NumpyFrameSaver: no traces for tag: \"{}\"", tag);
+            log->warn("NumpyFrameSaver: no traces for tag: \"{}\"", tag);
             continue;
         }
         auto channels = Aux::channels(traces);
@@ -95,7 +98,7 @@ bool Sio::NumpyFrameSaver::operator()(const IFrame::pointer& inframe, IFrame::po
         // fixme: may want to give user some config over tbin range to save.
         const size_t ncols = tbinmm.second - tbinmm.first;
         const size_t nrows = std::distance(chbeg, chend);
-        l->debug("NumpyFrameSaver: saving ncols={} nrows={}", ncols, nrows);
+        log->debug("NumpyFrameSaver: saving ncols={} nrows={}", ncols, nrows);
 
         Array::array_xxf arr = Array::array_xxf::Zero(nrows, ncols) + m_cfg.baseline;
         Aux::fill(arr, traces, channels.begin(), chend, tbinmm.first);
@@ -110,7 +113,7 @@ bool Sio::NumpyFrameSaver::operator()(const IFrame::pointer& inframe, IFrame::po
             else {
                 save2d(arr, aname, m_cfg.filename, mode);
             }
-            l->debug("NumpyFrameSaver: saved {} with {} channels {} ticks @t={} ms qtot={}", aname, nrows, ncols,
+            log->debug("NumpyFrameSaver: saved {} with {} channels {} ticks @t={} ms qtot={}", aname, nrows, ncols,
                      inframe->time() / units::ms, arr.sum());
         }
 

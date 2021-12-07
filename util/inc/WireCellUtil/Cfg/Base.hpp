@@ -1,18 +1,28 @@
 /*
  * This file is 100% generated.  Any manual edits will likely be lost.
  *
- * This contains struct and other type definitions for shema in 
- * namespace WireCellUtil::Cfg::Base.
+ * This contains configuration related types and methods for schema: 
+ *
+ *     WireCell.Util.Cfg.Base
+ *
  */
-#ifndef WIRECELLUTIL_CFG_BASE_STRUCTS_HPP
-#define WIRECELLUTIL_CFG_BASE_STRUCTS_HPP
+#ifndef WIRECELL_UTIL_CFG_BASE
+#define WIRECELL_UTIL_CFG_BASE
+
 
 #include <cstdint>
-
+// for sequence
 #include <vector>
+// for string
 #include <string>
 
-namespace WireCellUtil::Cfg::Base {
+#include <nlohmann/json.hpp>
+
+namespace WireCell::Util::Cfg::Base {
+
+    //
+    // Type definitions.
+    //
 
     // @brief Amount of charge per some unit
     using Charge = double;
@@ -79,7 +89,7 @@ namespace WireCellUtil::Cfg::Base {
     using Tag = std::string;
 
     // @brief A sequence of tags
-    using Tags = std::vector<WireCellUtil::Cfg::Base::Tag>;
+    using Tags = std::vector<WireCell::Util::Cfg::Base::Tag>;
 
     // @brief A sampling period
     using Tick = double;
@@ -93,8 +103,42 @@ namespace WireCellUtil::Cfg::Base {
     using TypeName = std::string;
 
     // @brief A sequence of component type name identifiers
-    using TypeNames = std::vector<WireCellUtil::Cfg::Base::TypeName>;
+    using TypeNames = std::vector<WireCell::Util::Cfg::Base::TypeName>;
 
-} // namespace WireCellUtil::Cfg::Base
 
-#endif // WIRECELLUTIL_CFG_BASE_STRUCTS_HPP
+
+    //
+    // JSON serialization methods
+    //
+
+    using data_t = nlohmann::json;
+    
+    inline void to_json(data_t& j, const Point& obj) {
+        j["x"] = obj.x;
+        j["y"] = obj.y;
+        j["z"] = obj.z;
+    }
+    
+    inline void from_json(const data_t& j, Point& obj) {
+        if (j.contains("x"))
+            j.at("x").get_to(obj.x);    
+        if (j.contains("y"))
+            j.at("y").get_to(obj.y);    
+        if (j.contains("z"))
+            j.at("z").get_to(obj.z);    
+    }
+    
+    inline void to_json(data_t& j, const Ray& obj) {
+        j["tail"] = obj.tail;
+        j["head"] = obj.head;
+    }
+    
+    inline void from_json(const data_t& j, Ray& obj) {
+        if (j.contains("tail"))
+            j.at("tail").get_to(obj.tail);    
+        if (j.contains("head"))
+            j.at("head").get_to(obj.head);    
+    }
+} // WireCell::Util::Cfg::Base
+
+#endif // WIRECELL_UTIL_CFG_BASE

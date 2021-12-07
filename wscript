@@ -51,46 +51,52 @@ def build(bld):
 
     bld.load('wcb')
 
+
+
 def do_schema(bld, schema):
+    '''
+    This performs schema based codegen.
+    '''
+    # fixme: move into waf-tools
 
     schema_path = schema.abspath()
     print("generating schema:",schema_path)
     Pkg, Comp = os.path.splitext(os.path.basename(schema_path))[0].split("_")
 
     params=dict(Pkg=Pkg, pkg=Pkg.lower(), Comp=Comp, top=bld.srcnode.abspath())
-    inc_cfg=bld.srcnode.make_node('{pkg}/inc/WireCell{Pkg}/Cfg/{Comp}'.format(**params))
+    inc_cfg=bld.srcnode.make_node('{pkg}/inc/WireCell{Pkg}/Cfg'.format(**params))
 
 
     src = [schema]
     if Pkg != "Util":           # likely a dependency
         src.append(bld.path.find_resource("util/schema/Util_Base.schema"))
 
-    out = inc_cfg.make_node("Structs.hpp")
+    out = inc_cfg.make_node(Comp + ".hpp")
     bld(rule="""${{MOO}} -g /lang:ocpp.jsonnet \
-    -M {top}/cfg -M {top}/util/schema \
-    -A path="WireCell{Pkg}.Cfg.{Comp}" \
+    -M {top}/cfg -M {top}/util/schema -T {top}/util/schema \
+    -A path="WireCell.{Pkg}.Cfg.{Comp}" \
     -A os="${{SRC[0]}}" \
-    render omodel.jsonnet ostructs.hpp.j2 \
+    render omodel.jsonnet cfg.hpp.j2 \
     > ${{TGT[0]}}""".format(**params),
         source=src, target=[out])
 
-    out = inc_cfg.make_node("Nljs.hpp")
-    bld(rule="""${{MOO}} -g /lang:ocpp.jsonnet \
-    -M {top}/cfg -M {top}/util/schema \
-    -A path="WireCell{Pkg}.Cfg.{Comp}" \
-    -A os="${{SRC[0]}}" \
-    render omodel.jsonnet onljs.hpp.j2 \
-    > ${{TGT[0]}}""".format(**params),
-        source=src, target=[out])
+    # out = inc_cfg.make_node("Nljs.hpp")
+    # bld(rule="""${{MOO}} -g /lang:ocpp.jsonnet \
+    # -M {top}/cfg -M {top}/util/schema \
+    # -A path="WireCell{Pkg}.Cfg.{Comp}" \
+    # -A os="${{SRC[0]}}" \
+    # render omodel.jsonnet onljs.hpp.j2 \
+    # > ${{TGT[0]}}""".format(**params),
+    #     source=src, target=[out])
 
 
-    out='cfg/schema/{pkg}/{Comp}.jsonnet'.format(**params)
-    out = bld.srcnode.make_node(out)
-    bld(rule="""${{MOO}} \
-    -T {top}/util/schema -M {top}/cfg -M {top}/util/schema \
-    -A path="WireCell{Pkg}.Cfg.{Comp}" \
-    -A os="${{SRC[0]}}" \
-    render omodel.jsonnet wct-cfg-ctor.jsonnet.j2 \
-    > ${{TGT[0]}}""".format(**params),
-        source=src, target=[out])
+    # out='cfg/schema/{pkg}/{Comp}.jsonnet'.format(**params)
+    # out = bld.srcnode.make_node(out)
+    # bld(rule="""${{MOO}} \
+    # -T {top}/util/schema -M {top}/cfg -M {top}/util/schema \
+    # -A path="WireCell{Pkg}.Cfg.{Comp}" \
+    # -A os="${{SRC[0]}}" \
+    # render omodel.jsonnet wct-cfg-ctor.jsonnet.j2 \
+    # > ${{TGT[0]}}""".format(**params),
+    #     source=src, target=[out])
 

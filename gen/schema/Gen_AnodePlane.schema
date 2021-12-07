@@ -2,7 +2,7 @@
 local moo = import "moo.jsonnet";
 local wc = import "wirecell.jsonnet";
 local util_seq = import "Util_Base.schema";
-local t = moo.oschema.hier(util_seq).WireCellUtil.Cfg.Base;
+local t = moo.oschema.hier(util_seq).WireCell.Util.Cfg.Base;
 
 local wcc = import "cfgschema.jsonnet";
 local f = wcc("Gen","AnodePlane");
@@ -44,6 +44,7 @@ local hier = {
 
         s.field("ident", t.Count, default=0,
                 doc="Identifier of wire plane as used in wire file"),
+
         s.field("wire_schema", t.TypeName, default="",
                 doc="Type name of IWireSchema component"),
         

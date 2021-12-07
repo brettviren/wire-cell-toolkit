@@ -11,14 +11,14 @@
 #include "WireCellAux/Logger.h"
 #include "WireCellAux/Configurable.h"
 
-#include "WireCellGen/Cfg/AnodePlane/Nljs.hpp"
+#include "WireCellGen/Cfg/AnodePlane.hpp"
 
 #include <unordered_map>
 
 namespace WireCell {
     namespace Gen {
 
-        using WireCellGen::Cfg::AnodePlane::Config;
+        using WireCell::Gen::Cfg::AnodePlane::Config;
 
         class AnodePlane : public Aux::Logger,
                            public Aux::Configurable<Config>,

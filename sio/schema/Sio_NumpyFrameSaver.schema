@@ -4,7 +4,7 @@ local moo = import "moo.jsonnet";
 
 // We will use util types
 local util_seq = import "Util_Base.schema";
-local t = moo.oschema.hier(util_seq).WireCellUtil.Cfg.Base;
+local t = moo.oschema.hier(util_seq).WireCell.Util.Cfg.Base;
 
 local wcc = import "cfgschema.jsonnet";
 local f = wcc("Sio","NumpyFrameSaver");

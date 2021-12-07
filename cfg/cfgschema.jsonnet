@@ -14,9 +14,11 @@ local moo = import "moo.jsonnet";
 function (pkg, comp) {
 
     // Set path convention incorporating package and component names.
+    // 
     // This reflects in things outside of codegen control so do not
     // change it unless you really know what you are getting into.
-    local path = ["WireCell"+pkg, "Cfg", comp],
+    // local fs_path = ["WireCell" + pkg, "Cfg"],
+    local ns_path = ["WireCell", pkg, "Cfg", comp],
 
     // A schema factory used to make types "in" a package namespace.
     // Use this in a "working object" context to define needed final
@@ -24,7 +26,7 @@ function (pkg, comp) {
     // A configurable component should use the component() function to
     // make a special record representing.  If the component is also a
     // node, it should use node()
-    schema :: moo.oschema.schema(path) {
+    schema :: moo.oschema.schema(ns_path) {
         local s = self,
 
         // make a configurable component record enforcing its type name
@@ -35,7 +37,7 @@ function (pkg, comp) {
     // sequence.  Note, if any types outside the path are referred to
     // by types in hier, they must be prepended to the type sequence
     // returned by build() prior to final output.
-    build(hier) :: moo.oschema.sort_select(hier,  path),
+    build(hier) :: moo.oschema.sort_select(hier,  ns_path),
 }
 
 
