@@ -2,7 +2,7 @@
  * This file is 100% generated.  Any manual edits will likely be lost.
  *
  * This holds constructor functions for creating objects from the
- * schema: util.Base
+ * schema: WireCell.Util.Cfg.Base
  * 
  * Prefer these functions over manual object construction to assure
  * greater validity.
@@ -10,7 +10,7 @@
  */
 
 {
-    util: { Base: {
+    util: { base: {
     // Construct Charge (number)
     // Amount of charge per some unit
     Charge(val) :: assert(std.type(val)=='number'); val,
@@ -48,9 +48,9 @@
     Point(obj=null, x=0.0, y=0.0, z=0.0) :: {
         assert(std.setMember(std.type(obj), ["null", "object"])),
         res: if std.type(obj) == 'object' then obj else {
-            x: $.util.Base.Distance(x),
-            y: $.util.Base.Distance(y),
-            z: $.util.Base.Distance(z),
+            x: $.util.base.Distance(x),
+            y: $.util.base.Distance(y),
+            z: $.util.base.Distance(z),
         },
     }.res,
 
@@ -59,8 +59,8 @@
     Ray(obj=null, tail={}, head={}) :: {
         assert(std.setMember(std.type(obj), ["null", "object"])),
         res: if std.type(obj) == 'object' then obj else {
-            tail: $.util.Base.Point(tail),
-            head: $.util.Base.Point(head),
+            tail: $.util.base.Point(tail),
+            head: $.util.base.Point(head),
         },
     }.res,
 
@@ -78,7 +78,7 @@
 
     // Construct Tags (sequence)
     // A sequence of tags
-    Tags(val) :: assert(std.type(val)=='array'); [$.util.Base.Tag(v) for v in val],
+    Tags(val) :: assert(std.type(val)=='array'); [$.util.base.Tag(v) for v in val],
 
     // Construct Tick (number)
     // A sampling period
@@ -94,7 +94,8 @@
 
     // Construct TypeNames (sequence)
     // A sequence of component type name identifiers
-    TypeNames(val) :: assert(std.type(val)=='array'); [$.util.Base.TypeName(v) for v in val],
+    TypeNames(val) :: assert(std.type(val)=='array'); [$.util.base.TypeName(v) for v in val],
 
-    } }, // util.Base
+
+    } }, // util.base
 }

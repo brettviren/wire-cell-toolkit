@@ -1,23 +1,22 @@
-{% macro ctor_extref(path, delim='_') %}
+{% macro lower_list(lst, delim='_') %}
+{{ lst[1]|lower }}{{delim}}{{ lst[3]|lower }}
+{%- endmacro -%}
+{% macro lower_path(path, delim='_') %}
 {% set p = path.split('.') %}
-{{ p[0][8:]|lower }}{{delim}}{{ p[2] }}
+{{ lower_list(p, delim) }}
 {%- endmacro -%}
 
 {% macro ctor_typepath(typeref, delim='.') %}
 {% set p = typeref.split('.') %}
-{{ p[0][8:]|lower }}{{delim}}{{ p[2:]|join(delim) }}
+{{ p[1]|lower }}{{delim}}{{ p[3]|lower }}{{delim}}{{ ".".join(p[4:])}}
 {%- endmacro -%}
 
-{% macro ctor_dotpath(path, delim='.') %}
-{{ path[0][8:]|lower }}{{delim}}{{ path[2] }}
+{% macro ctor_namespace_beg(lst) %}
+{{ lst[1]|lower }}: { {{ lst[3]|lower }}: {
 {%- endmacro -%}
 
-{% macro ctor_namespace_beg(path) %}
-{{ path[0][8:]|lower }}: { {{ path[2] }}: {
-{%- endmacro -%}
-
-{% macro ctor_namespace_end(model) %}
-} }, // {{ ctor_dotpath(model.path) }}
+{% macro ctor_namespace_end(lst) %}
+} }, // {{ lst[1]|lower }}.{{ lst[3]|lower }}
 {%- endmacro -%}
 
 {% macro ctor_boolean(model, t) %}

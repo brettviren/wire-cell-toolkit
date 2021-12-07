@@ -29,12 +29,6 @@ local hier = {
     tns: s.sequence("TypeNames", self.tn,
                     doc="A sequence of component type name identifiers"),
 
-    // Describe an instance of a component interface.
-    compinter: s.record("ComponentInterface", [
-        s.field("typename", self.tn, doc="Instance typename"),
-        s.field("interface", self.ident, doc="C++ interface type"),
-    ], doc="A component interface instance"),
-
     count: s.number("Count", "i4",
                     doc="A simple counting number"),
 

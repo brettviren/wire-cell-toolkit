@@ -3,18 +3,18 @@
  * This file is 100% generated.  Any manual edits will likely be lost.
  *
  * This holds constructor functions for creating objects from the
- * schema: {{ ctor.ctor_dotpath(model.path) }}
+ * schema: {{ model.path|join(".") }}
  * 
  * Prefer these functions over manual object construction to assure
  * greater validity.
  *
  */
 {% for ep in model.extrefs %}
-local {{ ctor.ctor_extref(ep) }} = import "schema/{{ ctor.ctor_extref(ep, '/') }}.jsonnet";
+local {{ ctor.lower_path(ep, '_') }} = import "schema/{{ ctor.lower_path(ep, '/') }}.jsonnet";
 {% endfor %}
 
 {% for ep in model.extrefs %}
-{{ ctor.ctor_extref(ep) }} +
+{{ ctor.lower_path(ep, '_') }} +
 {% endfor %}
 {
     {{ ctor.ctor_namespace_beg(model.path) }}
@@ -24,6 +24,7 @@ local {{ ctor.ctor_extref(ep) }} = import "schema/{{ ctor.ctor_extref(ep, '/') }
     {{ ctor["ctor_"+t.schema](model, t)|indent }}
 
     {% endfor %}
-    {{ ctor.ctor_namespace_end(model) }}
+
+    {{ ctor.ctor_namespace_end(model.path) }}
 }
 
