@@ -169,6 +169,7 @@ void OmnibusSigProc::configure(const WireCell::Configuration& config)
         log->warn("The 'wiener_threshold_tag' is obsolete, thresholds in summary on 'wiener' tagged traces");
     }
     m_decon_charge_tag = get(config, "decon_charge_tag", m_decon_charge_tag);
+    m_rawdecon_tag = get(config, "rawdecon_tag", m_rawdecon_tag);
     m_gauss_tag = get(config, "gauss_tag", m_gauss_tag);
     m_frame_tag = get(config, "frame_tag", m_frame_tag);
 
@@ -334,6 +335,7 @@ WireCell::Configuration OmnibusSigProc::default_configuration() const
     cfg["wiener_tag"] = m_wiener_tag;
     // cfg["wiener_threshold_tag"] = m_wiener_threshold_tag;
     cfg["decon_charge_tag"] = m_decon_charge_tag;
+    cfg["rawdecon_tag"] = m_rawdecon_tag;
     cfg["gauss_tag"] = m_gauss_tag;
     cfg["frame_tag"] = m_frame_tag;
 
@@ -1097,6 +1099,14 @@ void OmnibusSigProc::decon_2D_init(int plane)
     // make ratio to the response and apply wire filter
     m_c_data[plane] = m_c_data[plane] / c_resp;
 
+    // Special debug-mode tap: capture the deconvolved spectrum before any
+    // software filter (Wire / Wiener / LF) and before any ROI mask.
+    // c_rawdecon stays empty in production runs (m_rawdecon_tag == "").
+    Array::array_xxc c_rawdecon;
+    if (!m_rawdecon_tag.empty()) {
+        c_rawdecon = m_c_data[plane];
+    }
+
     // apply software filter on wire
     // const std::vector<std::string> filter_names{"Wire_ind", "Wire_ind", "Wire_col"};
     Waveform::realseq_t wire_filter_wf;
@@ -1147,6 +1157,46 @@ void OmnibusSigProc::decon_2D_init(int plane)
     //Unpad the data if needed.
     //A check will be done internally to see if this is needed
     unpad_data(plane);
+
+    // Finalize rawdecon: replay the IFFT + wire-shift + time-shift + unpad
+    // path on the pre-Wire-filter spectrum we saved above.  The geometry
+    // matches the production wiener/gauss frames so they share a (wire, tick)
+    // grid for like-for-like comparison.
+    if (!m_rawdecon_tag.empty()) {
+        inv_inplace(m_dft, c_rawdecon, 0);                              // inv-FFT in wire
+        m_rawdecon_r_data[plane] = inv_c2r(m_dft, c_rawdecon, 1);        // inv-FFT in time
+
+        const int rd_nrows = m_rawdecon_r_data[plane].rows();
+        const int rd_ncols = m_rawdecon_r_data[plane].cols();
+        if (m_wire_shift[plane] > 0) {
+            Array::array_xxf arr1(m_wire_shift[plane], rd_ncols);
+            arr1 = m_rawdecon_r_data[plane].block(rd_nrows - m_wire_shift[plane], 0,
+                                                  m_wire_shift[plane], rd_ncols);
+            Array::array_xxf arr2(rd_nrows - m_wire_shift[plane], rd_ncols);
+            arr2 = m_rawdecon_r_data[plane].block(0, 0,
+                                                  rd_nrows - m_wire_shift[plane], rd_ncols);
+            m_rawdecon_r_data[plane].block(0, 0,
+                                           m_wire_shift[plane], rd_ncols) = arr1;
+            m_rawdecon_r_data[plane].block(m_wire_shift[plane], 0,
+                                           rd_nrows - m_wire_shift[plane], rd_ncols) = arr2;
+        }
+        int rd_time_shift = (m_coarse_time_offset + m_intrinsic_time_offset) / m_period;
+        if (rd_time_shift > 0) {
+            Array::array_xxf arr1(rd_nrows, rd_ncols - rd_time_shift);
+            arr1 = m_rawdecon_r_data[plane].block(0, 0, rd_nrows, rd_ncols - rd_time_shift);
+            Array::array_xxf arr2(rd_nrows, rd_time_shift);
+            arr2 = m_rawdecon_r_data[plane].block(0, rd_ncols - rd_time_shift,
+                                                  rd_nrows, rd_time_shift);
+            m_rawdecon_r_data[plane].block(0, 0, rd_nrows, rd_time_shift) = arr2;
+            m_rawdecon_r_data[plane].block(0, rd_time_shift,
+                                           rd_nrows, rd_ncols - rd_time_shift) = arr1;
+        }
+        // unpad_data() always operates on m_r_data[plane]; swap-in / swap-out
+        // so we reuse it without duplicating its body.
+        m_r_data[plane].swap(m_rawdecon_r_data[plane]);
+        unpad_data(plane);
+        m_r_data[plane].swap(m_rawdecon_r_data[plane]);
+    }
 
     m_c_data[plane] = fwd_r2c(m_dft, m_r_data[plane], 1);
 
@@ -1629,6 +1679,7 @@ bool OmnibusSigProc::operator()(const input_pointer& in, output_pointer& out)
         break_roi_loop2_traces, shrink_roi_traces, extend_roi_traces;
     IFrame::trace_list_t mp2_roi_traces, mp3_roi_traces;
     IFrame::trace_list_t decon_charge_traces;
+    IFrame::trace_list_t rawdecon_traces;   // pre-filter pre-ROI tap (special mode)
 
     // initialize the overall response function ...
     init_overall_response(in);
@@ -1667,6 +1718,23 @@ bool OmnibusSigProc::operator()(const input_pointer& in, output_pointer& out)
 
         decon_2D_init(iplane);  // decon in large matrix
         check_data(iplane, "after 2D init");
+
+        // Special-mode tap: save the bare pre-Wire-filter, pre-ROI deconvolved
+        // waveform that decon_2D_init() stashed into m_rawdecon_r_data.  Done
+        // BEFORE decon_2D_*ROI overwrites the intermediate buffers.
+        if (!m_rawdecon_tag.empty()) {
+            IFrame::trace_list_t perframe;
+            std::vector<double> dummy_thr;
+            // save_data() reads from m_r_data[iplane]; swap so it picks up
+            // the rawdecon buffer, then swap back to keep the rest of the
+            // loop unaffected.
+            m_r_data[iplane].swap(m_rawdecon_r_data[iplane]);
+            save_data(*itraces, perframe, iplane, perwire_rmses, dummy_thr,
+                      m_rawdecon_tag, /*save_negative_charge=*/true);
+            m_r_data[iplane].swap(m_rawdecon_r_data[iplane]);
+            rawdecon_traces.insert(rawdecon_traces.end(),
+                                   perframe.begin(), perframe.end());
+        }
 
         // Form tight ROIs
         if (iplane != 2) {  // induction wire planes
@@ -1847,6 +1915,7 @@ bool OmnibusSigProc::operator()(const input_pointer& in, output_pointer& out)
 
             m_c_data[iplane].resize(0, 0);  // clear memory
             m_r_data[iplane].resize(0, 0);  // clear memory
+            m_rawdecon_r_data[iplane].resize(0, 0);  // clear memory (no-op if unused)
         } // loop over planes
     } // m_use_roi_refinement
 
@@ -1879,6 +1948,10 @@ bool OmnibusSigProc::operator()(const input_pointer& in, output_pointer& out)
         if (!m_gauss_tag.empty()) {
             sframe->tag_traces(m_gauss_tag, gauss_traces);
         }
+    }
+
+    if (!m_rawdecon_tag.empty()) {
+        sframe->tag_traces(m_rawdecon_tag, rawdecon_traces);
     }
 
     if (m_use_roi_debug_mode) {

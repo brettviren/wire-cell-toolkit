@@ -53,8 +53,11 @@ function(tools, outputfile) {
         root_file_mode: 'UPDATE',
         // frames: ['gauss%d' % tools.anodes[n].data.ident, 'wiener%d' % tools.anodes[n].data.ident],
         frames: ['gauss%d' % tools.anodes[n].data.ident,
-        'wiener%d' % tools.anodes[n].data.ident
-        
+        'wiener%d' % tools.anodes[n].data.ident,
+        // 'rawdecon%d' is a special-mode tag emitted by OmnibusSigProc only
+        // when its rawdecon_tag config is non-empty.  When the tag is absent
+        // from the input frame, MagnifySink simply skips it — no error.
+        'rawdecon%d' % tools.anodes[n].data.ident,
         ],
         trace_has_tag: true,
         anode: wc.tn(tools.anodes[n]),

@@ -220,6 +220,12 @@ namespace WireCell {
             Array::array_xxf m_r_data[3];
             Array::array_xxc m_c_data[3];
 
+            // Pre-Wire-filter, pre-ROI deconvolved waveform per plane.
+            // Populated by decon_2D_init() only when m_rawdecon_tag is set.
+            // Special debug-mode tap for offline filter tuning; off in
+            // production runs.
+            Array::array_xxf m_rawdecon_r_data[3];
+
             // average overall responses
             std::vector<Waveform::realseq_t> overall_resp[3];
             // filters for overall responses
@@ -229,6 +235,9 @@ namespace WireCell {
             std::string m_wiener_tag{"wiener"};
 //            std::string m_wiener_threshold_tag;
             std::string m_decon_charge_tag{"decon_charge"};
+            // Special-mode tag for pre-Wire-filter, pre-ROI deconvolved
+            // waveform.  Empty string disables (production default).
+            std::string m_rawdecon_tag{""};
             std::string m_gauss_tag{"gauss"};
             std::string m_frame_tag{"sigproc"};
 

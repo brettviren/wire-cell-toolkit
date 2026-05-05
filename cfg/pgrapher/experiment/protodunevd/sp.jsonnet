@@ -28,7 +28,8 @@ function(params, tools, override = {}) {
                l1sp_pd_wf_dump_path='',
                l1sp_pd_planes=[0, 1],
                l1sp_pd_adj_enable=true,
-               l1sp_pd_adj_max_hops=3)::
+               l1sp_pd_adj_max_hops=3,
+               dump_rawdecon=false)::
     // Top (_t) vs bottom (_b) anode filter suffix.  Bottom = ident 0..3,
     // top = ident 4..7.  See sp-filters.jsonnet for the registered names.
     local sfx = if anode.data.ident < 4 then '_b' else '_t';
@@ -121,6 +122,10 @@ function(params, tools, override = {}) {
       wiener_threshold_tag: 'threshold%d' % anode.data.ident,
       decon_charge_tag: 'decon_charge%d' % anode.data.ident,
       gauss_tag: 'gauss%d' % anode.data.ident,
+      // Special-mode pre-Wire-filter pre-ROI deconvolved waveform tap.
+      // Empty when dump_rawdecon=false (production default), enabling the
+      // tap-out only for offline filter-tuning special runs.
+      rawdecon_tag: if dump_rawdecon then 'rawdecon%d' % anode.data.ident else '',
 
       use_roi_debug_mode: false,
       tight_lf_tag: 'tight_lf%d' % anode.data.ident,
@@ -254,6 +259,9 @@ function(params, tools, override = {}) {
       // bit-identical to a no-L1SP run.
       local rawsplit     = g.pnode({type: 'FrameSplitter', name: 'rawsplit%d' % n}, nin=1, nout=2);
       local sigsplit     = g.pnode({type: 'FrameSplitter', name: 'sigsplit%d' % n}, nin=1, nout=2);
+      // rawdecon%d is a special-mode debug tap (off in production); listing it
+      // in mergemap preserves the tag through both FrameMergers when present
+      // and is a no-op when absent (production runs).
       local rawsigmerge  = g.pnode({
         type: 'FrameMerger', name: 'rawsigmerge%d' % n,
         data: {
@@ -261,6 +269,7 @@ function(params, tools, override = {}) {
           mergemap: [
             ['raw%d' % n, 'raw%d' % n, 'raw%d' % n],
             ['gauss%d' % n, 'gauss%d' % n, 'gauss%d' % n],
+            ['rawdecon%d' % n, 'rawdecon%d' % n, 'rawdecon%d' % n],
           ],
         },
       }, nin=2, nout=1);
@@ -271,6 +280,8 @@ function(params, tools, override = {}) {
           mergemap: [
             ['gauss%d' % n, 'gauss%d'  % n, 'gauss%d'  % n],   // L1SP gauss -> output gauss
             ['gauss%d' % n, 'wiener%d' % n, 'wiener%d' % n],   // L1SP gauss -> output wiener
+            // rawdecon is debug-only, never modified by L1SP — pass through.
+            ['rawdecon%d' % n, 'rawdecon%d' % n, 'rawdecon%d' % n],
           ],
         },
       }, nin=2, nout=1);
