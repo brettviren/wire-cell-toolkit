@@ -126,7 +126,6 @@ function(params, tools, override = {}) {
       // Empty when dump_rawdecon=false (production default), enabling the
       // tap-out only for offline filter-tuning special runs.
       rawdecon_tag: if dump_rawdecon then 'rawdecon%d' % anode.data.ident else '',
-
       use_roi_debug_mode: false,
       tight_lf_tag: 'tight_lf%d' % anode.data.ident,
       loose_lf_tag: 'loose_lf%d' % anode.data.ident,
@@ -259,9 +258,9 @@ function(params, tools, override = {}) {
       // bit-identical to a no-L1SP run.
       local rawsplit     = g.pnode({type: 'FrameSplitter', name: 'rawsplit%d' % n}, nin=1, nout=2);
       local sigsplit     = g.pnode({type: 'FrameSplitter', name: 'sigsplit%d' % n}, nin=1, nout=2);
-      // rawdecon%d is a special-mode debug tap (off in production); listing it
-      // in mergemap preserves the tag through both FrameMergers when present
-      // and is a no-op when absent (production runs).
+      // rawdecon%d is a special-mode debug tap (off in production);
+      // listing it in mergemap preserves the tag through both FrameMergers
+      // when present and is a no-op when absent (production runs).
       local rawsigmerge  = g.pnode({
         type: 'FrameMerger', name: 'rawsigmerge%d' % n,
         data: {

@@ -1196,6 +1196,12 @@ void OmnibusSigProc::decon_2D_init(int plane)
         m_r_data[plane].swap(m_rawdecon_r_data[plane]);
         unpad_data(plane);
         m_r_data[plane].swap(m_rawdecon_r_data[plane]);
+        // Strip the FFT row-padding (m_pad_nwires) and trim time axis to
+        // m_nticks so save_data() reads the same (m_nwires × m_nticks) grid
+        // that production wiener/gauss live on.  Mirrors the .block() slice
+        // at the end of decon_2D_hits / decon_2D_tightROI.
+        m_rawdecon_r_data[plane] = m_rawdecon_r_data[plane].block(
+            m_pad_nwires[plane], 0, m_nwires[plane], m_nticks).eval();
     }
 
     m_c_data[plane] = fwd_r2c(m_dft, m_r_data[plane], 1);

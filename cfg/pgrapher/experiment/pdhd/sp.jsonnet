@@ -89,7 +89,6 @@ function(params, tools, override = {}) {
       // Special-mode pre-Wire-filter pre-ROI deconvolved waveform tap.
       // Empty when dump_rawdecon=false (production default).
       rawdecon_tag: if dump_rawdecon then 'rawdecon%d' % anode.data.ident else '',
-
       use_roi_debug_mode: false,
       tight_lf_tag: 'tight_lf%d' % anode.data.ident,
       loose_lf_tag: 'loose_lf%d' % anode.data.ident,
@@ -182,11 +181,9 @@ function(params, tools, override = {}) {
       // covered by L1SP, which in practice is none.
       local rawsplit     = g.pnode({type: 'FrameSplitter', name: 'rawsplit%d' % n}, nin=1, nout=2);
       local sigsplit     = g.pnode({type: 'FrameSplitter', name: 'sigsplit%d' % n}, nin=1, nout=2);
-      // rawdecon%d is a special-mode debug tap (off in production); when
-      // dump_rawdecon=true the SP node emits it and we plumb it through
-      // both FrameMergers below so the FrameFileSink/MagnifySink see it.
-      // Listing it in mergemap preserves the tag; if the tag is absent from
-      // both inputs (production runs) the entry is a no-op.
+      // rawdecon%d is a special-mode debug tap (off in production);
+      // listing it in mergemap preserves the tag through both FrameMergers
+      // when present and is a no-op when absent (production runs).
       local rawsigmerge  = g.pnode({
         type: 'FrameMerger', name: 'rawsigmerge%d' % n,
         data: {
