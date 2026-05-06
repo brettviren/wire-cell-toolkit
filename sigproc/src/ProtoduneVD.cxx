@@ -19,9 +19,11 @@
 #include "WireCellUtil/Units.h"
 
 #include "WireCellUtil/Persist.h"
+#include "WireCellUtil/cnpy.h"
 
 #include <cmath>
 #include <complex>
+#include <filesystem>
 #include <iostream>
 #include <set>
 #include <fstream>
@@ -1336,6 +1338,10 @@ void PDVD::ShieldCouplingSub::configure(const WireCell::Configuration& cfg)
     m_dft = Factory::find_tn<IDFT>(dft_tn);
 
     m_rms_threshold = get<float>(cfg, "rms_threshold", m_rms_threshold);
+    m_dump_path = get<std::string>(cfg, "dump_path", m_dump_path);
+    if (!m_dump_path.empty()) {
+        std::filesystem::create_directories(m_dump_path);
+    }
     // m_capa_weight = get<bool>(cfg, "capa_weight", m_capa_weight);
     // m_calibrated = get<bool>(cfg, "calibrated", m_calibrated);
     // m_group_size = get<int>(cfg, "group_size", m_group_size);
@@ -1347,6 +1353,7 @@ WireCell::Configuration PDVD::ShieldCouplingSub::default_configuration() const
     Configuration cfg;
     cfg["anode"] = m_anode_tn;
     cfg["noisedb"] = m_noisedb_tn;
+    cfg["dump_path"] = m_dump_path;  // directory for diagnostic npz dumps; "" = disabled
     // cfg["capa_weight"] = m_capa_weight;
     // cfg["calibrated"] = m_calibrated;
     // cfg["group_size"] = m_group_size;
@@ -1358,19 +1365,38 @@ WireCell::Waveform::ChannelMaskMap PDVD::ShieldCouplingSub::apply(
     channel_signals_t& chansig) const
 {
     WireCell::Waveform::ChannelMaskMap ret;
-    
+
     if (chansig.empty()) {
         return ret;
     }
-    // std::cout << "grouped channel size: " << " " << chansig.size() << std::endl;
-    
+
     const int nbins = (chansig.begin()->second).size();
+    const int nch   = static_cast<int>(chansig.size());
+    const bool do_dump = !m_dump_path.empty();
+
+    // Diagnostic dump buffers (filled only when do_dump is true).
+    std::vector<int32_t> dump_channels;
+    std::vector<float>   dump_strip_lengths;
+    std::vector<float>   dump_wf_in_raw;   // nch x ntick, pre-normalization (physical ADC)
+    std::vector<float>   dump_wf_in_norm;  // nch x ntick, after /strip_length, before mask
+    std::vector<uint8_t> dump_signal_mask; // nch x ntick, 1 = signal-protected
+
+    // Capture raw-ADC input before any modification.
+    if (do_dump) {
+        dump_wf_in_raw.reserve(nch * nbins);
+        for (auto& cs : chansig) {
+            dump_channels.push_back(static_cast<int32_t>(cs.first));
+            for (float v : cs.second) dump_wf_in_raw.push_back(v);
+        }
+        dump_wf_in_norm.reserve(nch * nbins);
+        dump_signal_mask.reserve(nch * nbins);
+    }
 
     std::map<int, float> scale_factors;
     for (auto& cs : chansig) {
         const int ch = cs.first;
         auto& signal = cs.second;
-        
+
         float strip_length = 1.0;
         auto it = m_strip_lengths.find(ch);
         if (it != m_strip_lengths.end() && it->second > 0) {
@@ -1378,66 +1404,47 @@ WireCell::Waveform::ChannelMaskMap PDVD::ShieldCouplingSub::apply(
         }else{
             std::cerr<<"error!! strip length for ch "<<ch<<" not found"<< std::endl;
         }
-        
+
         scale_factors[ch] = strip_length;
-        
+        if (do_dump) dump_strip_lengths.push_back(strip_length);
+
         // Scale DOWN: divide by strip length (like calib/capa in Lardon)
         for (int ibin = 0; ibin < nbins; ibin++) {
             signal.at(ibin) /= strip_length;
         }
-        
+
+        // Capture normalized waveform before masking.
+        if (do_dump) {
+            for (float v : signal) dump_wf_in_norm.push_back(v);
+        }
+
         Signal_mask_top_u(signal);
     }
 
-
     WireCell::Waveform::realseq_t medians = PDVD::CalcMedian_shieldCoupling_u(chansig);
 
-    // const int achannel = chansig.begin()->first;
-   
-    
-    // if(false){
-    //     std::cout<<"print out median: "<<achannel<<std::endl;
-    // std::string filename = "medians_output_tu"+ std::to_string(achannel)+".txt";
-    // std::ofstream outfile(filename);
-    
-    // for (size_t i = 0; i < medians.size(); ++i) {
-    //     outfile << i << " " << medians[i]<<std::endl;
-    // }
-    
-    // outfile.close();
-    // int k=0;
-    // for (auto it : chansig) {
-    // if(it.first % 40==0){
-    //     std::string filename2 = "medians_output_tu"+ std::to_string(achannel)+"_"+std::to_string(k)+".txt";
-    //     std::ofstream outfile2(filename2);
-    
-    //     for (size_t i = 0; i < medians.size(); ++i) {
-    //         outfile2 << i << " " << it.second.at(i)<<std::endl;
-    //     }
-    
-    //     outfile2.close();
-    //     k++;
-    // }
-
-    // }
-
-    // }
-
+    // Capture signal mask from the +200000 sentinel markers (still present in chansig).
+    if (do_dump) {
+        for (auto& cs : chansig) {
+            for (float v : cs.second) {
+                dump_signal_mask.push_back(v > 100000.0f ? 1 : 0);
+            }
+        }
+    }
 
     for (auto it : chansig) {
         int ch = it.first;
         WireCell::IChannelFilter::signal_t& signal = it.second;
-        PDVD::RemoveFilterFlags(signal); 
+        PDVD::RemoveFilterFlags(signal);
 
         int nbin = signal.size();
         float scaling=1;
-                for (int i = 0; i != nbin; i++) {
-                if (fabs(signal.at(i)) > 0.001) {
-                    signal.at(i) = signal.at(i) - medians.at(i) * scaling;
-                }
+        for (int i = 0; i != nbin; i++) {
+            if (fabs(signal.at(i)) > 0.001) {
+                signal.at(i) = signal.at(i) - medians.at(i) * scaling;
             }
-
-         chansig[ch] = signal;
+        }
+        chansig[ch] = signal;
     }
 
     for (auto& cs : chansig) {
@@ -1452,7 +1459,34 @@ WireCell::Waveform::ChannelMaskMap PDVD::ShieldCouplingSub::apply(
         }
     }
 
-  return ret;
+    // Write diagnostic npz: one file per group, keyed by first channel number.
+    if (do_dump && !dump_channels.empty()) {
+        const int first_ch = dump_channels[0];
+        const std::string fname = m_dump_path + "/shield_dump_ch"
+                                  + std::to_string(first_ch) + ".npz";
+
+        // Medians in float32 for compact storage.
+        std::vector<float> medians_f(medians.begin(), medians.end());
+
+        // Capture raw-ADC output (after full processing) from chansig.
+        std::vector<float> dump_wf_out_raw;
+        dump_wf_out_raw.reserve(nch * nbins);
+        for (auto& cs : chansig) {
+            for (float v : cs.second) dump_wf_out_raw.push_back(v);
+        }
+
+        const size_t snch  = static_cast<size_t>(nch);
+        const size_t snbin = static_cast<size_t>(nbins);
+        cnpy::npz_save(fname, "channels",      dump_channels.data(),     {snch},        "w");
+        cnpy::npz_save(fname, "strip_lengths", dump_strip_lengths.data(),{snch},        "a");
+        cnpy::npz_save(fname, "wf_in_raw",     dump_wf_in_raw.data(),    {snch, snbin}, "a");
+        cnpy::npz_save(fname, "wf_in_norm",    dump_wf_in_norm.data(),   {snch, snbin}, "a");
+        cnpy::npz_save(fname, "signal_mask",   dump_signal_mask.data(),  {snch, snbin}, "a");
+        cnpy::npz_save(fname, "medians_norm",  medians_f.data(),         {snbin},       "a");
+        cnpy::npz_save(fname, "wf_out_raw",    dump_wf_out_raw.data(),   {snch, snbin}, "a");
+    }
+
+    return ret;
 }
 
 WireCell::Waveform::ChannelMaskMap PDVD::ShieldCouplingSub::apply(

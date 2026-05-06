@@ -153,7 +153,8 @@ namespace WireCell {
                 std::map<int, float> m_strip_lengths;
                 IDFT::pointer m_dft;
 
-                float m_rms_threshold; 
+                float m_rms_threshold;
+                std::string m_dump_path;  // directory for diagnostic npz dumps; "" = disabled
                 // bool m_capa_weight;
                 // bool m_calibrated;
                 // int m_group_size;

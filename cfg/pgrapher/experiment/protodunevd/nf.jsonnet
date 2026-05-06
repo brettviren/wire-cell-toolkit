@@ -5,7 +5,7 @@ local wc = import 'wirecell.jsonnet';
 local sp_filters = import 'pgrapher/experiment/protodunevd/sp-filters.jsonnet';
 
 function(params, anode, chndbobj, n, name='',
-         debug_dump_path='', debug_dump_groups=[])
+         debug_dump_path='', debug_dump_groups=[], shield_dump_path='')
   {
     local single = {
       type: 'PDVDOneChannelNoise',
@@ -48,6 +48,7 @@ function(params, anode, chndbobj, n, name='',
              noisedb: wc.tn(chndbobj),
              strip_length: params.files.strip_length,
              rms_threshold: 0.0,
+             dump_path: shield_dump_path,
          },
      },
 
