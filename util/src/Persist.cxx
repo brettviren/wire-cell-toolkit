@@ -29,6 +29,7 @@ extern "C" {
     void jsonnet_ext_code(struct JsonnetVm* vmRef, char* key, char* value);
     void jsonnet_tla_var(struct JsonnetVm* vmRef, char* key, char* value);
     void jsonnet_tla_code(struct JsonnetVm* vmRef, char* key, char* value);
+    void jsonnet_max_stack(struct JsonnetVm* vmRef, unsigned v);
     char* jsonnet_evaluate_file(struct JsonnetVm* vmRef, char* filename, int* e);
     char* jsonnet_evaluate_snippet(struct JsonnetVm* vmRef, char* filename, char* code, int* e);
 }
@@ -326,6 +327,10 @@ WireCell::Persist::Parser::Parser(const std::vector<std::string>& load_paths, co
                                   const externalvars_t& tlacode)
     : m_jvm{jsonnet_make()}
 {
+    // Default jsonnet max stack is 500 frames, which std.foldl chews through
+    // when fed lists with hundreds of elements (e.g. 360-fold fan-out configs
+    // hitting g.uses/popuses/std.foldl).
+    jsonnet_max_stack(m_jvm, 100000);
 
     // Loading: 1) cwd, 2) passed in paths 3) environment
     m_load_paths.push_back(boost::filesystem::current_path());
