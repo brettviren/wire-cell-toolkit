@@ -2,7 +2,7 @@
 
 # End-to-end PDVD bottom-drift anode 0 NF+SP regression test.
 #
-# Runs wire-cell against the production wct-nf-sp.jsonnet on the anode 0
+# Runs wire-cell against a pre-rendered frozen config on the anode 0
 # raw frame archive for run 039324 evt 0, and compares the resulting SP
 # frames (gauss0, wiener0 tags) bit-exactly against the checked-in
 # reference tar at sigproc/test/data/protodunevd-sp-frames-anode0.tar.bz2.
@@ -56,9 +56,19 @@
 #                   sigproc/test/data/.  Override only when refreshing
 #                   the reference after a deliberate algorithmic change.
 #
-#   WCT_PDVD_DEPLOY directory holding the standalone wct-nf-sp.jsonnet
-#                   entry point.  Defaults to:
-#                     /nfs/data/1/xqian/toolkit-dev/toolkit/pdvd
+# The wire-cell configuration is taken from the in-tree pre-rendered
+# snapshot sigproc/test/data/pdvd-anode0-nf-sp-cfg.json (frozen at
+# jsonnet render time).  To refresh after a deliberate config change,
+# re-run:
+#   jsonnet -J cfg \
+#     --tla-str orig_prefix=protodune-orig-frames \
+#     --tla-str raw_prefix=protodune-sp-frames-raw \
+#     --tla-str sp_prefix=protodune-sp-frames \
+#     --tla-str reality=data \
+#     --tla-code 'anode_indices=[0]' \
+#     --tla-str l1sp_pd_mode=process \
+#     pdvd/wct-nf-sp.jsonnet > sigproc/test/data/pdvd-anode0-nf-sp-cfg.json
+# and commit the new JSON together with the refreshed reference tar.
 
 bats_load_library wct-bats.sh
 
@@ -66,14 +76,13 @@ bats_load_library wct-bats.sh
 @test "PDVD anode 0 NF+SP regression vs frozen reference" {
     local data_dir="${WCT_PDVD_DATA:-/nfs/data/1/xqian/toolkit-dev/toolkit/pdvd/input_data/run039324/evt_0}"
     local ref_dir="${WCT_PDVD_REF:-$(dirname "$BATS_TEST_FILENAME")/data}"
-    local deploy_dir="${WCT_PDVD_DEPLOY:-/nfs/data/1/xqian/toolkit-dev/toolkit/pdvd}"
+    local frozen_cfg="$(dirname "$BATS_TEST_FILENAME")/data/pdvd-anode0-nf-sp-cfg.json"
     local input_tar="${data_dir}/protodune-orig-frames-anode0.tar.bz2"
     local ref_tar="${ref_dir}/protodunevd-sp-frames-anode0.tar.bz2"
-    local jsonnet="${deploy_dir}/wct-nf-sp.jsonnet"
 
-    [ -f "$input_tar" ] || skip "no anode 0 input tar at $input_tar"
-    [ -f "$ref_tar"   ] || skip "no anode 0 reference tar at $ref_tar"
-    [ -f "$jsonnet"   ] || skip "no wct-nf-sp.jsonnet at $jsonnet"
+    [ -f "$input_tar"  ] || skip "no anode 0 input tar at $input_tar"
+    [ -f "$ref_tar"    ] || skip "no anode 0 reference tar at $ref_tar"
+    [ -f "$frozen_cfg" ] || skip "no frozen cfg at $frozen_cfg"
     command -v wire-cell >/dev/null || skip "wire-cell not on PATH"
     command -v python3   >/dev/null || skip "python3 not on PATH"
 
@@ -81,15 +90,8 @@ bats_load_library wct-bats.sh
 
     cp "$input_tar" "protodune-orig-frames-anode0.tar.bz2"
 
-    # Run wire-cell on anode 0 only (bottom-drift, Resampler active).
-    wire-cell -l stderr -L info \
-        --tla-str orig_prefix="protodune-orig-frames" \
-        --tla-str raw_prefix="protodune-sp-frames-raw" \
-        --tla-str sp_prefix="protodune-sp-frames" \
-        --tla-str reality="data" \
-        --tla-code anode_indices="[0]" \
-        --tla-str l1sp_pd_mode="process" \
-        -c "$jsonnet"
+    # Run wire-cell using the pre-rendered frozen config (no live jsonnet).
+    wire-cell -l stderr -L info -c "$frozen_cfg"
 
     local out_tar="protodune-sp-frames-anode0.tar.bz2"
     [ -s "$out_tar" ] || die "wire-cell did not produce $out_tar"

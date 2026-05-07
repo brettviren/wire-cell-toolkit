@@ -2,7 +2,7 @@
 
 # End-to-end PDHD APA1 NF+SP regression test.
 #
-# Runs wire-cell against the production wct-nf-sp.jsonnet on the APA1
+# Runs wire-cell against a pre-rendered frozen config on the APA1
 # raw frame archive for run 027409 evt 0, and numerically compares the
 # resulting SP frames (gauss1, wiener1 tags) against a checked-in
 # reference tar.bz2 at sigproc/test/data/protodunehd-sp-frames-anode1.tar.bz2.
@@ -28,9 +28,19 @@
 #                   (e.g. commit 616cfcb2 routed L1SP into wiener1, at
 #                   which point this fixture was generated from HEAD).
 #
-#   WCT_PDHD_DEPLOY directory holding the standalone wct-nf-sp.jsonnet
-#                   entry point.  Defaults to:
-#                     /nfs/data/1/xqian/toolkit-dev/wcp-porting-img/pdhd
+# The wire-cell configuration is taken from the in-tree pre-rendered
+# snapshot sigproc/test/data/pdhd-apa1-nf-sp-cfg.json (frozen at
+# jsonnet render time).  To refresh after a deliberate config change,
+# re-run:
+#   jsonnet -J cfg \
+#     -V elecGain=14 \
+#     --tla-str orig_prefix=protodunehd-orig-frames \
+#     --tla-str raw_prefix=protodunehd-sp-frames-raw \
+#     --tla-str sp_prefix=protodunehd-sp-frames \
+#     --tla-str reality=data \
+#     --tla-code 'anode_indices=[1]' \
+#     pdhd/wct-nf-sp.jsonnet > sigproc/test/data/pdhd-apa1-nf-sp-cfg.json
+# and commit the new JSON together with the refreshed reference tar.
 
 bats_load_library wct-bats.sh
 
@@ -38,33 +48,22 @@ bats_load_library wct-bats.sh
 @test "PDHD APA1 NF+SP regression vs frozen reference" {
     local data_dir="${WCT_PDHD_DATA:-/nfs/data/1/xqian/toolkit-dev/wcp-porting-img/pdhd/input_data/run027409/evt_0}"
     local ref_dir="${WCT_PDHD_REF:-$(dirname "$BATS_TEST_FILENAME")/data}"
-    local deploy_dir="${WCT_PDHD_DEPLOY:-/nfs/data/1/xqian/toolkit-dev/wcp-porting-img/pdhd}"
+    local frozen_cfg="$(dirname "$BATS_TEST_FILENAME")/data/pdhd-apa1-nf-sp-cfg.json"
     local input_tar="${data_dir}/protodunehd-orig-frames-anode1.tar.bz2"
     local ref_tar="${ref_dir}/protodunehd-sp-frames-anode1.tar.bz2"
-    local jsonnet="${deploy_dir}/wct-nf-sp.jsonnet"
 
     [ -f "$input_tar"  ] || skip "no APA1 input tar at $input_tar"
     [ -f "$ref_tar"    ] || skip "no APA1 reference tar at $ref_tar"
-    [ -f "$jsonnet"    ] || skip "no wct-nf-sp.jsonnet at $jsonnet"
+    [ -f "$frozen_cfg" ] || skip "no frozen cfg at $frozen_cfg"
     command -v wire-cell >/dev/null || skip "wire-cell not on PATH"
     command -v python3   >/dev/null || skip "python3 not on PATH"
 
     cd_tmp
 
-    # wire-cell expects the input prefix as a string; the FrameFileSource
-    # will read "${prefix}-anode1.tar.bz2".  We stage the input next to
-    # the test cwd so a single prefix works for the source.
     cp "$input_tar" "protodunehd-orig-frames-anode1.tar.bz2"
 
-    # Run wire-cell on APA1 only.
-    wire-cell -l stderr -L info \
-        -V "elecGain=14" \
-        --tla-str orig_prefix="protodunehd-orig-frames" \
-        --tla-str raw_prefix="protodunehd-sp-frames-raw" \
-        --tla-str sp_prefix="protodunehd-sp-frames" \
-        --tla-str reality="data" \
-        --tla-code anode_indices="[1]" \
-        -c "$jsonnet"
+    # Run wire-cell using the pre-rendered frozen config (no live jsonnet).
+    wire-cell -l stderr -L info -c "$frozen_cfg"
 
     local out_tar="protodunehd-sp-frames-anode1.tar.bz2"
     [ -s "$out_tar" ] || die "wire-cell did not produce $out_tar"

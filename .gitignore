@@ -58,6 +58,7 @@ ltximg
 *.vtu
 *.pdf
 *.json
+!sigproc/test/data/*.json
 .snakemake
 *.old
 *.junk
