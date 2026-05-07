@@ -1077,17 +1077,20 @@ Observed run-to-run spread is bit-zero on this branch (commit
 are conservative against future drift.
 
 The reference fixture was last regenerated 2026-05-06 to incorporate
-four legitimate algorithmic changes that landed after the prior
+the legitimate algorithmic changes that landed after the prior
 baseline (2026-05-02):
 
   - 14b6c6de: `rawdecon` tap support in OmnibusSigProc
   - b4d61985: rawdecon trim to (m_nwires × m_nticks) grid
-  - dc613760: `BreakROIs` UAF / iterator-UB fix in ROI_refinement
-              (snapshot-then-iterate; changes ROI iteration order
-              on every plane, not just PDVD)
   - 36489a20: uninitialized FFT-padding rows in
               `OmnibusSigProc::decon_2D_looseROI` (see "PDVD anode 0
               regression" below for the original symptom)
+  - revert of dc613760's `BreakROI1` removal: that commit dropped the
+              `BreakROIs` second pass under a false UAF premise (see
+              "PDVD anode 0 regression" below); the second pass is
+              the legitimate near-zero-crossing split and has been
+              restored, with the harmless snapshot-then-iterate pattern
+              kept in the first pass
 
 Refresh it (and update `WCT_PDHD_REF` if you don't want to overwrite
 the in-tree copy) only when a deliberate algorithmic change is being
@@ -1113,10 +1116,8 @@ PDVD-only differences from the PDHD test:
     bottom path)
   - No `elecGain` override (protodunevd/params.jsonnet has gains)
 
-The PDVD branch needed two SP-side fixes to reach bit-determinism:
+The PDVD branch needed one SP-side fix to reach bit-determinism:
 
-  - `dc613760` — `BreakROIs` UAF / iterator UB in ROI_refinement
-    (PDVD-discovered; affects all detectors)
   - `36489a20` — uninitialized FFT-padding rows in
     `OmnibusSigProc::decon_2D_looseROI`.  The function only filled
     `c_data_afterfilter` rows iterated by `m_channel_range[plane]`
@@ -1134,9 +1135,18 @@ The PDVD branch needed two SP-side fixes to reach bit-determinism:
     `decon_2D_charge`: initialize all rows with the default filter,
     then apply the per-channel bad/lf_noisy override in a second pass.
 
-After both fixes, 12 fresh PDVD runs are bit-identical for both
+After this fix, 12 fresh PDVD runs are bit-identical for both
 `l1sp_pd_mode='process'` and `l1sp_pd_mode=''`; the test asserts
 bit-exact (`np.array_equal`) on every `frame_*` npy.
+
+Note: an earlier intermediate commit (`dc613760`) attributed the
+non-determinism to a UAF / iterator-UB in `BreakROIs` and disabled
+the `BreakROI1` second pass.  That diagnosis was wrong — `BreakROI`
+neither erases from `rois_*_loose` nor deletes the `SignalROI`; the
+function that does is `BreakROI1` itself, and it ran in a separate
+post-iteration loop.  `36489a20` was the actual root cause and is
+sufficient on its own for bit-determinism.  The `BreakROI1` second
+pass has been restored.
 
 Skip semantics mirror the PDHD test: skips cleanly when any of
 `WCT_PDVD_DATA`, `WCT_PDVD_DEPLOY`, or the in-tree reference is absent.

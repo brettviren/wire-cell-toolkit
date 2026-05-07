@@ -2454,32 +2454,15 @@ void ROI_refinement::BreakROI1(SignalROI *roi)
 
 void ROI_refinement::BreakROIs(int plane, ROI_formation &roi_form)
 {
-    // BreakROI erases its argument from rois_*_loose AND deletes the SignalROI.
-    // The previous implementation iterated rois_*_loose directly with a list
-    // iterator AND then pushed *it into all_rois AND advanced it++ — all
-    // touching the just-erased / just-deleted node (iterator UB and
-    // use-after-free on the SignalROI).  Then BreakROI1 was called on those
-    // freed pointers, reading freed memory and double-freeing them.  Heap
-    // contents at the freed addresses are ASLR-dependent, which is the
-    // empirically observed source of PDVD-anode-0 SP non-determinism on a
-    // subset of channels.
-    //
-    // Fix: (1) snapshot the list pointers into a vector before calling
-    // BreakROI, so the iteration does not touch the list being mutated; and
-    // (2) skip the BreakROI1 second-pass loop entirely.  BreakROI1 was
-    // documented to do a separate zero-crossing split on the *original* ROIs,
-    // but the original ROIs no longer exist by the time BreakROI1 sees them
-    // (BreakROI deleted them).  Since the original loop was reading freed
-    // memory, its observable effect was undefined — disabling it removes UB
-    // without losing well-defined behaviour.  A follow-up may want to
-    // refactor BreakROI1 to operate on the post-split sub-ROIs (the new
-    // entries in rois_*_loose.at(i)) if that is the intended algorithm.
+    SignalROISelection all_rois;
+
     if (plane == 0) {
         std::vector<float> &rms_u = roi_form.get_uplane_rms();
         for (size_t i = 0; i != rois_u_loose.size(); i++) {
             SignalROISelection snap(rois_u_loose.at(i).begin(), rois_u_loose.at(i).end());
             for (auto* r : snap) {
                 BreakROI(r, rms_u.at(i));
+                all_rois.push_back(r);
             }
         }
     }
@@ -2489,8 +2472,13 @@ void ROI_refinement::BreakROIs(int plane, ROI_formation &roi_form)
             SignalROISelection snap(rois_v_loose.at(i).begin(), rois_v_loose.at(i).end());
             for (auto* r : snap) {
                 BreakROI(r, rms_v.at(i));
+                all_rois.push_back(r);
             }
         }
+    }
+
+    for (size_t i = 0; i != all_rois.size(); i++) {
+        BreakROI1(all_rois.at(i));
     }
 }
 
