@@ -2,6 +2,8 @@
 #include "WireCellUtil/NamedFactory.h"
 #include "WireCellUtil/Logging.h"
 
+#include <unordered_map>
+
 using namespace std;
 using namespace WireCell;
 
@@ -14,10 +16,29 @@ ConfigManager::~ConfigManager() {}
 
 void ConfigManager::extend(Configuration more)
 {
-    // m_top = append(m_top, more);
+    // O(N+M) instead of O(N*M): build an index map of existing entries once,
+    // then probe per new entry.  Bulk loads of large configs (thousands of
+    // entries) used to scale quadratically through add()->index() linear scan.
+    std::unordered_map<std::string, int> by_tn;
+    by_tn.reserve(m_top.size() + more.size());
+    for (int i = 0; i < static_cast<int>(m_top.size()); ++i) {
+        const auto& c = m_top[i];
+        by_tn[get<string>(c, "type") + "\t" + get<string>(c, "name")] = i;
+    }
 
     for (auto one : more) {
-        add(one);
+        const std::string key = get<string>(one, "type") + "\t" + get<string>(one, "name");
+        auto it = by_tn.find(key);
+        if (it == by_tn.end()) {
+            const int ind = m_top.size();
+            m_top[ind] = one;
+            by_tn[key] = ind;
+        }
+        else {
+            spdlog::warn("ConfigManager::extend() overwriting type=\"{}\" name=\"{}\"",
+                         get<string>(one, "type"), get<string>(one, "name"));
+            m_top[it->second] = one;
+        }
     }
 }
 
