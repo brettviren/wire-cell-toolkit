@@ -87,7 +87,7 @@ local wf(name, data={}) = {
   lf('ROI_tight_lf_t',   { tau: 0.014 * wc.megahertz }),
   lf('ROI_tighter_lf_b', { tau: 0.06  * wc.megahertz }),
   lf('ROI_tighter_lf_t', { tau: 0.06  * wc.megahertz }),
-  lf('ROI_loose_lf_b',   { tau: 0.002 * wc.megahertz }),
+  lf('ROI_loose_lf_b',   { tau: 0.003 * wc.megahertz }),
   lf('ROI_loose_lf_t',   { tau: 0.003 * wc.megahertz }),
 
   hf('Gaus_tight'),

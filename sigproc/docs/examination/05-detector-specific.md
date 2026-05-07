@@ -285,7 +285,7 @@ notches are reactivated.
   - `SignalProtection` (median deconv) applies `HfFilter Wiener_tight_{U,V,W}`
     (per-plane, `_APA1` variants on APA 0) × `LfFilter ROI_tighter_lf` (τ=0.08 MHz).
   - `Subtract_WScaling` (per-channel deconv) applies the same Wiener ×
-    `LfFilter ROI_loose_lf` (τ=0.002 MHz).
+    `LfFilter ROI_loose_lf` (τ=0.003 MHz).
   The four hardcoded MicroBooNE-era notch bands (≈107/178/214/250 kHz) that
   were embedded in `filter_low` are dropped.  Filter instances are defined in
   `cfg/pgrapher/experiment/pdhd/sp-filters.jsonnet` and registered via
