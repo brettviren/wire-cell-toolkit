@@ -1076,15 +1076,70 @@ Observed run-to-run spread is bit-zero on this branch (commit
 47d16673 fixed the FFTW plan-cache nondeterminism), so the tolerances
 are conservative against future drift.
 
-The reference fixture was generated from current HEAD on 2026-05-02
-after the L1SP→`wiener1` routing change in commits 616cfcb2 and
-eab4e6ac.  Refresh it (and update `WCT_PDHD_REF` if you don't want
-to overwrite the in-tree copy) only when a deliberate algorithmic
-change is being baselined.
+The reference fixture was last regenerated 2026-05-06 to incorporate
+four legitimate algorithmic changes that landed after the prior
+baseline (2026-05-02):
+
+  - 14b6c6de: `rawdecon` tap support in OmnibusSigProc
+  - b4d61985: rawdecon trim to (m_nwires × m_nticks) grid
+  - dc613760: `BreakROIs` UAF / iterator-UB fix in ROI_refinement
+              (snapshot-then-iterate; changes ROI iteration order
+              on every plane, not just PDVD)
+  - 36489a20: uninitialized FFT-padding rows in
+              `OmnibusSigProc::decon_2D_looseROI` (see "PDVD anode 0
+              regression" below for the original symptom)
+
+Refresh it (and update `WCT_PDHD_REF` if you don't want to overwrite
+the in-tree copy) only when a deliberate algorithmic change is being
+baselined.
 
 Skip semantics: the BATS test skips cleanly when any of
 `WCT_PDHD_DATA` (raw input), `WCT_PDHD_DEPLOY` (jsonnet entry
 point), or the in-tree reference fixture is absent.
+
+### End-to-end PDVD anode 0 regression (BATS)
+
+`check_pdvd_anode0_nf_sp.bats` is the PDVD bottom-drift counterpart
+to the PDHD APA1 test.  It runs `pdvd/wct-nf-sp.jsonnet` on the
+anode 0 raw frame (`run039324` / `evt 0`) and compares SP output
+bit-exactly against the in-tree fixture
+`sigproc/test/data/protodunevd-sp-frames-anode0.tar.bz2`.
+
+PDVD-only differences from the PDHD test:
+
+  - `reality='data'` inserts the 512→500 ns Resampler before NF
+    on bottom-drift anodes (n<4)
+  - `l1sp_pd_mode='process'` enables LASSO writeback (production
+    bottom path)
+  - No `elecGain` override (protodunevd/params.jsonnet has gains)
+
+The PDVD branch needed two SP-side fixes to reach bit-determinism:
+
+  - `dc613760` — `BreakROIs` UAF / iterator UB in ROI_refinement
+    (PDVD-discovered; affects all detectors)
+  - `36489a20` — uninitialized FFT-padding rows in
+    `OmnibusSigProc::decon_2D_looseROI`.  The function only filled
+    `c_data_afterfilter` rows iterated by `m_channel_range[plane]`
+    (OSP wires 0..m_nwires-1) and left rows
+    `m_nwires..m_fft_nwires-1` uninitialized; `inv_c2r` propagated
+    heap garbage row-wise, and the `m_pad_nwires`-offset `.block()`
+    extract pulled it into the LAST `m_pad_nwires` rows of `m_r_data`
+    (OSP wires `m_nwires-m_pad_nwires..m_nwires-1`).  On PDVD V plane
+    that's exactly OSP wires 465-475 = WCT idents 1228-1238 = frame
+    rows 752-762, the empirically observed non-determinism band
+    (3 distinct frame_wiener0 states across 12 fresh runs, max|d|=692
+    ADC).  PDHD APA1 was bit-deterministic across runs but the same
+    uninitialized-memory path was active and shifted output values.
+    Fix mirrors `decon_2D_tightROI`/`decon_2D_ROI_refine`/
+    `decon_2D_charge`: initialize all rows with the default filter,
+    then apply the per-channel bad/lf_noisy override in a second pass.
+
+After both fixes, 12 fresh PDVD runs are bit-identical for both
+`l1sp_pd_mode='process'` and `l1sp_pd_mode=''`; the test asserts
+bit-exact (`np.array_equal`) on every `frame_*` npy.
+
+Skip semantics mirror the PDHD test: skips cleanly when any of
+`WCT_PDVD_DATA`, `WCT_PDVD_DEPLOY`, or the in-tree reference is absent.
 
 ### What's deliberately not tested at unit level
 
