@@ -1151,6 +1151,32 @@ pass has been restored.
 Skip semantics mirror the PDHD test: skips cleanly when any of
 `WCT_PDVD_DATA`, `WCT_PDVD_DEPLOY`, or the in-tree reference is absent.
 
+### End-to-end PDVD anode 7 regression (BATS)
+
+`check_pdvd_anode7_nf_sp.bats` is the top-CRP counterpart to the anode 0
+test.  It runs `pdvd/wct-nf-sp.jsonnet` on the anode 7 raw frame
+(`run039324` / `evt 0`) and compares SP output bit-exactly against the
+in-tree fixture
+`sigproc/test/data/protodunevd-sp-frames-anode7.tar.bz2`.
+
+Top-CRP differences from the anode 0 test:
+
+  - `reality='data'` is a no-op on top (the 512→500 ns Resampler is gated
+    on n<4 in `pdvd/wct-nf-sp.jsonnet`); the flag is passed for symmetry
+  - `l1sp_pd_mode='process'` — LASSO writeback is active on top; the
+    former `process→dump` auto-downgrade for ident≥4 was removed so the
+    top-CRP production path is now identical to bottom
+  - Electronics response: `JsonElecResponse` from
+    `dunevd-coldbox-elecresp-top-psnorm_400.json.bz2`, postgain 1.36
+  - L1SP kernels: `pdvd_top_l1sp_kernels.json.bz2`
+
+Bit-determinism was verified across two independent runs (both `gauss7`
+and `wiener7` pass `np.array_equal`).  The same two fixes that
+stabilised the anode 0 test (`36489a20` FFT-padding + `BreakROI1`
+second-pass restore) cover the top path identically.
+
+Skip semantics are identical to the anode 0 test.
+
 ### What's deliberately not tested at unit level
 
 - **`OmnibusSigProc` Tier 1 + 2 batched FFT path** — already
@@ -1173,11 +1199,6 @@ Skip semantics mirror the PDHD test: skips cleanly when any of
    parameters change) uses `wirecell-sigproc gen-l1sp-kernels`; the new file
    must be placed in `wire-cell-data` and its name updated in
    `cfg/.../pdhd/sp.jsonnet:kernels_file`.
-
-2. **PDVD jsonnet port** — the trigger logic is detector-symmetric; wire
-   `L1SPFilterPD` into `cfg/pgrapher/experiment/protodunevd/sp.jsonnet`
-   with a PDVD-specific `kernels_file` (generate with the PDVD field response).
-   The same `gain_scale` block applies.
 
 ## Design decisions
 
