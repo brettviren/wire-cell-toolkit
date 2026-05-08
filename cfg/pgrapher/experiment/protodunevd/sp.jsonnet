@@ -145,12 +145,12 @@ function(params, tools, override = {}) {
       } + override,
     }, nin=1, nout=1, uses=[anode, tools.dft, tools.field, tools.elec_resps[0], tools.elec_resps[1] ] + pc.uses + spfilt);
 
-    // PDVD top electronics not yet validated for the L1SP fit; cap 'process'
-    // to 'dump' on top anodes (ident >= 4) so callers can request process
-    // mode globally without accidentally enabling LASSO writeback on top.
-    local _eff_mode = if anode.data.ident >= 4 && l1sp_pd_mode == 'process'
-                      then 'dump'
-                      else l1sp_pd_mode;
+    // L1SP process mode applies to both bottom (ident < 4) and top (ident >= 4).
+    // Top kernels: pdvd_top_l1sp_kernels.json.bz2 (selected below).
+    // Top-CRP L1SP has not yet been validated against a hand-scan — this
+    // run is itself part of the top-CRP validation effort.  Bottom-tuned
+    // trigger-gate overrides below are reused as the starting point for top.
+    local _eff_mode = l1sp_pd_mode;
     if _eff_mode == '' then sp_node
     else
       local n = anode.data.ident;
@@ -170,12 +170,9 @@ function(params, tools, override = {}) {
       //   wirecell-sigproc gen-l1sp-kernels -d pdvd-bottom  pdvd_bottom_l1sp_kernels.json.bz2
       //   wirecell-sigproc gen-l1sp-kernels -d pdvd-top     pdvd_top_l1sp_kernels.json.bz2
       // Both files live in wire-cell-data/ (resolved via WIRECELL_PATH).
-      // The path is set unconditionally; in dump mode init_resp() is
-      // guarded by !m_dump_mode (L1SPFilterPD.cxx) so the file is not
-      // actually loaded until the user opts into process mode (-w on
-      // run_nf_sp_evt.sh).  Default behaviour therefore stays unchanged:
-      // tagger runs, no LASSO writeback, SP output bit-identical to a
-      // no-L1SP run.
+      // In dump mode, init_resp() is guarded by !m_dump_mode (L1SPFilterPD.cxx)
+      // so the kernel file is not loaded; pass -x to run_nf_sp_evt.sh to
+      // skip L1SP entirely, or -c to stay in dump-only (tagger-validation) mode.
       local kernels_file = if anode.data.ident < 4
                            then 'pdvd_bottom_l1sp_kernels.json.bz2'
                            else 'pdvd_top_l1sp_kernels.json.bz2';
@@ -213,7 +210,7 @@ function(params, tools, override = {}) {
           dump_path: l1sp_pd_dump_path,
           dump_tag: 'apa%d' % n,
           waveform_dump_path: l1sp_pd_wf_dump_path,
-        // ── PDVD-tuned trigger-gate overrides (BOTTOM anodes only) ──────
+        // ── PDVD-tuned trigger-gate overrides (applied to all anodes) ──
         // Tuned against pdvd/sp_plot/handscan_039324_anode0.csv (run
         // 39324 events 0-5, bottom anode 0).  See pdvd/sp_plot/
         // eval_l1sp_trigger_pdvd.py for the validation harness.
@@ -223,20 +220,18 @@ function(params, tools, override = {}) {
         // 0.40 even though the Python cluster-level sweep prefers 0.50:
         // at the per-ROI gate, raising it kills ch 386 of the evt-0
         // U 386-388 cluster (per-ROI asym=0.43; cluster max-asym=0.56,
-        // but C++ checks each ROI individually).  Top anodes (n >= 4)
-        // are left at the PDHD-inherited C++ defaults pending their own
-        // hand-scan validation — toggle on by extending the conditional.
-        } + (if n < 4 then {
+        // but C++ checks each ROI individually).  Extended to top anodes
+        // (n >= 4) as the starting-point thresholds; revisit after top-CRP
+        // hand-scan validation.
+        } + {
           l1_len_long_mod:         180,     // C++ default 100
           l1_len_fill_shape:       90,      // C++ default 50
           l1_fill_shape_fill_thr:  0.30,    // C++ default 0.38
           l1_fill_shape_fwhm_thr:  0.25,    // C++ default 0.30
-          // PDVD-only opt-in track veto (added in this commit).
-          // Rejects sub-windows that look like real prolonged tracks rather
-          // than L1SP unipolar lobes — the residual FP class against
-          // pdvd/sp_plot/handscan_039324_anode0.csv (evt 0 U 82-87, 89-91,
-          // 96; evt 3 U 319-331).  PDHD never sets this so its trigger
-          // remains bit-identical to the pre-veto behaviour.
+          // PDVD-only opt-in track veto.  Rejects sub-windows that look
+          // like real prolonged tracks rather than L1SP unipolar lobes —
+          // the residual FP class against handscan_039324_anode0.csv
+          // (evt 0 U 82-87, 89-91, 96; evt 3 U 319-331).
           l1_pdvd_track_veto_enable: true,
           l1_pdvd_track_high_asym:   0.85,
           l1_pdvd_track_long_cl:     170,
@@ -245,7 +240,7 @@ function(params, tools, override = {}) {
           l1_pdvd_track_med_fwhm:    0.40,
           peak_threshold: 1000,
           mean_threshold: 500,
-        } else {}),
+        },
       }, nin=1, nout=1, uses=[tools.dft, anode]);
       // L1SPFilterPD needs both raw{n} and gauss{n} in the same frame.
       // OmnibusSigProc drops raw traces from its output, so we split the
