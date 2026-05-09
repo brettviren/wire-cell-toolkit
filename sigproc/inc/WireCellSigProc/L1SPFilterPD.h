@@ -82,13 +82,8 @@ namespace WireCell {
                        std::vector<double>* lasso_unsmeared,
                        int polarity);
 
-            // Write per-ROI waveform NPZ when m_wf_dump_path is non-empty.
-            void dump_roi_waveforms(int frame_ident, int channel, int plane,
-                                    int start_tick, int end_tick, int polarity,
-                                    const std::shared_ptr<const WireCell::ITrace>& adctrace,
-                                    const std::shared_ptr<const WireCell::ITrace>& sigtrace,
-                                    const std::shared_ptr<WireCell::Aux::SimpleTrace>& newtrace,
-                                    const std::vector<double>& lasso_unsmeared);
+            // (Per-ROI waveform NPZ writer is a free helper in the .cxx
+            // anonymous namespace; AsymRecord cannot be referenced here.)
 
             // True if channel belongs to a plane in m_process_planes.
             // Always returns true when m_process_planes is empty or m_anode is null.
@@ -298,10 +293,17 @@ namespace WireCell {
             bool m_dump_mode{false};
             std::string m_dump_path;
             std::string m_dump_tag;
-            // Waveform dump: write per-triggered-ROI NPZ files with the four
-            // waveforms (raw, decon, lasso_unsmeared, lasso_smeared) when
-            // non-empty.  Independent of m_dump_mode.  Default "" = OFF.
+            // Waveform dump: write per-ROI NPZ files with the four
+            // waveforms (raw, decon, lasso_unsmeared, lasso_smeared) plus the
+            // per-ROI calibration features and trigger flags, when non-empty.
+            // Independent of m_dump_mode.  Default "" = OFF.
             std::string m_wf_dump_path;
+
+            // When true and m_wf_dump_path is non-empty, write per-ROI NPZs
+            // for every ROI (not just triggered ones).  Required for ML
+            // training datasets that need negative examples.  Default false
+            // recovers the legacy "triggered-only" waveform dump.
+            bool m_dump_all_rois{false};
         };
 
     }  // namespace SigProc

@@ -478,6 +478,123 @@ int decide_trigger(const std::vector<SubInfo>& subs,
     return 0;
 }
 
+// Per-ROI NPZ writer: raw/decon/lasso/smeared waveforms plus the calibration
+// scalar features and trigger flags, in one file per ROI.  Used by both the
+// triggered-only path (legacy) and the all-ROI path (m_dump_all_rois).  Lives
+// in the anonymous namespace because it touches AsymRecord, which is a local
+// struct (not exported through the public header).
+static void dump_roi_npz(const std::string& wf_dump_path,
+                         const std::string& dump_tag,
+                         size_t call_count,
+                         int frame_ident, int channel, int plane,
+                         int start_tick, int end_tick, int polarity,
+                         const std::shared_ptr<const WireCell::ITrace>& adctrace,
+                         const std::shared_ptr<const WireCell::ITrace>& sigtrace,
+                         const std::shared_ptr<WireCell::Aux::SimpleTrace>& newtrace,
+                         const std::vector<double>& lasso_unsmeared,
+                         const AsymRecord& rec,
+                         int flag, int flag_l1, int flag_l1_adj, int adj_donor_ch,
+                         double ratio,
+                         int prev_roi_end, int next_roi_start,
+                         int prev_gap, int next_gap)
+{
+    const int nbin = end_tick - start_tick;
+    const int tbin = sigtrace->tbin();
+
+    const std::string subdir = fmt::format("{}/{}_{:04d}_{}", wf_dump_path,
+                                           dump_tag, call_count, frame_ident);
+    std::error_code ec;
+    std::filesystem::create_directories(subdir, ec);
+    const std::string polsign = (polarity > 0) ? "pos"
+                              : (polarity < 0) ? "neg"
+                                               : "off";
+    const std::string fname = fmt::format("{}/wf_p{}_c{}_t{}_{}.npz",
+                                          subdir, plane, channel, start_tick, polsign);
+
+    std::vector<float> raw_arr(nbin), decon_arr(nbin), smeared_arr(nbin);
+    for (int i = 0; i < nbin; ++i) {
+        const int t = start_tick + i;
+        raw_arr[i]    = adctrace->charge().at(t - adctrace->tbin());
+        decon_arr[i]  = sigtrace->charge().at(t - tbin);
+        smeared_arr[i] = newtrace->charge().at(t - newtrace->tbin());
+    }
+
+    bool first = true;
+    auto save_f32 = [&](const std::string& key, const std::vector<float>& v) {
+        cnpy::npz_save(fname, key, v.data(), {v.size()}, first ? "w" : "a");
+        first = false;
+    };
+    auto save_f64v = [&](const std::string& key, const std::vector<double>& v) {
+        cnpy::npz_save(fname, key, v.data(), {v.size()}, first ? "w" : "a");
+        first = false;
+    };
+    auto save_i32s = [&](const std::string& key, int32_t val) {
+        cnpy::npz_save(fname, key, &val, {1}, first ? "w" : "a");
+        first = false;
+    };
+    auto save_f64s = [&](const std::string& key, double val) {
+        cnpy::npz_save(fname, key, &val, {1}, first ? "w" : "a");
+        first = false;
+    };
+
+    save_f32("raw",      raw_arr);
+    save_f32("decon",    decon_arr);
+    save_f64v("lasso",   lasso_unsmeared);
+    save_f32("smeared",  smeared_arr);
+
+    // Geometry / identity scalars (legacy waveform-NPZ keys).
+    save_i32s("channel",     (int32_t)channel);
+    save_i32s("plane",       (int32_t)plane);
+    save_i32s("start_tick",  (int32_t)start_tick);
+    save_i32s("end_tick",    (int32_t)end_tick);
+    save_i32s("polarity",    (int32_t)polarity);
+    save_i32s("frame_ident", (int32_t)frame_ident);
+    save_i32s("call_count",  (int32_t)call_count);
+
+    // Per-ROI calibration features (mirrors the keys written by the calibration
+    // NPZ writer in operator()).  Same names so a downstream loader can reuse
+    // calibration-side schemas with one row per file.
+    save_i32s("nbin_fit",    (int32_t)rec.nbin_fit);
+    save_f64s("temp_sum",    rec.temp_sum);
+    save_f64s("temp1_sum",   rec.temp1_sum);
+    save_f64s("temp2_sum",   rec.temp2_sum);
+    save_f64s("max_val",     rec.max_val);
+    save_f64s("min_val",     rec.min_val);
+    save_i32s("prev_roi_end",  (int32_t)prev_roi_end);
+    save_i32s("next_roi_start", (int32_t)next_roi_start);
+    save_i32s("prev_gap",      (int32_t)prev_gap);
+    save_i32s("next_gap",      (int32_t)next_gap);
+    save_i32s("flag",          (int32_t)flag);
+    save_f64s("ratio",         ratio);
+    save_f64s("temp_sum_pos",  rec.temp_sum_pos);
+    save_f64s("temp_sum_neg",  rec.temp_sum_neg);
+    save_i32s("n_above_pos",   (int32_t)rec.n_above_pos);
+    save_i32s("n_above_neg",   (int32_t)rec.n_above_neg);
+    save_i32s("argmax_tick",   (int32_t)rec.argmax_tick);
+    save_i32s("argmin_tick",   (int32_t)rec.argmin_tick);
+    save_f64s("sig_peak",      rec.sig_peak);
+    save_f64s("sig_integral",  rec.sig_integral);
+    save_f64s("gmax",            rec.gmax);
+    save_f64s("gauss_fill",      rec.gauss_fill);
+    save_f64s("gauss_fwhm_frac", rec.gauss_fwhm_frac);
+    save_f64s("roi_energy_frac", rec.roi_energy_frac);
+    save_f64s("raw_asym_wide",   rec.raw_asym_wide);
+    save_i32s("core_lo",         (int32_t)rec.core_lo);
+    save_i32s("core_hi",         (int32_t)rec.core_hi);
+    save_i32s("core_length",     (int32_t)rec.core_length);
+    save_f64s("core_fill",       rec.core_fill);
+    save_f64s("core_fwhm_frac",  rec.core_fwhm_frac);
+    save_f64s("core_raw_asym_wide", rec.core_raw_asym_wide);
+
+    // Heuristic L1SP trigger decisions (matches calibration writer).
+    //   flag_l1     = decide_trigger output (in-isolation, pre-adjacency)
+    //   flag_l1_adj = post-adjacency-expansion polarity (the actual heuristic)
+    //   adj_donor_ch = donor channel that promoted this ROI, or -1
+    save_i32s("flag_l1",      (int32_t)flag_l1);
+    save_i32s("flag_l1_adj",  (int32_t)flag_l1_adj);
+    save_i32s("adj_donor_ch", (int32_t)adj_donor_ch);
+}
+
 }  // namespace
 
 // ── L1SPFilterPD ─────────────────────────────────────────────────────────────
@@ -599,9 +716,14 @@ WireCell::Configuration L1SPFilterPD::default_configuration() const
     cfg["dump_mode"] = false;
     cfg["dump_path"] = "";    // directory; one NPZ per operator() call written here
     cfg["dump_tag"] = "";     // label baked into filename (e.g. "apa1")
-    // Waveform dump: write per-triggered-ROI NPZ (raw/decon/lasso/smeared).
-    // Non-empty path enables it; files go under <waveform_dump_path>/<dump_tag>_<frame_ident>/.
+    // Waveform dump: write per-ROI NPZ (raw/decon/lasso/smeared + features
+    // + trigger flags).  Non-empty path enables it; files go under
+    // <waveform_dump_path>/<dump_tag>_<frame_ident>/.
     cfg["waveform_dump_path"] = "";
+    // When true and waveform_dump_path is set, write an NPZ for every ROI
+    // (including non-triggered).  Required for ML training datasets with
+    // negative examples.  Default false = legacy "triggered-only" behaviour.
+    cfg["dump_all_rois"] = false;
 
     return cfg;
 }
@@ -749,6 +871,7 @@ void L1SPFilterPD::configure(const WireCell::Configuration& cfg)
     m_dump_path   = get<std::string>(cfg, "dump_path", m_dump_path);
     m_dump_tag    = get<std::string>(cfg, "dump_tag", m_dump_tag);
     m_wf_dump_path = get<std::string>(cfg, "waveform_dump_path", m_wf_dump_path);
+    m_dump_all_rois = get(cfg, "dump_all_rois", m_dump_all_rois);
 
     // Reset interpolators so init_resp() reloads them on next operator() call.
     m_lin_bipolar.clear();
@@ -1041,61 +1164,6 @@ int L1SPFilterPD::l1_fit(std::shared_ptr<Aux::SimpleTrace>& newtrace,
     return flag_l1;
 }
 
-void L1SPFilterPD::dump_roi_waveforms(int frame_ident, int channel, int plane,
-                                       int start_tick, int end_tick, int polarity,
-                                       const std::shared_ptr<const WireCell::ITrace>& adctrace,
-                                       const std::shared_ptr<const WireCell::ITrace>& sigtrace,
-                                       const std::shared_ptr<Aux::SimpleTrace>& newtrace,
-                                       const std::vector<double>& lasso_unsmeared)
-{
-    const int nbin = end_tick - start_tick;
-    const int tbin = sigtrace->tbin();
-
-    // Build output directory and filename.
-    const std::string subdir = fmt::format("{}/{}_{:04d}_{}", m_wf_dump_path,
-                                           m_dump_tag, m_count, frame_ident);
-    std::error_code ec;
-    std::filesystem::create_directories(subdir, ec);
-    const std::string polsign = (polarity > 0) ? "pos" : "neg";
-    const std::string fname = fmt::format("{}/wf_p{}_c{}_t{}_{}.npz",
-                                          subdir, plane, channel, start_tick, polsign);
-
-    // Slice the four waveforms over [start_tick, end_tick).
-    std::vector<float> raw_arr(nbin), decon_arr(nbin), smeared_arr(nbin);
-    for (int i = 0; i < nbin; ++i) {
-        const int t = start_tick + i;
-        raw_arr[i]    = adctrace->charge().at(t - adctrace->tbin());
-        decon_arr[i]  = sigtrace->charge().at(t - tbin);
-        smeared_arr[i] = newtrace->charge().at(t - newtrace->tbin());
-    }
-
-    bool first = true;
-    auto save_f32 = [&](const std::string& key, const std::vector<float>& v) {
-        cnpy::npz_save(fname, key, v.data(), {v.size()}, first ? "w" : "a");
-        first = false;
-    };
-    auto save_f64v = [&](const std::string& key, const std::vector<double>& v) {
-        cnpy::npz_save(fname, key, v.data(), {v.size()}, first ? "w" : "a");
-        first = false;
-    };
-    auto save_i32s = [&](const std::string& key, int32_t val) {
-        cnpy::npz_save(fname, key, &val, {1}, first ? "w" : "a");
-        first = false;
-    };
-
-    save_f32("raw",    raw_arr);
-    save_f32("decon",  decon_arr);
-    save_f64v("lasso", lasso_unsmeared);
-    save_f32("smeared", smeared_arr);
-    save_i32s("channel",     (int32_t)channel);
-    save_i32s("plane",       (int32_t)plane);
-    save_i32s("start_tick",  (int32_t)start_tick);
-    save_i32s("end_tick",    (int32_t)end_tick);
-    save_i32s("polarity",    (int32_t)polarity);
-    save_i32s("frame_ident", (int32_t)frame_ident);
-    save_i32s("call_count",  (int32_t)m_count);
-}
-
 bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
 {
     out = nullptr;
@@ -1275,6 +1343,11 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
         for (const auto& roi : rois) {
             RoiFeat f;
             f.plane = plane;
+            // Fill the dump-only AsymRecord fields whenever any consumer
+            // wants them: calibration NPZ (m_dump_mode) OR the per-ROI
+            // waveform NPZ (m_wf_dump_path non-empty, the merged-dump path
+            // used by the ML training set).
+            const bool fill_dump = m_dump_mode || !m_wf_dump_path.empty();
             f.rec = compute_asym(adctrace->charge(), sigtrace->charge(),
                                  sigtrace->tbin(),
                                  roi.first, roi.second + 1,
@@ -1283,7 +1356,7 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
                                  m_l1_raw_asym_pad_ticks,
                                  m_l1_raw_asym_eps,
                                  m_l1_core_g_thr,
-                                 m_dump_mode);
+                                 fill_dump);
             f.polarity = decide_trigger(f.rec.sub_windows,
                                         sigtrace->charge(),
                                         sigtrace->tbin(),
@@ -1512,14 +1585,44 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
                                             roi.first, roi.second + 1, feats[i].plane,
                                             m_wf_dump_path.empty() ? nullptr : &lasso_unsmeared_buf,
                                             polarity_in);
-                // Dump every tagged ROI (polarity != 0).  lasso_unsmeared may be empty
-                // when sum_beta did not pass the admit threshold; that is a legitimate
-                // "tagger fired but LASSO declined" outcome, visible in the viewer for
-                // hand-scan reconciliation.
-                if (!m_wf_dump_path.empty() && polarity != 0) {
-                    dump_roi_waveforms(in->ident(), ch, feats[i].plane,
-                                       roi.first, roi.second + 1, polarity,
-                                       adctrace, trace, newtrace, lasso_unsmeared_buf);
+                // Per-ROI waveform NPZ.  Two paths:
+                //   - legacy (m_dump_all_rois=false): triggered ROIs only
+                //     (polarity != 0).  Matches pre-2026-05-09 behaviour.
+                //   - merged (m_dump_all_rois=true): every ROI, including
+                //     non-triggered ones.  Required for ML training datasets
+                //     that need negative examples.  lasso_unsmeared may be
+                //     empty for non-triggered or admit-rejected ROIs; that is
+                //     a legitimate "tagger fired but LASSO declined" outcome.
+                if (!m_wf_dump_path.empty() && (polarity != 0 || m_dump_all_rois)) {
+                    const AsymRecord& rec = feats[i].rec;
+                    // Mirror the dump-mode legacy uBooNE asym-ratio computation
+                    // (operator() above:1517-1525) so the merged dump exposes
+                    // the same `flag` / `ratio` keys.
+                    const double ratio = (rec.temp1_sum > 0)
+                        ? rec.temp_sum / (rec.temp1_sum * m_adc_sum_rescaling / rec.nbin_fit)
+                        : 0.0;
+                    int legacy_flag = 0;
+                    if (rec.temp1_sum > m_adc_sum_threshold) {
+                        if      (ratio >  m_adc_ratio_threshold) legacy_flag = +1;
+                        else if (ratio < -m_adc_ratio_threshold) legacy_flag = -1;
+                    }
+                    const int32_t prev_end   = (i > 0) ? rois_save[i - 1].second : -1;
+                    const int32_t next_start = (i + 1 < rois_save.size())
+                                               ? rois_save[i + 1].first : -1;
+                    const int32_t prev_gap = prev_end >= 0
+                                             ? (int32_t)(rois_save[i].first - prev_end) : -1;
+                    const int32_t next_gap = next_start >= 0
+                                             ? (int32_t)(next_start - rois_save[i].second) : -1;
+                    dump_roi_npz(m_wf_dump_path, m_dump_tag, m_count,
+                                 in->ident(), ch, feats[i].plane,
+                                 roi.first, roi.second + 1, polarity,
+                                 adctrace, trace, newtrace, lasso_unsmeared_buf,
+                                 rec,
+                                 legacy_flag,
+                                 feats[i].polarity, feats[i].polarity_final,
+                                 feats[i].donor_ch,
+                                 ratio,
+                                 prev_end, next_start, prev_gap, next_gap);
                 }
                 // Zero any negative decon values within the ROI.
                 for (int t = roi.first; t <= roi.second; t++) {

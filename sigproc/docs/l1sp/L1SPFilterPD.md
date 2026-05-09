@@ -938,6 +938,75 @@ from the uBooNE single-ratio decision.
 
 ---
 
+## Per-ROI waveform dump schema
+
+When `waveform_dump_path` is non-empty (process mode, not bypass), each
+in-scope ROI is written to its own NPZ file under
+`<waveform_dump_path>/<dump_tag>_<call_count>_<frame_ident>/wf_p<plane>_c<channel>_t<start_tick>_<polsign>.npz`,
+where `<polsign>` is `pos` / `neg` / `off` for `polarity = +1 / -1 / 0`.
+
+Two gates control which ROIs fire (`L1SPFilterPD.cxx:1596`):
+
+- `dump_all_rois = false` (legacy default): only triggered ROIs
+  (`polarity != 0`). Reproduces the v6/v7/v8 dumps.
+- `dump_all_rois = true`: every in-scope ROI, including non-triggered
+  ones. Required for ML training datasets that need negative examples.
+  `pdhd/run_nf_sp_evt.sh -w` auto-enables this since 2026-05-09.
+
+The writer is the anonymous-namespace helper
+`dump_roi_npz()` (`L1SPFilterPD.cxx:486–`); it lives in the anon
+namespace so it can take an `AsymRecord` directly.
+
+### Waveforms
+
+| Key | Type | Shape | Meaning |
+|-----|------|-------|---------|
+| `raw` | float32 | `(nbin,)` | Raw ADC over the ROI |
+| `decon` | float32 | `(nbin,)` | Standard deconvolution output |
+| `lasso` | float64 | `(nbin,)` or `(0,)` | Unsmeared LASSO output in electron units (combined `basis0_scale * β_bipolar + basis1_scale * β_unipolar`). Empty for non-triggered ROIs and for triggered ROIs whose admit-threshold rejected the fit. |
+| `smeared` | float32 | `(nbin,)` | Smeared (final) L1SP output. Equals `decon` for non-triggered ROIs (no correction applied). |
+
+`nbin = end_tick - start_tick`.
+
+### Calibration scalar features
+
+The same fields the calibration NPZ writes per ROI, but here as length-1
+arrays per file (one record per NPZ). `compute_asym()` is invoked with
+`fill_dump_fields = m_dump_mode || !m_wf_dump_path.empty()`
+(`L1SPFilterPD.cxx:1348`), so every dump-only field is populated.
+
+Keys: `nbin_fit`, `temp_sum`, `temp1_sum`, `temp2_sum`, `max_val`,
+`min_val`, `prev_roi_end`, `next_roi_start`, `prev_gap`, `next_gap`,
+`flag` (legacy uBooNE asym-ratio, computed inline at the call site),
+`ratio`, `temp_sum_pos`, `temp_sum_neg`, `n_above_pos`, `n_above_neg`,
+`argmax_tick`, `argmin_tick`, `sig_peak`, `sig_integral`, `gmax`,
+`gauss_fill`, `gauss_fwhm_frac`, `roi_energy_frac`, `raw_asym_wide`,
+`core_lo`, `core_hi`, `core_length`, `core_fill`, `core_fwhm_frac`,
+`core_raw_asym_wide`. All shape `(1,)`; floats are float64, integers
+int32.
+
+### Heuristic trigger flags
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `flag_l1` | int32 | `decide_trigger()` output, pre-adjacency (`feats[i].polarity`) |
+| `flag_l1_adj` | int32 | Post-adjacency-expansion polarity (`feats[i].polarity_final`). The actual heuristic L1 decision used in production. |
+| `adj_donor_ch` | int32 | Donor channel that promoted this ROI via cross-channel adjacency, or `-1` if not promoted. |
+
+### Geometry / identity scalars
+
+`channel`, `plane`, `start_tick`, `end_tick`, `polarity` (post-`l1_fit`
+return value), `frame_ident`, `call_count`. All int32, shape `(1,)`.
+
+### Bit-for-bit equivalence to calibration mode
+
+Verified on event 0 of run 027409 (2026-05-09): a `dump_mode=true`
+calibration NPZ and a `dump_all_rois=true` waveform dump produced from
+the same toolkit revision agree on every shared key for all 32,629
+ROIs (0 mismatches).
+
+---
+
 ## Wiring into a PDHD/PDVD graph
 
 The wiring pattern mirrors uBooNE (`cfg/pgrapher/experiment/uboone/sp.jsonnet:65–163`).

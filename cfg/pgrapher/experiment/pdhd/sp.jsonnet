@@ -30,6 +30,10 @@ function(params, tools, override = {}) {
                l1sp_pd_mode='process',
                l1sp_pd_dump_path='',
                l1sp_pd_wf_dump_path='',
+               // When true, the per-ROI waveform NPZ dump fires for every ROI
+               // (not just triggered).  Required for ML training datasets with
+               // negative examples.  Default false = legacy "triggered-only".
+               l1sp_pd_dump_all_rois=false,
                l1sp_pd_planes=null,
                // Cross-channel adjacency expansion (default ON; see
                // sigproc/docs/l1sp/L1SPFilterPD.md).  Pass false to recover
@@ -165,6 +169,7 @@ function(params, tools, override = {}) {
           dump_path: l1sp_pd_dump_path,
           dump_tag: 'apa%d' % n,
           waveform_dump_path: l1sp_pd_wf_dump_path,
+          dump_all_rois: l1sp_pd_dump_all_rois,
         },
       }, nin=1, nout=1, uses=[tools.dft, anode]);
       // L1SPFilterPD needs both raw{n} and gauss{n} in the same frame.
