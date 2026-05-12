@@ -190,9 +190,9 @@ ITrace::vector Pytorch::DNNROIFinding::select(ITrace::vector traces)
 }
 
 
-Array::array_xxf Pytorch::DNNROIFinding::traces_to_eigen(ITrace::vector traces)
+Array::array_xxf Pytorch::DNNROIFinding::traces_to_eigen(ITrace::vector traces, int ntick)
 {
-    Array::array_xxf arr = Array::array_xxf::Zero(m_nrows, m_ncols);
+    Array::array_xxf arr = Array::array_xxf::Zero(m_nrows, ntick);
     traces = select(traces);
     if (traces.empty()) {
         return arr;
@@ -220,8 +220,9 @@ ITrace::shared_vector Pytorch::DNNROIFinding::eigen_to_traces(const Array::array
                                                              bool save_negative_charge,
                                                              bool sparcify)
 {
+    const int ntick = arr.cols();
     ITrace::vector traces;
-    ITrace::ChargeSequence charge(m_ncols, 0.0);
+    ITrace::ChargeSequence charge(ntick, 0.0);
     const int zero_gap = std::max(1, m_cfg.sparcify_zero_gap);
     auto clamp = [save_negative_charge](float value) {
         if (!save_negative_charge && value < 0.0f) {
@@ -233,7 +234,7 @@ ITrace::shared_vector Pytorch::DNNROIFinding::eigen_to_traces(const Array::array
         auto wave = arr.row(irow);
         const auto ch = m_chlist[irow];
         if (!sparcify) {
-            for (size_t icol = 0; icol < m_ncols; ++icol) {
+            for (int icol = 0; icol < ntick; ++icol) {
                 charge[icol] = clamp(wave(icol));
             }
             traces.push_back(std::make_shared<Aux::SimpleTrace>(ch, 0, charge));
@@ -254,7 +255,7 @@ ITrace::shared_vector Pytorch::DNNROIFinding::eigen_to_traces(const Array::array
             }
             traces.push_back(std::make_shared<Aux::SimpleTrace>(ch, start, roi_charge));
         };
-        for (int icol = 0; icol < static_cast<int>(m_ncols); ++icol) {
+        for (int icol = 0; icol < ntick; ++icol) {
             const float sample = wave(icol);
             const bool is_zero = sample == 0.0f;
             if (!is_zero) {
@@ -284,7 +285,7 @@ ITrace::shared_vector Pytorch::DNNROIFinding::eigen_to_traces(const Array::array
             }
         }
         if (roi_start >= 0) {
-            const int end = ztp_end >= 0 ? ztp_end : static_cast<int>(m_ncols) - 1;
+            const int end = ztp_end >= 0 ? ztp_end : ntick - 1;
             emit_roi(roi_start, end);
         }
     }
@@ -303,15 +304,36 @@ bool Pytorch::DNNROIFinding::operator()(const IFrame::pointer& inframe, IFrame::
 
     TimeKeeper tk(fmt::format("call={}", m_save_count));
 
+    // Determine the actual input tick count from the input frame and round
+    // up to the next multiple of tick_per_slice so the downsample/upsample
+    // cycle is exactly divisible.  The output is cropped back to input_ticks
+    // before traces are emitted.
+    int input_ticks = m_cfg.nticks;
+    {
+        auto probe = Aux::tagged_traces(inframe, m_cfg.intags.front());
+        for (const auto& tr : probe) {
+            const int n = static_cast<int>(tr->charge().size());
+            if (n > 0) { input_ticks = n; break; }
+        }
+    }
+    const int tps = m_cfg.tick_per_slice;
+    const int model_ticks = ((input_ticks + tps - 1) / tps) * tps;
+    log->debug("call={} input_ticks={} model_ticks={} cfg.nticks={}",
+               m_save_count, input_ticks, model_ticks, m_cfg.nticks);
+    if (input_ticks > m_cfg.nticks && m_save_count == 0) {
+        log->info("input_ticks={} exceeds configured nticks={}, using input-driven size",
+                  input_ticks, m_cfg.nticks);
+    }
+
     // frame to eigen
     std::vector<Array::array_xxf> ch_eigen;
     for (auto tag : m_cfg.intags) {
         auto traces = Aux::tagged_traces(inframe, tag);
-        auto arr = traces_to_eigen(traces);
+        auto arr = traces_to_eigen(traces, model_ticks);
         if (arr.sum() == 0.0) {
             log->warn("call={} no traces for input tag {}, using zeros", m_save_count, tag);
         }
-        else { 
+        else {
             log->debug("call={} tag={} ntraces={}", m_save_count, tag, traces.size());
         }
         arr = arr * m_cfg.input_scale + m_cfg.input_offset;
@@ -359,11 +381,11 @@ bool Pytorch::DNNROIFinding::operator()(const IFrame::pointer& inframe, IFrame::
     Array::array_xxf decon_charge_eigen;
     {
         auto traces = Aux::tagged_traces(inframe, m_cfg.decon_charge_tag);
-        decon_charge_eigen = traces_to_eigen(traces);
+        decon_charge_eigen = traces_to_eigen(traces, model_ticks);
         if (decon_charge_eigen.sum() == 0.0) {
             log->warn("call={} no traces for input tag {}, using zeros", m_save_count, m_cfg.decon_charge_tag);
         }
-        else { 
+        else {
             log->debug("call={} tag={} ntraces={}", m_save_count, m_cfg.decon_charge_tag, traces.size());
         }
     }
@@ -372,6 +394,12 @@ bool Pytorch::DNNROIFinding::operator()(const IFrame::pointer& inframe, IFrame::
     auto sp_charge_T = Array::mask(decon_charge_eigen.transpose(), mask_e, m_cfg.mask_thresh /*0.7*/);
     sp_charge_T = Array::baseline_subtraction(sp_charge_T) * m_cfg.output_scale + m_cfg.output_offset;
     Array::array_xxf sp_charge = sp_charge_T.transpose();
+
+    // Crop the padded trailing columns so output traces match the input
+    // frame's tick count exactly.
+    if (input_ticks < sp_charge.cols()) {
+        sp_charge = sp_charge.leftCols(input_ticks).eval();
+    }
 
 #ifdef DNNROI_HDF5_DEBUG
     // hdf5 eval

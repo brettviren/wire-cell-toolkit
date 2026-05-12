@@ -137,8 +137,8 @@ namespace WireCell {
             /// channel IDs in our set.
             ITrace::vector select(ITrace::vector traces);
             
-            // Convert traces to a dense array
-            Array::array_xxf traces_to_eigen(ITrace::vector traces);
+            // Convert traces to a dense (m_nrows x ntick) array.
+            Array::array_xxf traces_to_eigen(ITrace::vector traces, int ntick);
 
             // extract trace summary to mathch the eigen format order
             IFrame::trace_summary_t get_summary_e(const IFrame::pointer& inframe, const std::string &tag) const;

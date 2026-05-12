@@ -112,9 +112,10 @@ namespace WireCell {
 
             // Build an Eigen array for one plane filling its channels
             // from the given trace vector.  Output rows = nchans of that
-            // plane, cols = nticks.
+            // plane, cols = ntick.
             Array::array_xxf plane_traces_to_eigen(size_t plane_index,
-                                                   const ITrace::vector& traces) const;
+                                                   const ITrace::vector& traces,
+                                                   int ntick) const;
         };
     }  // namespace Pytorch
 }  // namespace WireCell

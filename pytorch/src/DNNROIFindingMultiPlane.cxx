@@ -184,11 +184,11 @@ WireCell::Configuration Pytorch::DNNROIFindingMultiPlane::default_configuration(
 }
 
 Array::array_xxf Pytorch::DNNROIFindingMultiPlane::plane_traces_to_eigen(
-    size_t plane_index, const ITrace::vector& traces) const
+    size_t plane_index, const ITrace::vector& traces, int ntick) const
 {
     const auto& chset = m_chsets[plane_index];
     const auto& chlist = m_chlists[plane_index];
-    Array::array_xxf arr = Array::array_xxf::Zero(chlist.size(), m_ncols);
+    Array::array_xxf arr = Array::array_xxf::Zero(chlist.size(), ntick);
     ITrace::vector selected;
     selected.reserve(traces.size());
     for (const auto& t : traces) {
@@ -217,6 +217,27 @@ bool Pytorch::DNNROIFindingMultiPlane::operator()(const IFrame::pointer& inframe
 
     TimeKeeper tk(fmt::format("call={}", m_save_count));
 
+    // Determine the actual input tick count from the input frame and round
+    // up to the next multiple of tick_per_slice so the downsample/upsample
+    // cycle is exactly divisible.  The per-plane output is cropped back to
+    // input_ticks before traces are emitted.
+    int input_ticks = m_cfg.nticks;
+    {
+        auto probe = Aux::tagged_traces(inframe, m_cfg.intags.front());
+        for (const auto& tr : probe) {
+            const int n = static_cast<int>(tr->charge().size());
+            if (n > 0) { input_ticks = n; break; }
+        }
+    }
+    const int tps = m_cfg.tick_per_slice;
+    const int model_ticks = ((input_ticks + tps - 1) / tps) * tps;
+    log->debug("call={} input_ticks={} model_ticks={} cfg.nticks={}",
+               m_save_count, input_ticks, model_ticks, m_cfg.nticks);
+    if (input_ticks > m_cfg.nticks && m_save_count == 0) {
+        log->info("input_ticks={} exceeds configured nticks={}, using input-driven size",
+                  input_ticks, m_cfg.nticks);
+    }
+
     // Per-tag, build the stacked (all planes concatenated by row) Eigen
     // array, scale, then downsample ticks.
     std::vector<Array::array_xxf> stacked_per_tag;
@@ -224,9 +245,9 @@ bool Pytorch::DNNROIFindingMultiPlane::operator()(const IFrame::pointer& inframe
 
     for (const auto& tag : m_cfg.intags) {
         auto traces = Aux::tagged_traces(inframe, tag);
-        Array::array_xxf big = Array::array_xxf::Zero(m_total_rows, m_ncols);
+        Array::array_xxf big = Array::array_xxf::Zero(m_total_rows, model_ticks);
         for (size_t ip = 0; ip < m_cfg.planes.size(); ++ip) {
-            auto a = plane_traces_to_eigen(ip, traces);
+            auto a = plane_traces_to_eigen(ip, traces, model_ticks);
             big.block(m_row_offsets[ip], 0, a.rows(), a.cols()) = a;
         }
         if (big.sum() == 0.0) {
@@ -339,7 +360,7 @@ bool Pytorch::DNNROIFindingMultiPlane::operator()(const IFrame::pointer& inframe
         Array::array_xxf mask_slice = mask_e_full.block(0, roff, mask_e_full.rows(), nrows);
 
         // Build this plane's decon-charge array.
-        auto decon_arr = plane_traces_to_eigen(ip, decon_traces);
+        auto decon_arr = plane_traces_to_eigen(ip, decon_traces, model_ticks);
         if (decon_arr.sum() == 0.0) {
             log->warn("call={} no decon-charge traces for plane {} (tag={})",
                       m_save_count, m_cfg.planes[ip], m_cfg.decon_charge_tag);
@@ -350,9 +371,16 @@ bool Pytorch::DNNROIFindingMultiPlane::operator()(const IFrame::pointer& inframe
         sp_T = Array::baseline_subtraction(sp_T) * m_cfg.output_scale + m_cfg.output_offset;
         Array::array_xxf sp = sp_T.transpose();
 
+        // Crop the padded trailing columns so output traces match the
+        // input frame's tick count exactly.
+        if (input_ticks < sp.cols()) {
+            sp = sp.leftCols(input_ticks).eval();
+        }
+        const int out_ticks = sp.cols();
+
         for (size_t irow = 0; irow < nrows; ++irow) {
-            ITrace::ChargeSequence charge(m_ncols, 0.0);
-            for (size_t icol = 0; icol < m_ncols; ++icol) {
+            ITrace::ChargeSequence charge(out_ticks, 0.0);
+            for (int icol = 0; icol < out_ticks; ++icol) {
                 float v = sp(irow, icol);
                 if (!m_cfg.save_negative_charge && v < 0.0f) v = 0.0f;
                 charge[icol] = v;
