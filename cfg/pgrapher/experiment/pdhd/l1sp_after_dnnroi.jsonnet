@@ -38,7 +38,6 @@ local pg = import 'pgraph.jsonnet';
 local wc = import 'wirecell.jsonnet';
 
 function(anode, sp_pipe, dnnroi_pipe, tools, params,
-         sp_frame_tap=null,
          l1sp_pd_adj_enable=true,
          l1sp_pd_adj_max_hops=3,
          l1sp_pd_planes=null,
@@ -79,9 +78,7 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
   }, nin=1, nout=1);
 
   local sp_dnn_chain = pg.pipeline(
-    [sp_pipe]
-    + (if sp_frame_tap != null then [sp_frame_tap] else [])
-    + [dnnroi_pipe, dnn_relabel],
+    [sp_pipe, dnnroi_pipe, dnn_relabel],
     'sp_dnn_chain_%d' % n);
 
   // Merge DNN-relabeled side (port 0: gauss%d, wiener%d) with the
