@@ -56,6 +56,11 @@ function(anode, ts, prefix='dnnroi',
       intags: apa_intags,
       decon_charge_tag: 'decon_charge%d' % apaid,
       outtag: outtag,
+      // Propagate the per-channel Wiener threshold (carried as the
+      // trace_summary of wiener%d in OmnibusSigProc output) onto the
+      // output dnnsp%d* trace tag so the downstream Magnify pipeline
+      // can build hu/hv/hw_threshold0 TH1F.
+      summary_tag: 'wiener%d' % apaid,
       input_scale: 1.0 / 4000,
       output_scale: output_scale,
       mask_thresh: mask_thresh,
@@ -68,6 +73,9 @@ function(anode, ts, prefix='dnnroi',
   }, nin=1, nout=1, uses=[ts, anode]);
 
   // Gauss passthrough for a non-DNN plane: re-tag gauss%d → outtag.
+  // summary_tags pulls the wiener%d trace_summary (= per-channel
+  // threshold) alongside the gauss waveforms so the threshold survives
+  // into the downstream Magnify TH1F.
   local pass_through(plane, outtag, name_suffix) = pg.pnode({
     type: 'PlaneSelector',
     name: prename + name_suffix,
@@ -75,6 +83,7 @@ function(anode, ts, prefix='dnnroi',
       anode: wc.tn(anode),
       plane: plane,
       tags: ['gauss%d' % apaid],
+      summary_tags: ['wiener%d' % apaid],
       tag_rules: [{
         frame: { '.*': 'DNNROIFinding' },
         trace: { ['gauss%d' % apaid]: outtag },
