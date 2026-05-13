@@ -456,50 +456,72 @@ void OmniChannelNoiseDB::update_channels(Json::Value cfg)
             get_ci(ch).response_offset = val;
         }
     }
+    auto eval_rms_cut = [&](const Json::Value& jv, int ch, double scalar) -> double {
+        // Wirelength-dependent RMS cut.
+        // type=linear_in_wirelength : 2-point clamped (l0,v0)->(l1,v1)
+        // type=piecewise_linear_in_wirelength : list "points":[{l,v},...]
+        //   sorted by l, clamped at endpoints, linear between adjacent pts
+        if (!jv.isObject()) return scalar;
+        const std::string t = jv.get("type", "").asString();
+        if (t == "linear_in_wirelength") {
+            const double l0 = jv["l0"].asDouble(), v0 = jv["v0"].asDouble();
+            const double l1 = jv["l1"].asDouble(), v1 = jv["v1"].asDouble();
+            auto it = m_wire_length_cm.find(ch);
+            const double L = (it == m_wire_length_cm.end()) ? l0 : it->second;
+            const double f = std::clamp((L - l0) / (l1 - l0), 0.0, 1.0);
+            return v0 + f * (v1 - v0);
+        }
+        if (t == "piecewise_linear_in_wirelength") {
+            const auto& pts = jv["points"];
+            const int n = (int)pts.size();
+            if (n < 1) return scalar;
+            auto it = m_wire_length_cm.find(ch);
+            const double L = (it == m_wire_length_cm.end()) ? pts[0]["l"].asDouble()
+                                                            : it->second;
+            if (n == 1) return pts[0]["v"].asDouble();
+            // clamp left
+            if (L <= pts[0]["l"].asDouble()) return pts[0]["v"].asDouble();
+            // clamp right
+            if (L >= pts[n-1]["l"].asDouble()) return pts[n-1]["v"].asDouble();
+            // find segment
+            for (int i = 0; i < n - 1; ++i) {
+                const double la = pts[i]["l"].asDouble(),
+                             lb = pts[i+1]["l"].asDouble();
+                if (L >= la && L <= lb) {
+                    const double va = pts[i]["v"].asDouble(),
+                                 vb = pts[i+1]["v"].asDouble();
+                    const double f = (lb > la) ? (L - la) / (lb - la) : 0.0;
+                    return va + f * (vb - va);
+                }
+            }
+            return pts[n-1]["v"].asDouble();
+        }
+        return scalar;  // shouldn't happen for object jv with unknown type
+    };
+
+    auto needs_lengths = [](const Json::Value& jv) {
+        if (!jv.isObject()) return false;
+        const std::string t = jv.get("type", "").asString();
+        return t == "linear_in_wirelength"
+            || t == "piecewise_linear_in_wirelength";
+    };
+
     if (cfg.isMember("min_rms_cut")) {
         const auto& jv = cfg["min_rms_cut"];
-        const bool linear = jv.isObject()
-            && jv.get("type", "").asString() == "linear_in_wirelength";
-        double scalar_val = linear ? 0.0 : jv.asDouble();
-        double l0 = 0, v0 = 0, l1 = 1, v1 = 0;
-        if (linear) {
-            cache_wire_lengths();
-            l0 = jv["l0"].asDouble(); v0 = jv["v0"].asDouble();
-            l1 = jv["l1"].asDouble(); v1 = jv["v1"].asDouble();
-        }
+        const bool wl = needs_lengths(jv);
+        const double scalar_val = wl ? 0.0 : jv.asDouble();
+        if (wl) cache_wire_lengths();
         for (int ch : chans) {
-            if (linear) {
-                auto it = m_wire_length_cm.find(ch);
-                double L = (it == m_wire_length_cm.end()) ? l0 : it->second;
-                double t = std::clamp((L - l0) / (l1 - l0), 0.0, 1.0);
-                get_ci(ch).min_rms_cut = v0 + t * (v1 - v0);
-            }
-            else {
-                get_ci(ch).min_rms_cut = scalar_val;
-            }
+            get_ci(ch).min_rms_cut = wl ? eval_rms_cut(jv, ch, scalar_val) : scalar_val;
         }
     }
     if (cfg.isMember("max_rms_cut")) {
         const auto& jv = cfg["max_rms_cut"];
-        const bool linear = jv.isObject()
-            && jv.get("type", "").asString() == "linear_in_wirelength";
-        double scalar_val = linear ? 0.0 : jv.asDouble();
-        double l0 = 0, v0 = 0, l1 = 1, v1 = 0;
-        if (linear) {
-            cache_wire_lengths();
-            l0 = jv["l0"].asDouble(); v0 = jv["v0"].asDouble();
-            l1 = jv["l1"].asDouble(); v1 = jv["v1"].asDouble();
-        }
+        const bool wl = needs_lengths(jv);
+        const double scalar_val = wl ? 0.0 : jv.asDouble();
+        if (wl) cache_wire_lengths();
         for (int ch : chans) {
-            if (linear) {
-                auto it = m_wire_length_cm.find(ch);
-                double L = (it == m_wire_length_cm.end()) ? l0 : it->second;
-                double t = std::clamp((L - l0) / (l1 - l0), 0.0, 1.0);
-                get_ci(ch).max_rms_cut = v0 + t * (v1 - v0);
-            }
-            else {
-                get_ci(ch).max_rms_cut = scalar_val;
-            }
+            get_ci(ch).max_rms_cut = wl ? eval_rms_cut(jv, ch, scalar_val) : scalar_val;
         }
     }
     if (cfg.isMember("pad_window_front")) {

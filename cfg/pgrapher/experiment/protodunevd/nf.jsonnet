@@ -5,7 +5,8 @@ local wc = import 'wirecell.jsonnet';
 local sp_filters = import 'pgrapher/experiment/protodunevd/sp-filters.jsonnet';
 
 function(params, anode, chndbobj, n, name='',
-         debug_dump_path='', debug_dump_groups=[], shield_dump_path='')
+         debug_dump_path='', debug_dump_groups=[],
+         maskmap=null, shield_dump_path='')
   {
     local single = {
       type: 'PDVDOneChannelNoise',
@@ -60,9 +61,11 @@ function(params, anode, chndbobj, n, name='',
         // Nonzero forces the number of ticks in the waveform
         nticks: 0,
 
-        // channel bin ranges are ignored
-        // only when the channelmask is merged to `bad`
-        maskmap: {sticky: "bad", ledge: "bad", noisy: "bad"},
+        // maskmap routes NF tag names to output tag names.
+        // null → use OmnibusNoiseFilter C++ defaults (chirp+noisy → bad).
+        // Pass an explicit object to rename each tag independently.
+        maskmap: { noisy:"bad"},
+        // [if maskmap != null then 'maskmap']: maskmap,
         channel_filters: [
           wc.tn(single),
         ],

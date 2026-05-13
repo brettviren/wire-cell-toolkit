@@ -472,6 +472,24 @@ top_u_groups:
         6248, 6406, 6407,
         // anode 4 top W hand scan (run 039324, weird smaller signals)
         8123, 8124, 8414, 8507,
+        // that the new RMS cut still misses (mostly dead with normal RMS).
+        // Bottom (CRP4/5):
+        928, 929, 964, 3072, 3073, 3074, 4001, 4707, 4791,
+        // Top (anodes 4-7) — 84 channels:
+        6604, 6620, 6621, 6622, 6623, 6624, 6625, 6626, 6628, 6629,
+        6724, 6725, 6744, 6771, 6776, 6961, 7094,
+        7341, 7346, 7442, 7572, 7573, 7574, 7817,
+        7952, 7954, 7955, 7956, 7957, 7958, 7959, 7960, 7961, 7962, 7963,
+        8316, 8772, 8899, 8914,
+        9081, 9121, 9122, 9132, 9163, 9262,
+        9724, 9725, 9784, 9785, 9786, 9787,
+        10066, 10705, 10922,
+        11044, 11045, 11046, 11047, 11048, 11049, 11050, 11051,
+        11054, 11055, 11056, 11057,
+        11410, 11411, 11458, 11463, 11464, 11467, 11468,
+        11556, 11558, 11652,
+        11727, 11730, 11731, 11773, 11848,
+        12210, 12216, 12217,
     ],
 
     // Overide defaults for specific channels.  If an info is
@@ -541,28 +559,28 @@ top_u_groups:
       // (47-282 kHz). Diagnosed from run 040475 evt 0 fft_w histogram;
       // both clusters share the same spectral pattern.
       // Only active when freqmask_enabled=true (use_freqmask TLA).
-      {
-        // Channels belong to bottom anode 0 only; gate on n==0 so other anodes
-        // don't ask OmniChannelNoiseDB to look up channels they don't own.
-        channels: if n == 0 then std.range(2188, 2195) + std.range(2480, 2485) else [],
-        // Physical-frequency form: bins are resolved at runtime from the
-        // live frame size, so the same entries work for 6400/8000-tick frames.
-        freqmasks: if freqmask_enabled && n == 0 then
-          wc.freqmasks_phys(
-            [ 47.0*wc.kilohertz,
-              70.5*wc.kilohertz,
-              94.0*wc.kilohertz,
-             117.5*wc.kilohertz,
-             141.0*wc.kilohertz,
-             164.5*wc.kilohertz,
-             188.0*wc.kilohertz,
-             211.5*wc.kilohertz,
-             235.0*wc.kilohertz,
-             258.5*wc.kilohertz,
-             282.0*wc.kilohertz ],
-            1.0*wc.kilohertz)
-          else [],
-      },
+      // {
+      //   // Channels belong to bottom anode 0 only; gate on n==0 so other anodes
+      //   // don't ask OmniChannelNoiseDB to look up channels they don't own.
+      //   channels: if n == 0 then std.range(2188, 2195) + std.range(2480, 2485) else [],
+      //   // Physical-frequency form: bins are resolved at runtime from the
+      //   // live frame size, so the same entries work for 6400/8000-tick frames.
+      //   freqmasks: if freqmask_enabled && n == 0 then
+      //     wc.freqmasks_phys(
+      //       [ 47.0*wc.kilohertz,
+      //         70.5*wc.kilohertz,
+      //         94.0*wc.kilohertz,
+      //        117.5*wc.kilohertz,
+      //        141.0*wc.kilohertz,
+      //        164.5*wc.kilohertz,
+      //        188.0*wc.kilohertz,
+      //        211.5*wc.kilohertz,
+      //        235.0*wc.kilohertz,
+      //        258.5*wc.kilohertz,
+      //        282.0*wc.kilohertz ],
+      //       1.0*wc.kilohertz)
+      //     else [],
+      // },
 
       // Top-anode (4-7) CW lines diagnosed from run 040475 evt 0 anode-4 scan:
       //   23.5 kHz fundamental — universal LF line, present on all planes,
@@ -594,19 +612,37 @@ top_u_groups:
       //   (via OmniChannelNoiseDB "linear_in_wirelength" mode).
     ] + (
       if n >= 4 then [
-        // Top TPCs: flat per-plane
-        { channels: u_chans, min_rms_cut: 8.0 * gain_scale, max_rms_cut: 30.0 * gain_scale },
-        { channels: v_chans, min_rms_cut: 8.0 * gain_scale, max_rms_cut: 30.0 * gain_scale },
-        { channels: w_chans, min_rms_cut: 8.0 * gain_scale, max_rms_cut: 30.0 * gain_scale },
+        // Top TPCs.
+        // U/V: piecewise-linear-in-wirelength min — flat at short L, then
+        //   linear up at long L because longer-than-typical induction wires
+        //   pick up extra capacitive noise. Max stays per-plane flat.
+        // W: flat per-plane (collection: ~uniform length).
+        { channels: u_chans,
+          min_rms_cut: { type: 'piecewise_linear_in_wirelength',
+                         points: [
+                           { l:   0.0, v:  9.0 * gain_scale },
+                           { l: 120.0, v:  9.0 * gain_scale },
+                           { l: 172.0, v: 10.0 * gain_scale },
+                         ] },
+          max_rms_cut: 50.0 * gain_scale },
+        { channels: v_chans,
+          min_rms_cut: { type: 'piecewise_linear_in_wirelength',
+                         points: [
+                           { l:   0.0, v:  9.1 * gain_scale },
+                           { l: 120.0, v:  9.1 * gain_scale },
+                           { l: 172.0, v: 11.0 * gain_scale },
+                         ] },
+          max_rms_cut: 30.0 * gain_scale },
+        { channels: w_chans, min_rms_cut: 10.0 * gain_scale, max_rms_cut: 30.0 * gain_scale },
       ] else [
         // Bottom TPCs: W flat; U and V linear-in-wirelength on min
         { channels: w_chans, min_rms_cut: 5.0 * gain_scale, max_rms_cut: 15.0 * gain_scale },
         { channels: u_chans,
-          min_rms_cut: { type: 'linear_in_wirelength', l0: 0.0, v0: 2.6 * gain_scale, l1: 180.0, v1: 6.3 * gain_scale },
-          max_rms_cut: 15.0 * gain_scale },
+          min_rms_cut: { type: 'linear_in_wirelength', l0: 0.0, v0: 2.7 * gain_scale, l1: 180.0, v1: 6.5 * gain_scale },
+          max_rms_cut: 30.0 * gain_scale },
         { channels: v_chans,
           min_rms_cut: { type: 'linear_in_wirelength', l0: 0.0, v0: 2.6 * gain_scale, l1: 180.0, v1: 6.3 * gain_scale },
-          max_rms_cut: 15.0 * gain_scale },
+          max_rms_cut: 30.0 * gain_scale },
       ]
     ) + rms_cuts,
   }

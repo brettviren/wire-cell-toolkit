@@ -3,7 +3,7 @@
 // See chndb.jsonnet
 
 local handmade = import 'chndb-resp.jsonnet';
-local femb_params = import 'femb-negpulse-groups-shifted.jsonnet';
+local femb_params = import 'femb-negpulse-groups-shifted_v2.jsonnet';
 local wc = import 'wirecell.jsonnet';
 
 // TODO (follow-up): decon_limit, decon_limit1, adc_limit, min_adc_limit and
@@ -38,9 +38,12 @@ function(params, anode, field, n, rms_cuts=[], use_freqmask=true, coh_group_shif
 
     // coh_group_shift: cyclic offset (in offline channels) applied to U and V
     // group boundaries.  Set to 0 to recover the original (pre-fix) definition.
-    // Default 3 corrects the +3-channel FEMB-edge misassignment identified in
+    // Default magnitude 3 corrects the FEMB-edge misassignment identified in
     // the 027409-evt0-apa0 coherent-noise audit (U/V only; W is unchanged).
-    local shift = coh_group_shift,
+    // Sign flips by anode: +shift on anodes 0 & 2, -shift on anodes 1 & 3.
+    local shift = if n == 0 || n == 2 then coh_group_shift
+                  else if n == 1 || n == 3 then -coh_group_shift
+                  else 0,
     local u_group(u) = std.map(function(j) n * 2560 + std.mod(40 * u + shift + j, 800),
                                std.range(0, 39)),
     local v_group(v) = std.map(function(j) n * 2560 + 800 + std.mod(40 * v + shift + j, 800),
@@ -78,7 +81,9 @@ function(params, anode, field, n, rms_cuts=[], use_freqmask=true, coh_group_shif
         min_adc_limit: 100 * gain_scale, // 50,
         roi_min_max_ratio: 0.8, // default 0.8
         min_rms_cut: 10.0 * gain_scale,  // ADC at 14 mV/fC
-        max_rms_cut: 30.0 * gain_scale,  // ADC at 14 mV/fC
+        // min_rms_cut: 8.0 * gain_scale,  // ADC at 14 mV/fC
+        max_rms_cut: 50.0 * gain_scale,  // ADC at 14 mV/fC
+        // max_rms_cut: 35.0 * gain_scale,  // ADC at 14 mV/fC
 
         // parameter used to make "rcrc" spectrum
         rcrc: 1.1 * wc.millisecond, // 1.1 for collection, 3.3 for induction
@@ -149,6 +154,76 @@ function(params, anode, field, n, rms_cuts=[], use_freqmask=true, coh_group_shif
         decon_limit1: 0.08,
         // freqmasks: freqbinner.freqmasks(harmonic_freqs, 5.0*wc.kilohertz),
       },
+
+      // W-plane harmonic noise diagnosed from run 027409 evt 0 (anodes 1 & 3).
+      // Two interleaved combs are present:
+      //   Comb A: f0 = 18.17 kHz, harmonics h2..h18 (36.34..327.06 kHz)
+      //   Comb B: f0 = 28.97 kHz, harmonics h1..h13 (28.97..376.6 kHz)
+      // Both are notched on the same channel set.  Comb B was identified
+      // post-NF on ch4160/5108/5118/5119/9280/9759/9760/9761 etc. as a
+      // residual 29-kHz-spaced peak structure not covered by comb A; a
+      // bin-spacing analysis across all listed channels showed best-fit
+      // f0 = 28.97 kHz with harmonics 1-12 confirmed at SNR>=4σ.
+      // Affected channels: anode1 {4160, 4626-4639, 5107-5119} and
+      //                    anode3 {9280-9295, 9758-9780}.
+      // Only active when freqmask_enabled=true (use_freqmask TLA).
+      // {
+      //   channels: if n == 1 then [4160] + std.range(4626, 4639) + std.range(5107, 5119)
+      //             else if n == 3 then std.range(9280, 9296) + std.range(9758, 9781)
+      //             else [],
+      //   freqmasks: if freqmask_enabled && (n == 1 || n == 3) then
+      //     wc.freqmasks_phys(
+      //       [k * 18.17 * wc.kilohertz for k in std.range(2, 18)] +
+      //       [k * 28.97 * wc.kilohertz for k in std.range(1, 13)],
+      //       1.0*wc.kilohertz)
+      //     else [],
+      // },
+
+      // ch10000-10047 (anode 3, W-plane): separate ~20-22 kHz doublet
+      // interference absent in all other groups.  Re-measured peaks at
+      // 20.7 and 22.0 kHz (previous config used 21.3/22.7 which missed
+      // both peaks under ±0.5 kHz notches).
+      // {
+      //   channels: if n == 3 then std.range(10000, 10048) else [],
+      //   freqmasks: if freqmask_enabled && n == 3 then
+      //     wc.freqmasks_phys(
+      //       [ 20.7*wc.kilohertz,
+      //         22.0*wc.kilohertz ],
+      //       0.5*wc.kilohertz)
+      //     else [],
+      // },
+
+      // APA2 (n==2) U/V plane harmonic combs diagnosed from run 027409 evt 0.
+      // Two distinct combs, each shared between a U-plane group and a V-plane
+      // group (same combs on both planes -> electronics-level pickup):
+      //   Comb A: f0 = 16.43 kHz, h2..h12 (32.86..197.16 kHz).  h3 (~49 kHz)
+      //           and h5 (~82 kHz) dominate.
+      //   Comb B: f0 = 25.57 kHz, h1..h3  (25.57, 51.14, 76.71 kHz).  h3
+      //           strongest.
+      // Carriers:
+      //   Comb A: U ch5202-5203, V ch6243-6282
+      //   Comb B: U ch5560-5603, V ch6641-6719
+      // G3 (V 5961-5965) had a wide bump 50-90 kHz that is not a discrete
+      // comb (peak walks 59->69 kHz channel-to-channel) and is left to the
+      // dynamic noisy-channel mask.
+      // {
+      //   channels: if n == 2 then std.range(5202, 5203) + std.range(6243, 6282)
+      //             else [],
+      //   freqmasks: if freqmask_enabled && n == 2 then
+      //     wc.freqmasks_phys(
+      //       [k * 16.43 * wc.kilohertz for k in std.range(2, 12)],
+      //       1.0*wc.kilohertz)
+      //     else [],
+      // },
+      // {
+      //   channels: if n == 2 then std.range(5560, 5603) + std.range(6641, 6719)
+      //             else [],
+      //   freqmasks: if freqmask_enabled && n == 2 then
+      //     wc.freqmasks_phys(
+      //       [k * 25.57 * wc.kilohertz for k in std.range(1, 3)],
+      //       1.0*wc.kilohertz)
+      //     else [],
+      // },
 
     ] + rms_cuts,
   }

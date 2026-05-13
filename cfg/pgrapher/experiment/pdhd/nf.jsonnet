@@ -7,7 +7,8 @@ local sp_filters = import 'pgrapher/experiment/pdhd/sp-filters.jsonnet';
 local default_dft = { type: 'FftwDFT' };
 
 function(params, anode, chndbobj, n, name='', dft=default_dft,
-         debug_dump_path='', debug_dump_groups=[]) {
+         debug_dump_path='', debug_dump_groups=[],
+         maskmap=null) {
     local single = {
         type: 'PDHDOneChannelNoise',
         name: name,
@@ -63,15 +64,13 @@ function(params, anode, chndbobj, n, name='', dft=default_dft,
             // Nonzero forces the number of ticks in the waveform
             nticks: 0,
 
-            // channel bin ranges are ignored
-            // only when the channelmask is merged to `bad`
-            // maskmap: {sticky: "bad", ledge: "bad", noisy: "bad"},
-            // Explicit maskmap replaces the OmnibusNoiseFilter defaults
-            // (chirp+noisy), so any keys we want active must be listed here.
-            // Mirrors MicroBooNE's chirp+noisy and adds femb_noise produced
-            // by PDHDFEMBNoiseSub.  lf_noisy is intentionally NOT routed to
-            // "bad" (matching MicroBooNE).
-            maskmap: {chirp: "bad", noisy: "bad", femb_noise: "bad"},
+            // maskmap routes NF tag names to output tag names.
+            // null → use OmnibusNoiseFilter C++ defaults (chirp+noisy → bad).
+            // Pass an explicit object to rename each tag independently, e.g.:
+            //   {chirp:"chirp", noisy:"noisy", femb_noise:"femb_noise"}
+            // or merge all to "bad":
+            maskmap: { noisy:"bad", femb_noise:"bad"},
+            // [if maskmap != null then 'maskmap']: maskmap,
             channel_filters: [
                 wc.tn(single),
             ],

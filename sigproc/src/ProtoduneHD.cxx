@@ -718,7 +718,7 @@ float PDHD::CalcRMSWithFlags(const WireCell::Waveform::realseq_t& sig)
     return theRMS;
 }
 
-bool PDHD::NoisyFilterAlg(WireCell::Waveform::realseq_t& sig, float min_rms, float max_rms)
+bool PDHD::NoisyFilterAlg(WireCell::Waveform::realseq_t& sig, float min_rms, float max_rms, int ch)
 {
     const double rmsVal = PDHD::CalcRMSWithFlags(sig);
 
@@ -727,6 +727,10 @@ bool PDHD::NoisyFilterAlg(WireCell::Waveform::realseq_t& sig, float min_rms, flo
         for (int i = 0; i < numBins; i++) {
             sig.at(i) = 100000.0/*10000.0*/;
         }
+        std::cerr << "[PDHD::NoisyFilterAlg] noisy ch=" << ch
+                  << " rms=" << rmsVal
+                  << " (cuts: min=" << min_rms << ", max=" << max_rms << ")"
+                  << std::endl;
 
         return true;
     }
@@ -926,7 +930,7 @@ WireCell::Waveform::ChannelMaskMap PDHD::OneChannelNoise::apply(int ch, signal_t
     const float max_rms = m_noisedb->max_rms_cut(ch);
     // alternative RMS tagging
     PDHD::SignalFilter(signal);
-    bool is_noisy = PDHD::NoisyFilterAlg(signal, min_rms, max_rms);
+    bool is_noisy = PDHD::NoisyFilterAlg(signal, min_rms, max_rms, ch);
     PDHD::RemoveFilterFlags(signal);
     if (is_noisy) {
         WireCell::Waveform::BinRange temp_bin_range;

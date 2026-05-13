@@ -30,7 +30,7 @@ namespace WireCell {
             bool RawAdapativeBaselineAlg(WireCell::Waveform::realseq_t& sig);
 
             bool RemoveFilterFlags(WireCell::Waveform::realseq_t& sig);
-            bool NoisyFilterAlg(WireCell::Waveform::realseq_t& spec, float min_rms, float max_rms);
+            bool NoisyFilterAlg(WireCell::Waveform::realseq_t& spec, float min_rms, float max_rms, int ch = -1);
 
             std::vector<std::vector<int> > SignalProtection(WireCell::Waveform::realseq_t& sig,
                                                             const WireCell::Waveform::compseq_t& respec,
