@@ -256,17 +256,25 @@ void Main::initialize()
     // backends the same.
     Log::set_pattern("[%H:%M:%S.%03e] %L [%^%=8n%$] %v");
     log = Log::logger("main");
-    log->set_pattern("[%H:%M:%S.%03e] %L [  main  ] %v");
+    Log::set_level("debug", "main");
+    Log::set_pattern("[%H:%M:%S.%03e] %L [  main  ] %v", "main");
     log->debug("logging to \"main\"");
 
     // Load configuration files
     for (auto filename : m_cfgfiles) {
-        log->debug("loading config file {}", filename);
+        log->debug("loading config file {}: extvars={} extcode={} tlavars={} tlacode={} load_paths={}",
+                   filename, m_extvars.size(), m_extcode.size(),
+                   m_tlavars.size(), m_tlacode.size(), m_load_path.size());
         Persist::Parser p(m_load_path, m_extvars, m_extcode, m_tlavars, m_tlacode);
+        log->debug("parser ready, calling p.load({})", filename);
         Json::Value one = p.load(filename);  // throws
+        log->debug("p.load({}) returned: top-level type={} size={}",
+                   filename, (int)one.type(), one.size());
         //log->debug(one.toStyledString());
         m_cfgmgr.extend(one);
+        log->debug("config file {} merged into cfgmgr", filename);
     }
+    log->debug("all config files loaded ({} total)", m_cfgfiles.size());
 
     // Find if we have our own special configuration entry
     int ind = m_cfgmgr.index("wire-cell");
@@ -356,6 +364,7 @@ void Main::initialize()
         Configuration cfg = cfgobj->default_configuration();
         cfg = update(cfg, c["data"]);
         cfgobj->configure(cfg);  // throws
+        log->debug("configured component:  \"{}\":\"{}\"", type, name);
     }
 }
 
