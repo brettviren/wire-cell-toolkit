@@ -271,7 +271,7 @@ void Main::initialize()
         log->debug("p.load({}) returned: top-level type={} size={}",
                    filename, (int)one.type(), one.size());
         //log->debug(one.toStyledString());
-        m_cfgmgr.extend(one);
+        m_cfgmgr.extend(std::move(one));  // move avoids the ~tree-size deep-copy
         log->debug("config file {} merged into cfgmgr", filename);
     }
     log->debug("all config files loaded ({} total)", m_cfgfiles.size());

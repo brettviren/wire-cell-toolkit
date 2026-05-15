@@ -25,6 +25,10 @@ namespace WireCell {
         ~ConfigManager();
 
         /// Extend current list of configuration objects with more.
+        /// Pass by value (kept for ABI compatibility with pre-built binaries
+        /// such as cvmfs libWireCellApps.so); the body consumes `more` via
+        /// per-entry std::move into m_top, so new callers should pass an
+        /// rvalue (e.g. std::move(cfg)) to skip the caller-side deep-copy.
         void extend(Configuration more);
 
         // Add a fully-built configurable configuration for an instance, return its index

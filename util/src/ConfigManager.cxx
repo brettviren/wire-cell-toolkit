@@ -26,18 +26,24 @@ void ConfigManager::extend(Configuration more)
         by_tn[get<string>(c, "type") + "\t" + get<string>(c, "name")] = i;
     }
 
-    for (const auto& one : more) {
-        const std::string key = get<string>(one, "type") + "\t" + get<string>(one, "name");
+    // We own `more` (by-value parameter): move each entry into m_top instead
+    // of deep-copying.  Read type/name into locals first because we may move
+    // `one` afterwards.  Callers that std::move()-in their argument also skip
+    // the caller-side deep-copy at the call boundary.
+    for (auto& one : more) {
+        const std::string type = get<string>(one, "type");
+        const std::string name = get<string>(one, "name");
+        const std::string key = type + "\t" + name;
         auto it = by_tn.find(key);
         if (it == by_tn.end()) {
             const int ind = m_top.size();
-            m_top[ind] = one;
+            m_top[ind] = std::move(one);
             by_tn[key] = ind;
         }
         else {
             spdlog::warn("ConfigManager::extend() overwriting type=\"{}\" name=\"{}\"",
-                         get<string>(one, "type"), get<string>(one, "name"));
-            m_top[it->second] = one;
+                         type, name);
+            m_top[it->second] = std::move(one);
         }
     }
 }
@@ -106,16 +112,8 @@ Configuration ConfigManager::pop(int ind)
         return Configuration();
     }
     Configuration ret;
-    Configuration reduced(Json::arrayValue);
-    int siz = size();
-    for (int i = 0; i < siz; ++i) {
-        if (i == ind) {
-            ret = m_top[i];
-        }
-        else {
-            reduced.append(m_top[i]);
-        }
-    }
-    m_top = reduced;
+    // In-place removal via jsoncpp; avoids cloning every non-popped entry into
+    // a fresh `reduced` array and then re-assigning that array back to m_top.
+    m_top.removeIndex(static_cast<Json::ArrayIndex>(ind), &ret);
     return ret;
 }
