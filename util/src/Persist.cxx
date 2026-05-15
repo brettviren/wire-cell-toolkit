@@ -17,6 +17,8 @@
 #include <string>
 #include <sstream>
 #include <fstream>
+#include <cstring>
+#include <memory>
 
 // see #239 for why this is here.
 extern "C" {
@@ -245,12 +247,20 @@ Json::Value WireCell::Persist::loads(const std::string& text,
     return parser.loads(text);
 }
 
-// bundles few lines into function to avoid some copy-paste
+// Parse JSON text directly via CharReader, avoiding the stringstream/stringbuf
+// pipeline that used to materialize 2-3 extra copies of the input text for
+// large configurations.
 Json::Value WireCell::Persist::json2object(const std::string& text)
 {
     Json::Value res;
-    stringstream ss(text);
-    ss >> res;
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    std::string errs;
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    if (!reader->parse(begin, end, &res, &errs)) {
+        THROW(IOError() << errmsg{"json parse failed: " + errs});
+    }
     return res;
 }
 
@@ -406,11 +416,23 @@ Json::Value WireCell::Persist::Parser::load(const std::string& filename)
         char* jtext = jsonnet_evaluate_file(m_jvm, to_chars(fname), &rc);
         if (rc) {
             error(jtext);
-            THROW(ValueError() << errmsg{jtext});
+            std::string emsg(jtext);
+            jsonnet_realloc(m_jvm, jtext, 0);
+            THROW(ValueError() << errmsg{emsg});
         }
-        std::string output(jtext);
+        // Parse directly from the libjsonnet buffer; avoids materializing a
+        // ~1 GB std::string copy of the jsonnet output before parsing.
+        Json::Value res;
+        Json::CharReaderBuilder builder;
+        std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+        std::string errs;
+        const std::size_t len = std::strlen(jtext);
+        const bool ok = reader->parse(jtext, jtext + len, &res, &errs);
         jsonnet_realloc(m_jvm, jtext, 0);
-        return json2object(output);
+        if (!ok) {
+            THROW(IOError() << errmsg{"jsonnet output JSON parse failed: " + errs});
+        }
+        return res;
     }
 
     // also support JSON, possibly compressed
