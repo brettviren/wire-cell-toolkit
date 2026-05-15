@@ -34,7 +34,7 @@ namespace WireCell {
         int add(Configuration& data, const std::string& type, const std::string& name = "");
 
         /// Return top-level, aggregate configuration
-        Configuration all() const { return m_top; }
+        const Configuration& all() const { return m_top; }
 
         Configuration at(int index) const;
 

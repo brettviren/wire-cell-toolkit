@@ -296,7 +296,7 @@ void Main::initialize()
 
     // Load any plugin shared libraries requested by user.
     PluginManager& pm = PluginManager::instance();
-    for (auto plugin : m_plugins) {
+    for (const auto& plugin : m_plugins) {
         string pname, lname;
         std::tie(pname, lname) = String::parse_pair(plugin);
         log->debug("adding plugin: \"{}\"", plugin);
@@ -309,7 +309,7 @@ void Main::initialize()
     // Apply any component configuration sequence.
 
     // Instantiation
-    for (auto c : m_cfgmgr.all()) {
+    for (const auto& c : m_cfgmgr.all()) {
         if (c.isNull()) {
             continue;  // allow and ignore any totally empty configurations
         }
@@ -322,13 +322,13 @@ void Main::initialize()
         log->debug("constructing component: \"{}\":\"{}\"", type, name);
         auto iface = Factory::lookup<Interface>(type, name);  // throws
     }
-    for (auto c : m_apps) {
+    for (const auto& c : m_apps) {
         log->debug("constructing app: \"{}\"", c);
         Factory::lookup_tn<IApplication>(c);
     }
 
     // Give any named components their name.
-    for (auto c : m_cfgmgr.all()) {
+    for (const auto& c : m_cfgmgr.all()) {
         if (c.isNull()) {
             continue;  // allow and ignore any totally empty configurations
         }
@@ -347,7 +347,7 @@ void Main::initialize()
 
     // Finally, ask any configurables for their default, merge with
     // user config and give back.
-    for (auto c : m_cfgmgr.all()) {
+    for (const auto& c : m_cfgmgr.all()) {
         if (c.isNull()) {
             continue;  // allow and ignore any totally empty configurations
         }
@@ -362,8 +362,15 @@ void Main::initialize()
         // Get component's hard-coded default config, update it with
         // anything the user may have provided and apply it.
         Configuration cfg = cfgobj->default_configuration();
-        cfg = update(cfg, c["data"]);
-        cfgobj->configure(cfg);  // throws
+        if (cfg.isNull()) {
+            // Component has no defaults — skip the merge and pass user config directly.
+            cfgobj->configure(c["data"]);  // throws
+        }
+        else {
+            Configuration user_data = c["data"];  // update() needs a non-const ref
+            update(cfg, user_data);
+            cfgobj->configure(cfg);  // throws
+        }
         log->debug("configured component:  \"{}\":\"{}\"", type, name);
     }
 }
@@ -372,7 +379,7 @@ void Main::operator()()
 {
     // Find all IApplications to execute
     vector<IApplication::pointer> app_objs;
-    for (auto component : m_apps) {
+    for (const auto& component : m_apps) {
         string type, name;
         std::tie(type, name) = String::parse_pair(component);
         auto a = Factory::find<IApplication>(type, name);  // throws
@@ -405,7 +412,7 @@ void Main::operator()()
 
 void Main::finalize()
 {
-    for (auto c : m_cfgmgr.all()) {
+    for (const auto& c : m_cfgmgr.all()) {
         if (c.isNull()) {
             continue;  // allow and ignore any totally empty configurations
         }

@@ -26,7 +26,7 @@ void ConfigManager::extend(Configuration more)
         by_tn[get<string>(c, "type") + "\t" + get<string>(c, "name")] = i;
     }
 
-    for (auto one : more) {
+    for (const auto& one : more) {
         const std::string key = get<string>(one, "type") + "\t" + get<string>(one, "name");
         auto it = by_tn.find(key);
         if (it == by_tn.end()) {
@@ -45,7 +45,7 @@ void ConfigManager::extend(Configuration more)
 int ConfigManager::index(const std::string& type, const std::string& name) const
 {
     int ind = -1;
-    for (auto c : m_top) {
+    for (const auto& c : m_top) {
         ++ind;
         if (get<string>(c, "type") != type) {
             continue;
