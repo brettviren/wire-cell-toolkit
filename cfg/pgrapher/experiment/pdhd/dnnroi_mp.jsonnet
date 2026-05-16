@@ -23,16 +23,24 @@ function(anode, ts, prefix='dnnroi',
          tick_per_slice=4,
          nchunks=1,
          mask_thresh=0.5,
+         nchan=3,
          debugfile='')
 
   local apaid = anode.data.ident;
   local prename = prefix + std.toString(apaid);
 
+  // Input trace tags fed to the model, in the order the model expects.
+  // The 3-ch model (CP43.ts) uses the first three; the 6-ch KD/QAT models
+  // add tight_lf/decon_charge/gauss.  Order must match the training im_tags.
+  assert nchan == 3 || nchan == 6 : 'dnnroi nchan must be 3 or 6, got %d' % nchan;
   local apa_intags = [
     'loose_lf%d' % apaid,
     'mp2_roi%d' % apaid,
     'mp3_roi%d' % apaid,
-  ];
+    'tight_lf%d' % apaid,
+    'decon_charge%d' % apaid,
+    'gauss%d' % apaid,
+  ][0:nchan];
 
   // Decide which planes get DNN-ROI outputs emitted.
   //   APA0:    output U only (V/W → standard SP gauss)
@@ -54,7 +62,9 @@ function(anode, ts, prefix='dnnroi',
       intags: apa_intags,
       decon_charge_tag: 'decon_charge%d' % apaid,
       outtags: model_outtags,
-      input_scale: 1.0 / 4000,
+      // 6-ch models bake per-channel z-scale normalization into the .ts,
+      // so they run with input_scale 1.0; the 3-ch model needs 1/4000.
+      input_scale: if nchan == 6 then 1.0 else 1.0 / 4000,
       output_scale: output_scale,
       mask_thresh: mask_thresh,
       forward: wc.tn(ts),
