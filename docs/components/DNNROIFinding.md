@@ -24,8 +24,24 @@ Applies a deep-neural-network ROI finder to deconvolved wire-plane traces by run
 | `intags` | array of input trace tags fed as network input channels (required) |
 | `decon_charge_tag` | trace tag for the deconvolved charge used as the signal source after ROI masking (required) |
 | `outtag` | output trace tag applied to the resulting signal traces |
-| `input_scale` | scale factor applied to input charge values before the model (default 1/4000) |
+| `input_scale` | scale factor applied uniformly to all input charge values before the model (default 1/4000); set to 1.0 when the TorchScript model bakes per-channel normalization internally (e.g. 6-channel models) |
+| `input_offset` | constant offset added to input charge values after scaling (default 0.0) |
 | `output_scale` | scale factor applied to output charge after ROI masking (default 1.0) |
 | `tick0` | first tick index of the data window (default 0) |
 | `nticks` | number of ticks in the data window (default 6000) |
 | `mask_thresh` | probability threshold for converting the network ROI mask to binary (default 0.5) |
+
+## Input Normalization
+
+Before being passed to the model, all input channels are transformed uniformly:
+
+```
+model_input = raw_charge * input_scale + input_offset
+```
+
+The location of normalization depends on the model:
+
+- **3-channel models** — normalization is external: set `input_scale = 1/4000` (the default) so C++ scales the charge before inference.
+- **6-channel models** — per-channel z-score normalization is baked into the TorchScript graph itself, so `input_scale` should be `1.0` (pass-through) and the model handles the rest internally.
+
+The `DNNROIFindingMultiPlane` variant follows the same convention.
