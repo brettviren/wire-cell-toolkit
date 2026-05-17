@@ -373,6 +373,12 @@ void Main::initialize()
         }
         log->debug("configured component:  \"{}\":\"{}\"", type, name);
     }
+
+    // All components are now configured.  Drop the bulk "data" sub-trees
+    // from the cfgmgr (finalize() only needs type/name) so the multi-GB
+    // resident Json::Value tree is released before event processing begins.
+    m_cfgmgr.clear_data();
+    log->debug("released config data sub-trees from cfgmgr");
 }
 
 void Main::operator()()

@@ -52,6 +52,13 @@ namespace WireCell {
         /// Remove configuration at given index and return it.
         Configuration pop(int ind);
 
+        /// Drop the bulk "data" sub-tree from every top-level entry, retaining
+        /// only "type" and "name".  Useful after every IConfigurable has been
+        /// constructed and configured: the resident Json::Value tree (which
+        /// can be multiple GB for ICARUS-scale configs) is no longer needed
+        /// for downstream operation since finalize() only consults type/name.
+        void clear_data();
+
         /// Return a list of all known configurables
         typedef std::pair<std::string, std::string> ClassInstance;
         std::vector<ClassInstance> configurables() const;

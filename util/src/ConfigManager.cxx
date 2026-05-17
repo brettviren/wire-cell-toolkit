@@ -117,3 +117,15 @@ Configuration ConfigManager::pop(int ind)
     m_top.removeIndex(static_cast<Json::ArrayIndex>(ind), &ret);
     return ret;
 }
+
+void ConfigManager::clear_data()
+{
+    // For each top-level entry, drop its "data" sub-tree.  finalize() only
+    // looks at "type" and "name" so the bulk payload can be released after
+    // configure() has run.
+    for (auto& c : m_top) {
+        if (c.isObject()) {
+            c.removeMember("data");
+        }
+    }
+}
