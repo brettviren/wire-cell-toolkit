@@ -162,6 +162,12 @@ base {
         
     },
 
+    // Toggle: data-retuned PDVD electronics-noise spectra, derived from
+    // run039324 (see pdvd/nf_plot/noise_spectrum_comparison.md).  Default
+    // false keeps the original v1/v2 spectra so existing production configs
+    // stay bit-identical; override with `params { use_retuned_noise: true }`.
+    use_retuned_noise: false,
+
     files: {
         wires: "protodunevd-wires-larsoft-v3.json.bz2",
         strip_length: "PDVD_strip_length.json.bz2",
@@ -175,10 +181,15 @@ base {
             "protodunevd_FR_imbalance3p_260501.json.bz2",
         ],
 
-        noises: [
-            "pdvd-bottom-noise-spectra-v1.json.bz2",
-            "pdvd-top-noise-spectra-v2.json.bz2",
-        ],
+        noises: if $.use_retuned_noise
+                then [
+                    "pdvd-bottom-noise-spectra-v2.json.bz2",
+                    "pdvd-top-noise-spectra-v3.json.bz2",
+                ]
+                else [
+                    "pdvd-bottom-noise-spectra-v1.json.bz2",
+                    "pdvd-top-noise-spectra-v2.json.bz2",
+                ],
 
         // chresp: "protodunevd-params-channel-responses-v0.json.bz2",
         chresp: null,
