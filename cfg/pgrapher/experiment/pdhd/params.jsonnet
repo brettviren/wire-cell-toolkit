@@ -4,6 +4,19 @@
 local wc = import "wirecell.jsonnet";
 local base = import "pgrapher/dune/params.jsonnet";
 
+// Electronics-noise file, selected by the front-end gain.  The cold
+// electronics has four gain settings -- 4.7 / 7.8 / 14 / 25 mV/fC -- and
+// noise-spectra files currently exist only for 7.8 and 14.  Any other gain
+// (a setting with no file, or a value that is not a valid setting) aborts the
+// configuration rather than silently using a wrong-gain spectrum.
+local pdhd_noise(gain) =
+    local g = gain / (wc.mV / wc.fC);
+    if std.abs(g - 7.8) < 0.05 then "protodunehd-noise-spectra-7d8mVfC-v1.json.bz2"
+    else if std.abs(g - 14.0) < 0.05 then "protodunehd-noise-spectra-14mVfC-v1.json.bz2"
+    else error ("PDHD noise: no spectra file for elec.gain = " + g
+                + " mV/fC.  Valid cold-electronics gain settings are"
+                + " 4.7/7.8/14/25 mV/fC; spectra files exist only for 7.8 and 14.");
+
 base {
     // This section will be overwritten in simparams.jsonnet
     det : {
@@ -162,12 +175,9 @@ base {
 
         fltresp: "protodunehd-field-response-filters.json.bz2",
 
-        // Noise models for different FE amplifier gains
-        // Note: set gain value accordingly in the field of elecs
-        // noise: "protodunehd-noise-spectra-14mVfC-v1.json.bz2",
-        // noise: "protodunehd-noise-spectra-7d8mVfC-v1.json.bz2",
-        noise: if $.elec.gain > 8*wc.mV/wc.fC then "protodunehd-noise-spectra-14mVfC-v1.json.bz2"
-               else "protodunehd-noise-spectra-7d8mVfC-v1.json.bz2",
+        // Noise model, selected by the FE amplifier gain (`pdhd_noise`,
+        // above -- set the gain in the `elec` field).
+        noise: pdhd_noise($.elec.gain),
 
 
         chresp: null,

@@ -4,6 +4,20 @@
 local wc = import "wirecell.jsonnet";
 local base = import "pgrapher/dune/params.jsonnet";
 
+// Bottom-drift electronics-noise file, selected by the front-end gain.  The
+// cold electronics has four gain settings -- 4.7 / 7.8 / 14 / 25 mV/fC -- and
+// noise-spectra files currently exist only for 7.8 and 14.  Any other gain
+// (a setting with no file, or a value that is not a valid setting) aborts the
+// configuration rather than silently using a wrong-gain spectrum.  See
+// pdvd/nf_plot/electronics_gain_and_noise.md.
+local pdvd_bottom_noise(gain) =
+    local g = gain / (wc.mV / wc.fC);
+    if std.abs(g - 7.8) < 0.05 then "pdvd-bottom-noise-spectra-7d8mVfC-v1.json.bz2"
+    else if std.abs(g - 14.0) < 0.05 then "pdvd-bottom-noise-spectra-14mVfC-v1.json.bz2"
+    else error ("PDVD bottom noise: no spectra file for elec.gain = " + g
+                + " mV/fC.  Valid cold-electronics gain settings are"
+                + " 4.7/7.8/14/25 mV/fC; spectra files exist only for 7.8 and 14.");
+
 base {
     // This section will be overwritten in simparams.jsonnet
     det : {
@@ -175,10 +189,12 @@ base {
             "protodunevd_FR_imbalance3p_260501.json.bz2",
         ],
 
-        // Electronics-noise spectra, data-retuned from run039324 -- see
-        // pdvd/nf_plot/noise_spectrum_comparison.md.
+        // Electronics-noise spectra.  Bottom: selected by front-end gain
+        // (`pdvd_bottom_noise`, above -- set the gain in $.elecs[0]); the
+        // 7.8 mV/fC file is data-retuned from run039324, see
+        // noise_spectrum_comparison.md.  Top: single gain setting.
         noises: [
-            "pdvd-bottom-noise-spectra-v2.json.bz2",
+            pdvd_bottom_noise($.elec.gain),
             "pdvd-top-noise-spectra-v3.json.bz2",
         ],
 
