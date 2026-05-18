@@ -73,6 +73,9 @@ function(params) base {
   },
 
   elec: super.elec {
+    // FE gain: restores the default removed from the shared base in
+    // commit 41e02736 (pre-41e02736 inherited 14 mV/fC).
+    gain: 14.0 * wc.mV / wc.fC,
     postgain: 1.0,
     shaping: 2.0 * wc.us,
   },

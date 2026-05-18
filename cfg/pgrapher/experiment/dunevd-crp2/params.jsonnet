@@ -67,6 +67,10 @@ base {
     },
 
     adc: super.adc {
+        // ADC resolution (bits): restores the default removed from the
+        // shared base params in commit 41e02736 (pre-41e02736 inherited 12).
+        resolution: 12,
+
         // per tdr, chapter 2
         // induction plane: 2350 ADC, collection plane: 900 ADC
         baselines: [1003.4*wc.millivolt,1003.4*wc.millivolt,507.7*wc.millivolt],
@@ -79,6 +83,10 @@ base {
     },
 
     elec: super.elec {
+      // FE gain: restores the default removed from the shared base in
+      // commit 41e02736.  JsonElecResponse loads its response from file,
+      // but the jsonnet still requires the field to exist.
+      gain: 14.0*wc.mV/wc.fC,
       type: "JsonElecResponse",
       filename: "dunevd-coldbox-elecresp-top-psnorm_400.json.bz2",
       postgain: 1.0,

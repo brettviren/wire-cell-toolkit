@@ -94,6 +94,10 @@ base {
 	// induction plane: 6k Ohm vs 6k Ohm; collection: 6k Ohm vs 1.2k Ohm
 	//Vref = 1.8 V
 	// induce a RC filter  with tau = 1ms
+        // ADC resolution (bits): restores the default removed from the
+        // shared base params in commit 41e02736 (pre-41e02736 inherited 12).
+        resolution: 12,
+
         baselines: [879.5*wc.millivolt, 879.5*wc.millivolt, 286.0*wc.millivolt],
 
         // check this
@@ -106,6 +110,9 @@ base {
     // in pgrapher/common/ui/wcls/nodes.jsonnet.
     // also, see later overwriting in simparams.jsonnet
     elec: super.elec {
+      // FE gain: restores the default removed from the shared base in
+      // commit 41e02736 (pre-41e02736 inherited 14 mV/fC).
+      gain: 14.0*wc.mV/wc.fC,
       postgain: 1.0, // pulser calibration: 41.649 ADC*tick/1ke
                        // theoretical elec resp (14mV/fC): 36.6475 ADC*tick/1ke
       shaping: 2.0 * wc.us,
