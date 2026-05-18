@@ -119,7 +119,6 @@ function(params, tools, override = {}) {
 
       // frame tags
       wiener_tag: 'wiener%d' % anode.data.ident,
-      wiener_threshold_tag: 'threshold%d' % anode.data.ident,
       decon_charge_tag: 'decon_charge%d' % anode.data.ident,
       gauss_tag: 'gauss%d' % anode.data.ident,
       // Special-mode pre-Wire-filter pre-ROI deconvolved waveform tap.
