@@ -118,6 +118,12 @@ function(params)
        else [params.elec], // backward compatible
     ),
 
+    // Pick the elec response for field-response index `n`.  Detectors with
+    // per-field electronics (e.g. PD-VD top/bottom) provide one elec per
+    // field response; single-electronics detectors (uboone, pdsp, pdhd) have
+    // fewer elecs than fields and reuse elec_resps[0] for every field.
+    elec_resp_for(n):: $.elec_resps[if n < std.length($.elec_resps) then n else 0],
+
     rc_resp : {
         type: "RCResponse",
         data: sim_response_binning {
@@ -150,8 +156,8 @@ function(params)
                 field_response: wc.tn(fr),
                 // note twice we give rc so we have rc^2 in the final convolution
                 short_responses: if params.sys_status == false
-                                    then [wc.tn($.elec_resps[n])]
-                                    else [wc.tn($.elec_resps[n]), wc.tn($.sys_resp)],
+                                    then [wc.tn($.elec_resp_for(n))]
+                                    else [wc.tn($.elec_resp_for(n)), wc.tn($.sys_resp)],
 		overall_short_padding: if std.objectHas(params, 'overall_short_padding')
                                     then params.overall_short_padding
                                     else if params.sys_status == false
@@ -164,7 +170,7 @@ function(params)
         else [wc.tn($.rc_resp), wc.tn($.rc_resp)],
 		long_padding: 1.5*wc.ms,
 	    },
-            uses: [$.dft, fr, $.elec_resps[n], $.rc_resp, $.sys_resp],
+            uses: [$.dft, fr, $.elec_resp_for(n), $.rc_resp, $.sys_resp],
         } for plane in [0,1,2]], $.fields),
 
     // One anode per detector "volume"
