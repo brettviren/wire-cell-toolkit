@@ -5,7 +5,7 @@ local wc = import "wirecell.jsonnet";
 local io = import 'pgrapher/common/fileio.jsonnet';
 local tools_maker = import 'pgrapher/common/tools.jsonnet';
 local params_maker = import 'pgrapher/experiment/dune-vd/params.jsonnet';
-local params = params_maker({ response_plane: 18.92 * wc.cm, nticks: 8500 });
+local params = params_maker({ response_plane: 18.1 * wc.cm, nticks: 8500 }); // synced to protodunevd
 
 local tools = tools_maker(params);
 

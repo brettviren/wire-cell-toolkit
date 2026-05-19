@@ -24,7 +24,8 @@ base {
         // start.  Garfield calcualtions start somewhere relative to
         // something, here's where that is made concrete.  This MUST
         // match what field response functions also used.
-        response_plane: 18.92*wc.cm, // relative to collection wires
+        response_plane: 18.1*wc.cm, // relative to collection wires
+                                    // synced to protodunevd / params.files.fields
         local res_plane = 0.5*apa_w2w + self.response_plane,
 
         // The cathode plane is like the anode cut off plane.  Any
@@ -89,7 +90,7 @@ base {
       gain: 14.0*wc.mV/wc.fC,
       type: "JsonElecResponse",
       filename: "dunevd-coldbox-elecresp-top-psnorm_400.json.bz2",
-      postgain: 1.0,
+      postgain: 1.36, // synced to protodunevd top elec: 11mV/fC, 1.94 -> 14mV/fC
     },
 
     sim: super.sim {
@@ -125,10 +126,12 @@ base {
         wires: "dunevdcrp2-wires-larsoft-v1.json.bz2",
 
         fields: [
-            "dunevd-resp-isoc3views-18d92.json.bz2",
+            // synced to protodunevd field response (CRP, 18.1 cm response plane)
+            "protodunevd_FR_imbalance3p_260501.json.bz2",
         ],
 
-        noise: "protodune-noise-spectra-v1.json.bz2",
+        // synced to protodunevd top-drift electronics-noise spectra
+        noise: "pdvd-top-noise-spectra-v3.json.bz2",
 
 
         chresp: null,
