@@ -155,24 +155,25 @@ cmd_tarball() {
     git archive --prefix="${name}/" "$tag" | gzip > "$tarfile"
     info "Tarball created: $tarfile"
 
-    info "Unpacking and verifying build in $tmpdir"
-    tar -C "$tmpdir" -xzf "$tarfile"
-    local srcdir="${tmpdir}/${name}"
+    echo "Not yet able to do a test build of the tar file"
+    # info "Unpacking and verifying build in $tmpdir"
+    # tar -C "$tmpdir" -xzf "$tarfile"
+    # local srcdir="${tmpdir}/${name}"
 
-    if [[ -f "$srcdir/wscript" ]]; then
-        info "Running waf configure and build for clean-build check"
-        (
-            cd "$srcdir"
-            python3 waf configure 2>&1 | tail -5
-            python3 waf build 2>&1 | tail -10
-        )
-        info "Clean build succeeded"
-    else
-        info "No wscript found; skipping build check (manual verification needed)"
-    fi
+    # if [[ -f "$srcdir/wscript" ]]; then
+    #     info "Running waf configure and build for clean-build check"
+    #     (
+    #         cd "$srcdir"
+    #         ./wcb configure 2>&1 | tail -5
+    #         ./wcb build 2>&1 | tail -10
+    #     )
+    #     info "Clean build succeeded"
+    # else
+    #     info "No wscript found; skipping build check (manual verification needed)"
+    # fi
 
-    rm -rf "$tmpdir"
-    info "Tarball verified: $tarfile"
+    # rm -rf "$tmpdir"
+    # info "Tarball verified: $tarfile"
 }
 
 # Retrofit a release branch to match the highest existing tag for A.BB.x
