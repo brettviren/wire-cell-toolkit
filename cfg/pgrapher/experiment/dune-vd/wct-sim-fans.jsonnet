@@ -196,14 +196,15 @@ local tag_rules = {
 };
 
 // local parallel_graph = f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1,4], [4,1], [1,4], [4,1], 'sn_mag', outtags, tag_rules);
-local parallel_graph = 
+// The per-anode pipelines terminate in imaging (img per_anode ends in
+// dump sinks), so they cannot fan back into a FrameFanin.  Use
+// multifanout: fan out to the terminal imaging pipelines, no fanin.
+local parallel_graph =
 if fcl_params.process_crm == "test1"
-then f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1,4], [4,1], [1,4], [4,1], 'sn_mag', outtags, tag_rules)
-// then f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1,1], [1,1], [1,1], [1,1], 'sn_mag', outtags, tag_rules)
-// then f.multifanout('DepoSetFanout', parallel_pipes, [1,4], [4,1], 'sn_mag', tag_rules)
+then f.multifanout('DepoSetFanout', parallel_pipes, [1,4], [4,1], 'sn_mag', tag_rules)
 else if fcl_params.process_crm == "test2"
-then f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1,8], [8,1], [1,8], [8,1], 'sn_mag', outtags, tag_rules)
-else f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1,2,8,32], [2,4,4,10], [1,2,8,32], [2,4,4,10], 'sn_mag', outtags, tag_rules);
+then f.multifanout('DepoSetFanout', parallel_pipes, [1,8], [8,1], 'sn_mag', tag_rules)
+else f.multifanout('DepoSetFanout', parallel_pipes, [1,2,8,32], [2,4,4,10], 'sn_mag', tag_rules);
 
 
 // Only one sink ////////////////////////////////////////////////////////////////////////////
@@ -214,7 +215,7 @@ local sink = sim.frame_sink;
 
 // Final pipeline //////////////////////////////////////////////////////////////////////////////
 
-local graph = g.pipeline([depos, drifter, bagger, parallel_graph, sink], "main");
+local graph = g.pipeline([depos, drifter, bagger, parallel_graph], "main");
 // local graph = g.pipeline([depos, drifter, bagger, parallel_graph], "main");
 // local graph = g.pipeline([depos, drifter, bagger, parallel_pipes[0]], "main");
 
