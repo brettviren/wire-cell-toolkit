@@ -5,7 +5,7 @@ local wc = import "wirecell.jsonnet";
 local io = import 'pgrapher/common/fileio.jsonnet';
 local tools_maker = import 'pgrapher/common/tools.jsonnet';
 local params_maker = import 'pgrapher/experiment/dune-vd/params.jsonnet';
-local params = params_maker({});
+local params = params_maker({ response_plane: 18.92 * wc.cm, nticks: 8500 });
 
 local tools = tools_maker(params);
 
@@ -53,7 +53,7 @@ local sn_pipes = sim.splusn_pipelines;
 local parallel_pipes = [ g.pipeline([ sn_pipes[n] ], 'parallel_pipe_%d' % n)  for n in std.range(0, std.length(tools.anodes) - 1)];
 
 local outtags = ['orig%d' % n for n in std.range(0, std.length(tools.anodes) - 1)];
-local parallel_graph = f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', 6, 'sn_mag', outtags);
+local parallel_graph = f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1, 36], [36, 1], [1, 36], [36, 1], 'sn_mag', outtags);
 
 
 // Frame save  ////////////////////////////////////////////////////////////////////////////
