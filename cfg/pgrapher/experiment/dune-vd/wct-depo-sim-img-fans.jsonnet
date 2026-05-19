@@ -104,7 +104,7 @@ local img_pipes = [img_maker.per_anode(a, "multi-3view", add_dump = false) for a
 local clus = import 'pgrapher/experiment/dune-vd/clus.jsonnet';
 local clus_maker = clus();
 // local clus_pipes = [clus_maker.per_volume(tools.anodes[0], face=0, dump=true), clus_maker.per_volume(tools.anodes[1], face=1, dump=true)];
-local clus_pipes = [clus_maker.per_volume(tools.anodes[n], face=0, dump=true) for n in std.range(0, std.length(tools.anodes) - 1)];
+local clus_pipes = [clus_maker.per_face(tools.anodes[n], face=0, dump=true) for n in std.range(0, std.length(tools.anodes) - 1)];
 
 local img_clus_pipe = [g.intern(
     innodes = [img_pipes[n]],
