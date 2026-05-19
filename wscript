@@ -17,16 +17,28 @@ TOP = '.'
 APPNAME = 'WireCell'
 
 def determine_version():
+    '''
+    Determine the version of the source to bake into the build.
+    '''
+
+    # If in a git clone, git wins
     proc = subprocess.run(["git", "describe", "--tags"], capture_output=True)
+
+    # Otherwise, we may be in a release archive.
     if proc.returncode:
         if os.path.exists("version.txt"):
             return open("version.txt", "r").readlines()[0].strip()
         raise FileNotFoundError("Wire-Cell Toolkit must either be built from a git clone or a version.txt must be provided in the source distribution")
+
     version = proc.stdout.decode().strip()
     proc = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True)
     branch = proc.stdout.decode().strip()
+
+    # Check if in master or a release branch.
     if branch == "master" or branch[0].isdecimal():
         return version
+
+    # Feature branches get special marking
     return f'{branch}-{version}'
 
 VERSION = determine_version()
