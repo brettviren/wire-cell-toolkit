@@ -256,7 +256,7 @@ void Main::initialize()
     // backends the same.
     Log::set_pattern("[%H:%M:%S.%03e] %L [%^%=8n%$] %v");
     log = Log::logger("main");
-    Log::set_level("debug", "main");
+    // Log::set_level("debug", "main");
     Log::set_pattern("[%H:%M:%S.%03e] %L [  main  ] %v", "main");
     log->debug("logging to \"main\"");
 
