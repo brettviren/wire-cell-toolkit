@@ -20,6 +20,8 @@
 #include "WireCellUtil/Waveform.h"
 #include "WireCellUtil/NumpyHelper.h"
 
+#include <cmath>
+
 #include "WireCellUtil/NamedFactory.h"
 
 WIRECELL_FACTORY(OmnibusSigProc, WireCell::SigProc::OmnibusSigProc,
@@ -913,32 +915,36 @@ void OmnibusSigProc::init_overall_response(IFrame::pointer frame)
             // arr.block(0,ncols-fine_time_shift,nrows,fine_time_shift) = arr1;
         }
 
-        // redigitize ...
+        // Redigitize from the fine (FR period) grid onto the SP tick grid by
+        // boxcar averaging within each SP tick window.  Replaces an earlier
+        // linear-interp recipe whose interpolation weights were swapped from
+        // the textbook formula; the swap, combined with the lack of an anti-
+        // alias filter, created a spurious deep notch in the V-plane overall
+        // response near (k_wire ≈ -0.16 /wire, f_time ≈ 0.0019 MHz) for the
+        // PD-VD top CRP -- which then over-amplifies in deconvolution.  See
+        // DNN_ROI_SP/docs/vplane_low_freq_pole.md for the full analysis.
+        //
+        // For integer ratio R = m_period / fravg.period (R=5 for PDVD), this
+        // is wfs[i] = mean(arr[irow, R*i : R*i + R]).  For non-integer ratios
+        // it averages whichever fine samples fall in [i*m_period, (i+1)*m_period).
         for (int irow = 0; irow < fine_nwires; ++irow) {
-            // gtemp = new TGraph();
-
-            size_t fcount = 1;
-            for (int i = 0; i != m_fft_nticks; i++) {
-                double ctime = ctbins.at(i);
-
-                if (fcount < fine_nticks)
-                    while (ctime > ftbins.at(fcount)) {
-                        fcount++;
-                        if (fcount >= fine_nticks) break;
+            for (int i = 0; i != m_fft_nticks; ++i) {
+                const double ctime_lo = i * m_period;
+                const double ctime_hi = (i + 1) * m_period;
+                const int j_lo = (int)std::ceil(ctime_lo / fravg.period);
+                const int j_hi = (int)std::ceil(ctime_hi / fravg.period);
+                double accum = 0.0;
+                int count = 0;
+                for (int j = j_lo; j < j_hi && j < (int)fine_nticks; ++j) {
+                    if (j >= 0) {
+                        accum += arr(irow, j);
+                        ++count;
                     }
-
-                if (fcount < fine_nticks) {
-                    wfs.at(i) = ((ctime - ftbins.at(fcount - 1)) / fravg.period * arr(irow, fcount - 1) +
-                                 (ftbins.at(fcount) - ctime) / fravg.period * arr(irow, fcount));  // / (-1);
                 }
-                else {
-                    wfs.at(i) = 0;
-                }
+                wfs.at(i) = (count > 0) ? (accum / count) : 0.0;
             }
 
             overall_resp[iplane].push_back(wfs);
-
-            // wfs.clear();
         }  // loop inside wire ...
 
         // calculated the wire shift ...
