@@ -18,6 +18,7 @@
 #include "WireCellUtil/String.h"
 #include "WireCellUtil/FFTBestLength.h"
 #include "WireCellUtil/Waveform.h"
+#include "WireCellUtil/NumpyHelper.h"
 
 #include "WireCellUtil/NamedFactory.h"
 
@@ -174,6 +175,8 @@ void OmnibusSigProc::configure(const WireCell::Configuration& config)
     m_frame_tag = get(config, "frame_tag", m_frame_tag);
 
     m_use_roi_debug_mode = get(config, "use_roi_debug_mode", m_use_roi_debug_mode);
+    m_dump_2d_spectra = get(config, "dump_2d_spectra", m_dump_2d_spectra);
+    m_dump_2d_prefix = get(config, "dump_2d_prefix", m_dump_2d_prefix);
     m_save_negative_charge = get(config, "save_negative_charge", m_save_negative_charge);
     m_use_roi_refinement = get(config, "use_roi_refinement", m_use_roi_refinement);
     m_tight_lf_tag = get(config, "tight_lf_tag", m_tight_lf_tag);
@@ -1096,8 +1099,30 @@ void OmnibusSigProc::decon_2D_init(int plane)
     // do second round FFT on the response on wire
     fwd_inplace(m_dft, c_resp, 0);
 
+    // Diagnostic dump (off in production): write the input, response and
+    // output 2D spectra to a NPZ.  Saved BEFORE the division so we capture
+    // the un-deconvolved input spectrum next to the response and decon.
+    Array::array_xxc c_input_dump;
+    if (m_dump_2d_spectra) {
+        c_input_dump = m_c_data[plane];   // copy before in-place division
+    }
+
     // make ratio to the response and apply wire filter
     m_c_data[plane] = m_c_data[plane] / c_resp;
+
+    if (m_dump_2d_spectra) {
+        const char* pn = (plane == 0) ? "U" : ((plane == 1) ? "V" : "W");
+        std::string fname = m_dump_2d_prefix + "_anode"
+                          + std::to_string(m_anode->ident()) + "_plane"
+                          + pn + ".npz";
+        Array::array_xxc c_resp_dump = c_resp;
+        Array::array_xxc c_decon_dump = m_c_data[plane];
+        WireCell::Numpy::save2d(c_input_dump, "input",    fname, "w");
+        WireCell::Numpy::save2d(c_resp_dump,  "response", fname, "a");
+        WireCell::Numpy::save2d(c_decon_dump, "decon",    fname, "a");
+        log->info("call={} dumped 2D spectra to {} (shape {}x{})",
+                  m_count, fname, c_input_dump.rows(), c_input_dump.cols());
+    }
 
     // Special debug-mode tap: capture the deconvolved spectrum before any
     // software filter (Wire / Wiener / LF) and before any ROI mask.
