@@ -40,7 +40,7 @@ function(anode, ts, prefix='dnnroi',
          nticks=6000,
          tick_per_slice=4,
          nchunks=1,
-         mask_thresh=0.5,
+         mask_thresh=0.2,
          nchan=6,
          debugfile='')
 
