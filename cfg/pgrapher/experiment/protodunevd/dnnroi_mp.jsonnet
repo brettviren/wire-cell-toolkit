@@ -6,12 +6,12 @@
 // (1, 4, ~952, 1600 -- W is dropped in training; the fully-convolutional
 // MobileNetV3-UNet stretches to the toolkit's runtime channel count).
 //
-// The PDVD DNN-ROI models are 4-channel.  Input trace tags, in the order
-// the model expects (matches the training im_tags
-// frame_loose_lf / frame_mp2_roi / frame_mp3_roi / frame_gauss):
-//   loose_lf{A}, mp2_roi{A}, mp3_roi{A}, gauss{A}
-// NOTE: the 4th channel is gauss -- not PDHD's tight_lf.  Per-channel
-// z-scale normalization is baked into the .ts, so input_scale = 1.0.
+// The PDVD DNN-ROI models are 6-channel (matches PDHD 6-ch deployment).
+// Input trace tags, in the order the model expects (matches the training
+// im_tags loose_lf / mp2_roi / mp3_roi / tight_lf / decon_charge / gauss):
+//   loose_lf{A}, mp2_roi{A}, mp3_roi{A}, tight_lf{A}, decon_charge{A}, gauss{A}
+// Per-channel z-scale normalization is baked into the .ts, so
+// input_scale = 1.0.
 //
 // Every CRP emits DNN-ROI output for both induction planes; the W
 // collection plane is passed through from standard SP gauss.
@@ -41,19 +41,22 @@ function(anode, ts, prefix='dnnroi',
          tick_per_slice=4,
          nchunks=1,
          mask_thresh=0.5,
-         nchan=4,
+         nchan=6,
          debugfile='')
 
   local apaid = anode.data.ident;
   local prename = prefix + std.toString(apaid);
 
   // Input trace tags fed to the model, in the order the model expects.
-  // PDVD has only 4-channel models.  Order must match the training im_tags.
-  assert nchan == 4 : 'pdvd dnnroi nchan must be 4, got %d' % nchan;
+  // PDVD ships 6-channel models (DAGMan 287); order must match the training
+  // im_tags exactly.
+  assert nchan == 6 : 'pdvd dnnroi nchan must be 6, got %d' % nchan;
   local apa_intags = [
     'loose_lf%d' % apaid,
     'mp2_roi%d' % apaid,
     'mp3_roi%d' % apaid,
+    'tight_lf%d' % apaid,
+    'decon_charge%d' % apaid,
     'gauss%d' % apaid,
   ];
 
@@ -68,7 +71,7 @@ function(anode, ts, prefix='dnnroi',
       intags: apa_intags,
       decon_charge_tag: 'decon_charge%d' % apaid,
       outtags: ['dnnsp%du' % apaid, 'dnnsp%dv' % apaid],
-      // 4-ch PDVD models bake per-channel z-scale normalization into the
+      // 6-ch PDVD models bake per-channel z-scale normalization into the
       // .ts, so they run with input_scale 1.0.
       input_scale: 1.0,
       output_scale: output_scale,

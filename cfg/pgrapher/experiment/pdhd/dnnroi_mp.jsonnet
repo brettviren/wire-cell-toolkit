@@ -23,7 +23,7 @@ function(anode, ts, prefix='dnnroi',
          tick_per_slice=4,
          nchunks=1,
          mask_thresh=0.5,
-         nchan=3,
+         nchan=6,
          debugfile='')
 
   local apaid = anode.data.ident;
