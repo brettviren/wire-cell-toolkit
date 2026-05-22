@@ -1594,6 +1594,26 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
                 //     empty for non-triggered or admit-rejected ROIs; that is
                 //     a legitimate "tagger fired but LASSO declined" outcome.
                 if (!m_wf_dump_path.empty() && (polarity != 0 || m_dump_all_rois)) {
+                    // Skip ROIs whose decon (sigtrace) carries no signal in
+                    // the ROI window — they are raw-noise-seeded candidates
+                    // that both classical WCT-SP and the L1SP-after-DNN
+                    // gauss tag have zero-suppressed (e.g. FEMB saturation).
+                    // Mirrors the consolidator's per-row filter in
+                    // l1sp_dl_tagger/code/data/consolidate_training_data.py.
+                    // Triggered ROIs (polarity != 0) pass decide_trigger
+                    // which requires gmax >= gmax_min, so this guard is a
+                    // no-op for them; it fires only on the
+                    // dump_all_rois=true (training-dump) path.
+                    bool decon_nonzero = false;
+                    const auto& sig_charges = trace->charge();
+                    const int sig_tbin = trace->tbin();
+                    for (int t = roi.first; t <= roi.second; t++) {
+                        if (sig_charges.at(t - sig_tbin) != 0.0f) {
+                            decon_nonzero = true;
+                            break;
+                        }
+                    }
+                    if (!decon_nonzero) continue;
                     const AsymRecord& rec = feats[i].rec;
                     // Mirror the dump-mode legacy uBooNE asym-ratio computation
                     // (operator() above:1517-1525) so the merged dump exposes
