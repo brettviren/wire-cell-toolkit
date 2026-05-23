@@ -42,7 +42,13 @@ function(anode, ts, prefix='dnnroi',
          nchunks=1,
          mask_thresh=0.2,
          nchan=6,
-         debugfile='')
+         debugfile='',
+         // PDVD's traced NestedUNet `.ts` has 5 stride-2 levels post-rebin
+         // and requires the post-rebin width divisible by 32, i.e. input
+         // ticks divisible by 128.  Set tick_pad_multiple=128 so the C++
+         // module zero-pads any input length to the next 128-multiple
+         // before inference (output is cropped back to input_ticks).
+         tick_pad_multiple=128)
 
   local apaid = anode.data.ident;
   local prename = prefix + std.toString(apaid);
@@ -80,6 +86,7 @@ function(anode, ts, prefix='dnnroi',
       nticks: nticks,
       tick_per_slice: tick_per_slice,
       nchunks: nchunks,
+      tick_pad_multiple: tick_pad_multiple,
       debugfile: debugfile,
     },
   }, nin=1, nout=1, uses=[ts, anode]);

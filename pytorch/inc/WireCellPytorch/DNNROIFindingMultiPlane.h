@@ -66,6 +66,15 @@ namespace WireCell {
 
             int nchunks{1};
 
+            // Round model_ticks up to a multiple of this value before
+            // running inference.  Use 4 (== tick_per_slice) when the
+            // model can absorb any post-rebin width.  Set larger (e.g.
+            // 128 for PDVD's traced NestedUNet, which needs the post-
+            // rebin width divisible by 32 to survive the U-Net's 5
+            // stride-2 levels evenly).  When 0 or unset, defaults to
+            // tick_per_slice — current pre-knob behaviour.
+            int tick_pad_multiple{0};
+
             bool save_negative_charge{false};
 
             // If non-empty, after each call write

@@ -135,6 +135,7 @@ void Pytorch::DNNROIFindingMultiPlane::configure(const WireCell::Configuration& 
     m_cfg.nchunks = get(cfg, "nchunks", m_cfg.nchunks);
     m_cfg.save_negative_charge = get(cfg, "save_negative_charge", m_cfg.save_negative_charge);
     m_cfg.debugfile = get(cfg, "debugfile", m_cfg.debugfile);
+    m_cfg.tick_pad_multiple = get(cfg, "tick_pad_multiple", m_cfg.tick_pad_multiple);
 
     m_ncols = m_cfg.nticks;
 
@@ -180,6 +181,7 @@ WireCell::Configuration Pytorch::DNNROIFindingMultiPlane::default_configuration(
     cfg["nchunks"] = m_cfg.nchunks;
     cfg["save_negative_charge"] = m_cfg.save_negative_charge;
     cfg["debugfile"] = m_cfg.debugfile;
+    cfg["tick_pad_multiple"] = m_cfg.tick_pad_multiple;
     return cfg;
 }
 
@@ -218,9 +220,14 @@ bool Pytorch::DNNROIFindingMultiPlane::operator()(const IFrame::pointer& inframe
     TimeKeeper tk(fmt::format("call={}", m_save_count));
 
     // Determine the actual input tick count from the input frame and round
-    // up to the next multiple of tick_per_slice so the downsample/upsample
-    // cycle is exactly divisible.  The per-plane output is cropped back to
-    // input_ticks before traces are emitted.
+    // up to the next multiple of `pad_mult` so the model's downsample /
+    // upsample cycle is exactly divisible.  Default pad_mult = tick_per_slice
+    // (4) which absorbs rebin.  Set tick_pad_multiple > tick_per_slice when
+    // the model has stride-N levels that need a coarser-than-rebin alignment
+    // (e.g. PDVD's traced NestedUNet has 5 stride-2 levels post-rebin →
+    // tick_pad_multiple = 128 == 4*32 keeps all intermediate widths even).
+    // The per-plane output is cropped back to input_ticks before traces are
+    // emitted, so padding adds no real signal — just zero-fills the tail.
     int input_ticks = m_cfg.nticks;
     {
         auto probe = Aux::tagged_traces(inframe, m_cfg.intags.front());
@@ -230,9 +237,10 @@ bool Pytorch::DNNROIFindingMultiPlane::operator()(const IFrame::pointer& inframe
         }
     }
     const int tps = m_cfg.tick_per_slice;
-    const int model_ticks = ((input_ticks + tps - 1) / tps) * tps;
-    log->debug("call={} input_ticks={} model_ticks={} cfg.nticks={}",
-               m_save_count, input_ticks, model_ticks, m_cfg.nticks);
+    const int pad_mult = m_cfg.tick_pad_multiple > 0 ? m_cfg.tick_pad_multiple : tps;
+    const int model_ticks = ((input_ticks + pad_mult - 1) / pad_mult) * pad_mult;
+    log->debug("call={} input_ticks={} model_ticks={} pad_mult={} cfg.nticks={}",
+               m_save_count, input_ticks, model_ticks, pad_mult, m_cfg.nticks);
     if (input_ticks > m_cfg.nticks && m_save_count == 0) {
         log->info("input_ticks={} exceeds configured nticks={}, using input-driven size",
                   input_ticks, m_cfg.nticks);
