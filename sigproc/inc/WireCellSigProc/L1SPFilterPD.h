@@ -38,6 +38,7 @@
 #include "WireCellIface/IConfigurable.h"
 #include "WireCellIface/IDFT.h"
 #include "WireCellIface/IAnodePlane.h"
+#include "WireCellIface/ITensorForward.h"
 
 #include "WireCellAux/SimpleTrace.h"
 #include "WireCellAux/Logger.h"
@@ -289,7 +290,46 @@ namespace WireCell {
             // Optional eligibility whitelist (channel IDs). Empty = all in scope.
             std::set<int> m_eligible_channels;
 
-            // Calibration dump mode
+            // Operating mode dispatch.  Set via the ``mode`` cfg key
+            // (or legacy ``dump_mode=true`` for back-compat with
+            // pre-DNN cfg snippets).  Valid: "process" (default;
+            // 5-arm heuristic + LASSO), "dump" (write per-ROI NPZ,
+            // no LASSO), "dnn" (call out to ITensorForward to score
+            // each ROI; fire = score >= m_dnn_threshold; polarity
+            // remains sign(rec.raw_asym_wide) per the heuristic).
+            enum class Mode { process, dump, dnn };
+            Mode m_mode{Mode::process};
+
+            // ── DNN-mode knobs ────────────────────────────────────────────
+            // Wire-cell torch-service performing the actual inference.
+            // Resolved at configure() from the ``forward`` cfg key (typed
+            // name like ``TorchService:l1sp_dnn_pdhd``).  Required when
+            // m_mode == Mode::dnn, ignored otherwise.
+            ITensorForward::pointer m_forward;
+            // Cut on the model's sigmoid score.  Default 0.94 = p99.9 of
+            // the round-2 data-corpus score distribution (see
+            // l1sp_dl_tagger/experiments/stage_a_pu_round2/notes.md).
+            // Set to 0.0 in validation runs to capture every score.
+            double m_dnn_threshold{0.94};
+            // VAE-input window size; MUST match the trained model
+            // (256 ticks for round-2; tracked in the .ts sidecar
+            // l1sp_dnn_pdhd_v1.meta.json).
+            int m_dnn_window_ticks{256};
+            // Amplitude floor for the per-ROI normalisation
+            // scale = max(|raw|.max, |decon|.max, dnn_amp_floor).
+            // Matches the training pipeline's AMP_FLOOR = 1.0.
+            double m_dnn_amp_floor{1.0};
+            // When non-empty, write per-ROI (scalars, waveform window,
+            // model score, polarity, fired bool) to one NPZ per
+            // operator() call under this directory.  Used by the
+            // Python deployment validator
+            // (l1sp_dl_tagger/code/inference/validate_deployment.py).
+            std::string m_dnn_debug_path;
+
+            // Calibration dump mode — legacy bool, kept for back-compat
+            // with older cfg snippets that set ``dump_mode: true`` instead
+            // of ``mode: "dump"``.  Mirrors m_mode == Mode::dump after
+            // configure() resolves the two.
             bool m_dump_mode{false};
             std::string m_dump_path;
             std::string m_dump_tag;

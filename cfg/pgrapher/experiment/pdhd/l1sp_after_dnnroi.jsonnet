@@ -44,7 +44,15 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
          l1sp_pd_dump_mode='process',
          l1sp_pd_dump_path='',
          l1sp_pd_wf_dump_path='',
-         l1sp_pd_dump_all_rois=false)
+         l1sp_pd_dump_all_rois=false,
+         // ── DNN-mode opts (l1sp_pd_dump_mode == 'dnn') ────────────────
+         // ``l1sp_pd_torch_service`` is the pre-constructed TorchService
+         // jsonnet object that L1SPFilterPD will call via ITensorForward.
+         // Must be non-null when l1sp_pd_dump_mode == 'dnn'.
+         l1sp_pd_torch_service=null,
+         l1sp_pd_dnn_threshold=0.94,
+         l1sp_pd_dnn_window_ticks=256,
+         l1sp_pd_dnn_debug_path='')
 
   local n = anode.data.ident;
   local l1sp_planes = if l1sp_pd_planes != null then l1sp_pd_planes
@@ -117,13 +125,24 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
       l1_asym_very_long: 0.35,
       l1_adj_enable: l1sp_pd_adj_enable,
       l1_adj_max_hops: l1sp_pd_adj_max_hops,
+      mode: l1sp_pd_dump_mode,   // 'process' | 'dump' | 'dnn'
       dump_mode: l1sp_pd_dump_mode == 'dump',
       dump_path: l1sp_pd_dump_path,
       dump_tag: 'apa%d' % n,
       waveform_dump_path: l1sp_pd_wf_dump_path,
       dump_all_rois: l1sp_pd_dump_all_rois,
+      // DNN-mode plumbing — ignored by L1SPFilterPD when mode != 'dnn'.
+      forward: if l1sp_pd_dump_mode == 'dnn' && l1sp_pd_torch_service != null
+               then wc.tn(l1sp_pd_torch_service)
+               else '',
+      dnn_threshold:    l1sp_pd_dnn_threshold,
+      dnn_window_ticks: l1sp_pd_dnn_window_ticks,
+      dnn_debug_path:   l1sp_pd_dnn_debug_path,
     },
-  }, nin=1, nout=1, uses=[tools.dft, anode]);
+  }, nin=1, nout=1,
+     uses=[tools.dft, anode] +
+          (if l1sp_pd_dump_mode == 'dnn' && l1sp_pd_torch_service != null
+           then [l1sp_pd_torch_service] else []));
 
   // Final merger: L1SP-modified gauss replaces gauss AND wiener;
   // raw passes through from the rawsigmerge.
