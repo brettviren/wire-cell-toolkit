@@ -99,6 +99,7 @@ void Pytorch::DNNROIFinding::configure(const WireCell::Configuration& cfg)
     }
     m_cfg.summary_tag = get(cfg, "summary_tag", m_cfg.summary_tag);
     m_cfg.tick_per_slice = get(cfg, "tick_per_slice", m_cfg.tick_per_slice);
+    m_cfg.tick_pad_multiple = get(cfg, "tick_pad_multiple", m_cfg.tick_pad_multiple);
     m_cfg.decon_charge_tag = get(cfg, "decon_charge_tag", m_cfg.decon_charge_tag);
     m_cfg.outtag = get(cfg, "outtag", m_cfg.outtag);
     m_cfg.debugfile = get(cfg, "debugfile", m_cfg.debugfile);
@@ -168,6 +169,7 @@ WireCell::Configuration Pytorch::DNNROIFinding::default_configuration() const
         cfg["intags"].append(one);
     }
     cfg["tick_per_slice"] = m_cfg.tick_per_slice;
+    cfg["tick_pad_multiple"] = m_cfg.tick_pad_multiple;
     cfg["decon_charge_tag"] = m_cfg.decon_charge_tag;
     cfg["outtag"] = m_cfg.outtag;
     cfg["debugfile"] = m_cfg.debugfile;
@@ -317,9 +319,10 @@ bool Pytorch::DNNROIFinding::operator()(const IFrame::pointer& inframe, IFrame::
         }
     }
     const int tps = m_cfg.tick_per_slice;
-    const int model_ticks = ((input_ticks + tps - 1) / tps) * tps;
-    log->debug("call={} input_ticks={} model_ticks={} cfg.nticks={}",
-               m_save_count, input_ticks, model_ticks, m_cfg.nticks);
+    const int pad_mult = m_cfg.tick_pad_multiple > 0 ? m_cfg.tick_pad_multiple : tps;
+    const int model_ticks = ((input_ticks + pad_mult - 1) / pad_mult) * pad_mult;
+    log->debug("call={} input_ticks={} model_ticks={} pad_mult={} cfg.nticks={}",
+               m_save_count, input_ticks, model_ticks, pad_mult, m_cfg.nticks);
     if (input_ticks > m_cfg.nticks && m_save_count == 0) {
         log->info("input_ticks={} exceeds configured nticks={}, using input-driven size",
                   input_ticks, m_cfg.nticks);

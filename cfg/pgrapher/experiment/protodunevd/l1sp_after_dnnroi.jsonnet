@@ -64,11 +64,30 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
     type: 'FrameSplitter', name: 'predannsplit%d' % n,
   }, nin=1, nout=2);
 
-  // No dnnsp -> gauss relabel here.  protodunevd/dnnroi_mp.jsonnet already
-  // emits a final Retagger that merges dnnsp%du/v/w into gauss%d and keeps
-  // wiener%d, so the dnnroi_pipe output is already structurally an SP frame.
+  // protodunevd/dnnroi_pp.jsonnet emits a single dnnsp%d trace tag (its
+  // final Retagger merges dnnsp%du/v/w → dnnsp%d).  L1SP downstream
+  // expects gauss%d (signal) and wiener%d (carrying the per-channel
+  // threshold trace_summary).  A trace/merge Retagger relabels:
+  //   trace: dnnsp%d → gauss%d   (rename, carries summary)
+  //   merge: dnnsp%d → wiener%d  (alias the same data + summary)
+  // Mirrors the PDHD envelope's dnn_relabel.
+  local dnn_relabel = pg.pnode({
+    type: 'Retagger',
+    name: 'dnnsp_to_gauss%d' % n,
+    data: {
+      tag_rules: [{
+        trace: {
+          ['dnnsp%d' % n]: 'gauss%d' % n,
+        },
+        merge: {
+          ['dnnsp%d' % n]: 'wiener%d' % n,
+        },
+      }],
+    },
+  }, nin=1, nout=1);
+
   local sp_dnn_chain = pg.pipeline(
-    [sp_pipe, dnnroi_pipe],
+    [sp_pipe, dnnroi_pipe, dnn_relabel],
     'sp_dnn_chain_%d' % n);
 
   local rawsigmerge = pg.pnode({
