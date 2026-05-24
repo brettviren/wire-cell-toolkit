@@ -292,12 +292,19 @@ namespace WireCell {
 
             // Operating mode dispatch.  Set via the ``mode`` cfg key
             // (or legacy ``dump_mode=true`` for back-compat with
-            // pre-DNN cfg snippets).  Valid: "process" (default;
-            // 5-arm heuristic + LASSO), "dump" (write per-ROI NPZ,
-            // no LASSO), "dnn" (call out to ITensorForward to score
-            // each ROI; fire = score >= m_dnn_threshold; polarity
-            // remains sign(rec.raw_asym_wide) per the heuristic).
-            enum class Mode { process, dump, dnn };
+            // pre-DNN cfg snippets).  Valid:
+            //   "process" (default; 5-arm heuristic + LASSO),
+            //   "dump"    (write per-ROI NPZ, no LASSO),
+            //   "dnn"     (call out to ITensorForward to score each
+            //              ROI; fire = score >= m_dnn_threshold;
+            //              polarity = sign(rec.raw_asym_wide)),
+            //   "hybrid"  (heuristic 5-arm gate; if heur fires, also
+            //              call DNN and require score >= threshold;
+            //              polarity = heuristic decision when both
+            //              fire, 0 otherwise.  DNN inference is
+            //              SKIPPED on heur-negative ROIs, which is
+            //              the speedup vs full "dnn" mode).
+            enum class Mode { process, dump, dnn, hybrid };
             Mode m_mode{Mode::process};
 
             // ── DNN-mode knobs ────────────────────────────────────────────

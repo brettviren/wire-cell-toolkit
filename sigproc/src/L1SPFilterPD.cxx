@@ -1059,15 +1059,17 @@ void L1SPFilterPD::configure(const WireCell::Configuration& cfg)
             m_dump_mode = true;
         } else if (mode_str == "dnn") {
             m_mode = Mode::dnn;
+        } else if (mode_str == "hybrid") {
+            m_mode = Mode::hybrid;
         } else {
             THROW(ValueError() << errmsg{
                 "L1SPFilterPD: invalid mode '" + mode_str +
-                "'; valid: process, dump, dnn"});
+                "'; valid: process, dump, dnn, hybrid"});
         }
-        if (m_mode == Mode::dnn && m_dump_mode) {
+        if ((m_mode == Mode::dnn || m_mode == Mode::hybrid) && m_dump_mode) {
             THROW(ValueError() << errmsg{
-                "L1SPFilterPD: mode='dnn' is incompatible with "
-                "dump_mode=true; pick one"});
+                "L1SPFilterPD: mode='" + mode_str + "' is incompatible "
+                "with dump_mode=true; pick one"});
         }
     }
 
@@ -1079,16 +1081,18 @@ void L1SPFilterPD::configure(const WireCell::Configuration& cfg)
     m_dnn_window_ticks = get<int>(cfg, "dnn_window_ticks", m_dnn_window_ticks);
     m_dnn_amp_floor    = get<double>(cfg, "dnn_amp_floor", m_dnn_amp_floor);
     m_dnn_debug_path   = get<std::string>(cfg, "dnn_debug_path", m_dnn_debug_path);
-    if (m_mode == Mode::dnn) {
+    if (m_mode == Mode::dnn || m_mode == Mode::hybrid) {
         const std::string fwd_tn = get<std::string>(cfg, "forward", "");
         if (fwd_tn.empty()) {
+            const std::string ms = (m_mode == Mode::dnn) ? "dnn" : "hybrid";
             THROW(ValueError() << errmsg{
-                "L1SPFilterPD: mode='dnn' requires 'forward' "
+                "L1SPFilterPD: mode='" + ms + "' requires 'forward' "
                 "(typed name of the TorchService)"});
         }
         m_forward = Factory::find_tn<ITensorForward>(fwd_tn);
-        log->info("L1SPFilterPD: DNN mode active "
+        log->info("L1SPFilterPD: {} mode active "
                   "(forward={}, threshold={:.4f}, window_ticks={})",
+                  (m_mode == Mode::dnn) ? "DNN" : "hybrid",
                   fwd_tn, m_dnn_threshold, m_dnn_window_ticks);
     }
 
@@ -1576,9 +1580,11 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
         std::vector<RoiFeat> feats;
         feats.reserve(rois.size());
         const bool dnn = (m_mode == Mode::dnn);
-        // Dump fields are required in DNN mode too (the 29-scalar
-        // feature vector reads them off AsymRecord).
-        const bool fill_dump = m_dump_mode || !m_wf_dump_path.empty() || dnn;
+        const bool hybrid = (m_mode == Mode::hybrid);
+        // Dump fields are required in DNN mode (and hybrid) too -- the
+        // 29-scalar feature vector reads them off AsymRecord.
+        const bool fill_dump = m_dump_mode || !m_wf_dump_path.empty()
+                               || dnn || hybrid;
         for (size_t i = 0; i < rois.size(); ++i) {
             const auto& roi = rois[i];
             RoiFeat f;
@@ -1592,7 +1598,24 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
                                  m_l1_raw_asym_eps,
                                  m_l1_core_g_thr,
                                  fill_dump);
-            if (dnn) {
+            // Heuristic decision first (needed by process/dump and as the
+            // hybrid-mode gate). In dnn-only mode we skip this -- the
+            // existing dnn block sets polarity directly from the model
+            // output (matches pre-hybrid behaviour bit-for-bit).
+            int heur_polarity = 0;
+            if (!dnn) {
+                heur_polarity = decide_trigger(f.rec.sub_windows,
+                                                sigtrace->charge(),
+                                                sigtrace->tbin(),
+                                                roi.first,
+                                                f.rec.gmax, tcfg,
+                                                m_l1_energy_pad_ticks);
+            }
+            // In hybrid mode, only call the DNN if the heuristic fires.
+            // This is the speedup vs full-dnn (~99% of ROIs short-circuit
+            // here, since the heur-positive rate is ~1% in production).
+            const bool call_dnn = dnn || (hybrid && heur_polarity != 0);
+            if (call_dnn) {
                 // 1. Compute prev/next gap and legacy uBooNE flag/ratio
                 //    inline (same recipe as the dump path's NPZ writer).
                 const int32_t prev_end = (i > 0) ? rois[i - 1].second : -1;
@@ -1638,9 +1661,17 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
                 f.dnn_score = score;
                 const bool fire = (score >= 0.0) &&
                                   (score >= m_dnn_threshold);
-                f.polarity = fire
-                    ? ((f.rec.raw_asym_wide > 0.0) ? +1 : -1)
-                    : 0;
+                if (hybrid) {
+                    // Hybrid: heuristic already decided polarity (non-zero
+                    // since call_dnn requires heur_polarity != 0). DNN
+                    // either confirms (fire) or vetoes (no fire).
+                    f.polarity = fire ? heur_polarity : 0;
+                } else {
+                    // dnn-only: polarity from sign(asym) on DNN fire.
+                    f.polarity = fire
+                        ? ((f.rec.raw_asym_wide > 0.0) ? +1 : -1)
+                        : 0;
+                }
                 if (!m_dnn_debug_path.empty()) {
                     ddnn_channel.push_back(ch);
                     ddnn_plane.push_back(plane);
@@ -1655,12 +1686,11 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
                                         scalar_buf.begin(), scalar_buf.end());
                 }
             } else {
-                f.polarity = decide_trigger(f.rec.sub_windows,
-                                            sigtrace->charge(),
-                                            sigtrace->tbin(),
-                                            roi.first,
-                                            f.rec.gmax, tcfg,
-                                            m_l1_energy_pad_ticks);
+                // Heuristic-only path (process/dump or hybrid-veto). The
+                // heuristic was already computed above; in hybrid-veto we
+                // explicitly emit polarity=0 (heur_polarity is already 0
+                // for that case, so a plain copy is fine).
+                f.polarity = heur_polarity;
             }
             f.polarity_final = f.polarity;
             f.hop = (f.polarity != 0) ? 0 : -1;
@@ -2028,9 +2058,11 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
 
     // DNN-mode debug dump: one NPZ per operator() call with the inputs
     // and outputs of every per-ROI model invocation.  Consumed by the
-    // Python validator.
-    if (m_mode == Mode::dnn && !m_dnn_debug_path.empty() &&
-        !ddnn_channel.empty()) {
+    // Python validator.  In hybrid mode the dump only covers ROIs
+    // where the DNN was actually called (i.e. heuristic fired); ROIs
+    // vetoed by the heuristic are not represented here.
+    if ((m_mode == Mode::dnn || m_mode == Mode::hybrid)
+        && !m_dnn_debug_path.empty() && !ddnn_channel.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(m_dnn_debug_path, ec);
         const std::string dnn_fname = fmt::format(

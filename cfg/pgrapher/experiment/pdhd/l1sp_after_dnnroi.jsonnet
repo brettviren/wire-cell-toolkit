@@ -140,14 +140,16 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
       l1_gmax_min:           l1sp_pd_gmax_min,
       l1_min_length:         l1sp_pd_min_length,
       l1_energy_frac_thr:    l1sp_pd_energy_frac_thr,
-      mode: l1sp_pd_dump_mode,   // 'process' | 'dump' | 'dnn'
+      mode: l1sp_pd_dump_mode,   // 'process' | 'dump' | 'dnn' | 'hybrid'
       dump_mode: l1sp_pd_dump_mode == 'dump',
       dump_path: l1sp_pd_dump_path,
       dump_tag: 'apa%d' % n,
       waveform_dump_path: l1sp_pd_wf_dump_path,
       dump_all_rois: l1sp_pd_dump_all_rois,
-      // DNN-mode plumbing — ignored by L1SPFilterPD when mode != 'dnn'.
-      forward: if l1sp_pd_dump_mode == 'dnn' && l1sp_pd_torch_service != null
+      // DNN-mode plumbing — required for mode='dnn' and mode='hybrid'.
+      // Ignored by L1SPFilterPD when mode is process/dump.
+      forward: if (l1sp_pd_dump_mode == 'dnn' || l1sp_pd_dump_mode == 'hybrid')
+                  && l1sp_pd_torch_service != null
                then wc.tn(l1sp_pd_torch_service)
                else '',
       dnn_threshold:    l1sp_pd_dnn_threshold,
@@ -156,7 +158,8 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
     },
   }, nin=1, nout=1,
      uses=[tools.dft, anode] +
-          (if l1sp_pd_dump_mode == 'dnn' && l1sp_pd_torch_service != null
+          (if (l1sp_pd_dump_mode == 'dnn' || l1sp_pd_dump_mode == 'hybrid')
+              && l1sp_pd_torch_service != null
            then [l1sp_pd_torch_service] else []));
 
   // Final merger: L1SP-modified gauss replaces gauss AND wiener;
