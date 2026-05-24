@@ -50,7 +50,7 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
          // jsonnet object that L1SPFilterPD will call via ITensorForward.
          // Must be non-null when l1sp_pd_dump_mode == 'dnn'.
          l1sp_pd_torch_service=null,
-         l1sp_pd_dnn_threshold=0.99,
+         l1sp_pd_dnn_threshold=0.9945,
          l1sp_pd_dnn_window_ticks=256,
          l1sp_pd_dnn_debug_path='')
 
