@@ -38,17 +38,39 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
          l1sp_pd_dump_path='',
          l1sp_pd_wf_dump_path='',
          l1sp_pd_dump_all_rois=false,
-         // ── DNN-mode opts (no PDVD L1SP-DNN model today; plumbing kept
-         //    for parity with the PDHD envelope so future calibrations
-         //    can drop in a TorchService without rewriting this file).
+         // ── DNN-mode opts (mode=='dnn' or mode=='hybrid').  The PDVD L1SP
+         //    DNN model lives at wire-cell-data/l1sp/pdvd/l1sp_dnn_pdvd_v1.ts;
+         //    deploy_round2.md documents the round-2-derived thresholds.
          l1sp_pd_torch_service=null,
-         l1sp_pd_dnn_threshold=0.94,
+         l1sp_pd_dnn_threshold=0.94,         // single-threshold fallback
+         l1sp_pd_dnn_threshold_bottom=null,  // per-CRP override (apa<4)
+         l1sp_pd_dnn_threshold_top=null,     // per-CRP override (apa>=4)
          l1sp_pd_dnn_window_ticks=256,
-         l1sp_pd_dnn_debug_path='')
+         l1sp_pd_dnn_debug_path='',
+         // ── Loose-heur overrides (DNN-chain only) ─────────────────────
+         // Defaults match the C++/PDVD-deployed values; loosen via the
+         // runner's --loose-heur preset when running heuristic on DNN ROIs.
+         l1sp_pd_gmax_min=1500.0,
+         l1sp_pd_min_length=30,
+         l1sp_pd_energy_frac_thr=0.66)
 
   local n = anode.data.ident;
   local sfx = if n < 4 then '_b' else '_t';
   local l1sp_planes = if l1sp_pd_planes != null then l1sp_pd_planes else [0, 1];
+  // Per-CRP threshold resolution: prefer the explicit bottom/top TLA
+  // when set, otherwise fall back to the single-threshold scalar.
+  local per_crp_thr = if n < 4
+                      then (if l1sp_pd_dnn_threshold_bottom != null
+                            then l1sp_pd_dnn_threshold_bottom
+                            else l1sp_pd_dnn_threshold)
+                      else (if l1sp_pd_dnn_threshold_top != null
+                            then l1sp_pd_dnn_threshold_top
+                            else l1sp_pd_dnn_threshold);
+  // In hybrid mode the DNN is the FP suppressor; double-suppressing
+  // with the PDVD-specific track veto starves the DNN of candidates,
+  // so disable track veto only when mode=='hybrid'.  In all other
+  // modes (process/dump/dnn) keep the deployed PDVD veto on.
+  local track_veto_enabled = !(l1sp_pd_dump_mode == 'hybrid');
   // Per-region gain reference: bottom (ident<4) follows params.elec.gain
   // at the 7.8 mV/fC PDVD-bottom reference; top (ident>=4) uses
   // JsonElecResponse and is gain-invariant.  Same convention as
@@ -121,26 +143,37 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
       gauss_filter: 'HfFilter:Gaus_wide' + sfx,
       l1_adj_enable:  l1sp_pd_adj_enable,
       l1_adj_max_hops: l1sp_pd_adj_max_hops,
-      mode: l1sp_pd_dump_mode,   // 'process' | 'dump' | 'dnn'
+      // Loose-heur overrides — exposed as TLAs so the runner's
+      // --loose-heur preset can relax the three pre-filters when running
+      // heuristic on DNN ROIs (which are typically shorter / lower-peak
+      // than trad ROIs for the same physical signal).
+      l1_gmax_min:        l1sp_pd_gmax_min,
+      l1_min_length:      l1sp_pd_min_length,
+      l1_energy_frac_thr: l1sp_pd_energy_frac_thr,
+      mode: l1sp_pd_dump_mode,   // 'process' | 'dump' | 'dnn' | 'hybrid'
       dump_mode: l1sp_pd_dump_mode == 'dump',
       dump_path: l1sp_pd_dump_path,
       dump_tag: 'apa%d' % n,
       waveform_dump_path: l1sp_pd_wf_dump_path,
       dump_all_rois: l1sp_pd_dump_all_rois,
-      // DNN-mode plumbing — ignored by L1SPFilterPD unless mode == 'dnn'.
-      forward: if l1sp_pd_dump_mode == 'dnn' && l1sp_pd_torch_service != null
+      // DNN-mode plumbing — required for mode='dnn' and mode='hybrid'.
+      forward: if (l1sp_pd_dump_mode == 'dnn' || l1sp_pd_dump_mode == 'hybrid')
+                  && l1sp_pd_torch_service != null
                then wc.tn(l1sp_pd_torch_service)
                else '',
-      dnn_threshold:    l1sp_pd_dnn_threshold,
+      dnn_threshold:    per_crp_thr,
       dnn_window_ticks: l1sp_pd_dnn_window_ticks,
       dnn_debug_path:   l1sp_pd_dnn_debug_path,
     } + {
-      // PDVD-tuned trigger-gate overrides (verbatim from sp.jsonnet:226-242).
+      // PDVD-tuned trigger-gate overrides (verbatim from sp.jsonnet:226-242,
+      // except track-veto, which is disabled when mode=='hybrid' so the DNN
+      // sees the full loose-heur candidate set rather than the track-veto-
+      // residual; see deploy_round2.md §"Deviations from PDHD" for rationale.)
       l1_len_long_mod:         180,
       l1_len_fill_shape:       90,
       l1_fill_shape_fill_thr:  0.30,
       l1_fill_shape_fwhm_thr:  0.25,
-      l1_pdvd_track_veto_enable: true,
+      l1_pdvd_track_veto_enable: track_veto_enabled,
       l1_pdvd_track_high_asym:   0.85,
       l1_pdvd_track_long_cl:     170,
       l1_pdvd_track_med_cl:      100,
@@ -151,7 +184,8 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
     },
   }, nin=1, nout=1,
      uses=[tools.dft, anode] +
-          (if l1sp_pd_dump_mode == 'dnn' && l1sp_pd_torch_service != null
+          (if (l1sp_pd_dump_mode == 'dnn' || l1sp_pd_dump_mode == 'hybrid')
+              && l1sp_pd_torch_service != null
            then [l1sp_pd_torch_service] else []));
 
   local final_merger = pg.pnode({
