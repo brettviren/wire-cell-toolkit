@@ -1545,7 +1545,7 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
     // the per-channel scoring loop populates them) and flushed to NPZ
     // near the end of operator() alongside the calibration dump.
     std::vector<int32_t> ddnn_channel, ddnn_plane, ddnn_roi_start, ddnn_roi_end;
-    std::vector<int32_t> ddnn_polarity, ddnn_fired;
+    std::vector<int32_t> ddnn_polarity, ddnn_fired, ddnn_is_adj;
     std::vector<float>   ddnn_score;
     // Flat arrays:  ddnn_wave    length = N * 2 * nbin_window  (interleaved)
     //               ddnn_scalars length = N * 29
@@ -1681,6 +1681,7 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
                     ddnn_roi_end.push_back(roi.second);
                     ddnn_polarity.push_back(f.polarity);
                     ddnn_fired.push_back(fire ? 1 : 0);
+                    ddnn_is_adj.push_back(0);
                     ddnn_score.push_back((float)score);
                     ddnn_wave.insert(ddnn_wave.end(),
                                      wave_buf.begin(), wave_buf.end());
@@ -1876,6 +1877,7 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
                         ddnn_roi_end.push_back(roi_p.second);
                         ddnn_polarity.push_back(std::get<3>(t));
                         ddnn_fired.push_back(fire ? 1 : 0);
+                        ddnn_is_adj.push_back(1);
                         ddnn_score.push_back((float)score);
                         ddnn_wave.insert(ddnn_wave.end(),
                                          wave_buf.begin(), wave_buf.end());
@@ -2184,6 +2186,7 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
         save_i32("roi_end",   ddnn_roi_end);
         save_i32("polarity",  ddnn_polarity);
         save_i32("fired",     ddnn_fired);
+        save_i32("is_adj",    ddnn_is_adj);
         save_f32("score",     ddnn_score, {N});
         save_f32("wave",      ddnn_wave,
                  {N, 2, (size_t)m_dnn_window_ticks});
