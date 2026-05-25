@@ -832,6 +832,7 @@ WireCell::Configuration L1SPFilterPD::default_configuration() const
     cfg["l1_adj_loose_gmax"]     = m_l1_adj_loose_gmax;
     cfg["l1_adj_loose_core_len"] = m_l1_adj_loose_core_len;
     cfg["l1_adj_loose_asym_abs"] = m_l1_adj_loose_asym_abs;
+    cfg["l1_adj_dnn_veto"]       = m_l1_adj_dnn_veto;
 
     cfg["l1_seg_length"] = 120;
     cfg["l1_scaling_factor"] = 500;  // numerical conditioning only; cancels in linear algebra
@@ -958,6 +959,7 @@ void L1SPFilterPD::configure(const WireCell::Configuration& cfg)
     m_l1_adj_loose_gmax     = get(cfg, "l1_adj_loose_gmax",     m_l1_adj_loose_gmax);
     m_l1_adj_loose_core_len = get(cfg, "l1_adj_loose_core_len", m_l1_adj_loose_core_len);
     m_l1_adj_loose_asym_abs = get(cfg, "l1_adj_loose_asym_abs", m_l1_adj_loose_asym_abs);
+    m_l1_adj_dnn_veto       = get(cfg, "l1_adj_dnn_veto",       m_l1_adj_dnn_veto);
 
     m_l1_seg_length = get(cfg, "l1_seg_length", m_l1_seg_length);
     m_l1_scaling_factor = get(cfg, "l1_scaling_factor", m_l1_scaling_factor);
@@ -1789,8 +1791,78 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
             }
 
             if (to_promote.empty()) break;
+            // When m_l1_adj_dnn_veto is on (hybrid mode only), each adj
+            // candidate must also pass the DNN threshold before being
+            // promoted.  Mirrors the Pass-2 DNN call site at the top of
+            // this function so the same TorchScript inputs (29-vec
+            // scalars + (2,nbin) wave) are used.  A vetoed candidate
+            // simply isn't promoted, which naturally collapses any
+            // dependent hop>1 promotions in subsequent BFS layers since
+            // they look up polarity_final on the donor.
+            const bool adj_dnn_veto =
+                m_l1_adj_dnn_veto && (m_mode == Mode::hybrid);
             for (const auto& t : to_promote) {
-                auto& f = map_ch_feat[std::get<0>(t)][std::get<1>(t)];
+                const int    ch_p = std::get<0>(t);
+                const size_t i_p  = std::get<1>(t);
+                auto& f = map_ch_feat[ch_p][i_p];
+                if (adj_dnn_veto) {
+                    auto adcit = adctrace_ch_map.find(ch_p);
+                    auto sigit = sigtrace_ch_map.find(ch_p);
+                    if (adcit == adctrace_ch_map.end() ||
+                        sigit == sigtrace_ch_map.end()) {
+                        continue;  // no traces -> can't DNN-check -> skip
+                    }
+                    const auto& adctrace_p = adcit->second;
+                    const auto& sigtrace_p = sigit->second;
+                    const auto& rois_p     = map_ch_rois.at(ch_p);
+                    const auto& roi_p      = rois_p[i_p];
+                    const int32_t prev_end =
+                        (i_p > 0) ? rois_p[i_p - 1].second : -1;
+                    const int32_t next_start =
+                        (i_p + 1 < rois_p.size())
+                          ? rois_p[i_p + 1].first : -1;
+                    const int prev_gap = prev_end >= 0
+                        ? (int)(roi_p.first - prev_end) : -1;
+                    const int next_gap = next_start >= 0
+                        ? (int)(next_start - roi_p.second) : -1;
+                    const double ratio = (f.rec.temp1_sum > 0)
+                        ? f.rec.temp_sum
+                          / (f.rec.temp1_sum * m_adc_sum_rescaling
+                             / f.rec.nbin_fit)
+                        : 0.0;
+                    int legacy_flag = 0;
+                    if (f.rec.temp1_sum > m_adc_sum_threshold) {
+                        if      (ratio >  m_adc_ratio_threshold) legacy_flag = +1;
+                        else if (ratio < -m_adc_ratio_threshold) legacy_flag = -1;
+                    }
+                    const auto& raw_seq = adctrace_p->charge();
+                    const auto& dec_seq = sigtrace_p->charge();
+                    const int raw_off = roi_p.first - adctrace_p->tbin();
+                    const int dec_off = roi_p.first - sigtrace_p->tbin();
+                    const int nraw = (int)(roi_p.second - roi_p.first + 1);
+                    const double scale = dnn_amplitude_scale(
+                        raw_seq, raw_off, dec_seq, dec_off, nraw,
+                        m_dnn_amp_floor);
+                    const auto win = dnn_window(dec_seq, dec_off, nraw,
+                                                m_dnn_window_ticks);
+                    std::vector<float> wave_buf;
+                    dnn_build_waveform(raw_seq, raw_off,
+                                        dec_seq, dec_off,
+                                        win.first, win.second,
+                                        m_dnn_window_ticks,
+                                        scale, wave_buf);
+                    std::vector<float> scalar_buf;
+                    dnn_fill_scalars_29(f.rec, prev_gap, next_gap,
+                                         legacy_flag, ratio, scalar_buf);
+                    const double score = dnn_call_forward(
+                        m_forward, wave_buf, scalar_buf,
+                        m_dnn_window_ticks, (int)m_count);
+                    f.dnn_score = score;
+                    if (!(score >= 0.0) || score < m_dnn_threshold) {
+                        // DNN vetoes the adjacency promotion.
+                        continue;
+                    }
+                }
                 f.polarity_final = std::get<3>(t);
                 f.donor_ch       = std::get<2>(t);
                 f.hop            = hop;

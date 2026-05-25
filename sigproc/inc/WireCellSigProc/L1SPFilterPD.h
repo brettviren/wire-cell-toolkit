@@ -255,6 +255,13 @@ namespace WireCell {
             double m_l1_adj_loose_gmax     {300.0};
             int    m_l1_adj_loose_core_len {2};
             double m_l1_adj_loose_asym_abs {0.30};
+            // When true (hybrid mode only), the DNN also vetoes
+            // adjacency-promoted ROIs: a candidate that satisfies the
+            // adjacency preconditions is only promoted if its own DNN
+            // score >= m_dnn_threshold.  Default true since
+            // 2026-05-25 — set to false to recover the original
+            // behaviour where adj-promoted ROIs bypassed the DNN.
+            bool   m_l1_adj_dnn_veto    {true};
 
             double m_l1_seg_length{120};
             double m_l1_scaling_factor{500};

@@ -51,6 +51,11 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
          // Must be non-null when l1sp_pd_dump_mode == 'dnn'.
          l1sp_pd_torch_service=null,
          l1sp_pd_dnn_threshold=0.9945,
+         // When true, the DNN also vetoes adjacency-promoted ROIs
+         // (i.e. ROIs whose heuristic flag_l1 == 0 but flag_l1_adj == 1).
+         // Default true since 2026-05-25 — set to false to recover the
+         // original behaviour where adj-promoted ROIs bypassed the DNN.
+         l1sp_pd_adj_dnn_veto=true,
          l1sp_pd_dnn_window_ticks=256,
          l1sp_pd_dnn_debug_path='',
          // ── Loose-heur overrides (DNN-chain only) ─────────────────────
@@ -153,6 +158,7 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
                then wc.tn(l1sp_pd_torch_service)
                else '',
       dnn_threshold:    l1sp_pd_dnn_threshold,
+      l1_adj_dnn_veto:  l1sp_pd_adj_dnn_veto,
       dnn_window_ticks: l1sp_pd_dnn_window_ticks,
       dnn_debug_path:   l1sp_pd_dnn_debug_path,
     },

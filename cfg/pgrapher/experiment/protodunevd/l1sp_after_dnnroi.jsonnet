@@ -45,6 +45,11 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
          l1sp_pd_dnn_threshold=0.94,         // single-threshold fallback
          l1sp_pd_dnn_threshold_bottom=null,  // per-CRP override (apa<4)
          l1sp_pd_dnn_threshold_top=null,     // per-CRP override (apa>=4)
+         // When true, the DNN also vetoes adjacency-promoted ROIs
+         // (i.e. ROIs whose heuristic flag_l1 == 0 but flag_l1_adj == 1).
+         // Default true since 2026-05-25 — set to false to recover the
+         // original behaviour where adj-promoted ROIs bypassed the DNN.
+         l1sp_pd_adj_dnn_veto=true,
          l1sp_pd_dnn_window_ticks=256,
          l1sp_pd_dnn_debug_path='',
          // ── Loose-heur overrides (DNN-chain only) ─────────────────────
@@ -162,6 +167,7 @@ function(anode, sp_pipe, dnnroi_pipe, tools, params,
                then wc.tn(l1sp_pd_torch_service)
                else '',
       dnn_threshold:    per_crp_thr,
+      l1_adj_dnn_veto:  l1sp_pd_adj_dnn_veto,
       dnn_window_ticks: l1sp_pd_dnn_window_ticks,
       dnn_debug_path:   l1sp_pd_dnn_debug_path,
     } + {
