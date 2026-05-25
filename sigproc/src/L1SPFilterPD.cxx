@@ -1858,7 +1858,32 @@ bool L1SPFilterPD::operator()(const input_pointer& in, output_pointer& out)
                         m_forward, wave_buf, scalar_buf,
                         m_dnn_window_ticks, (int)m_count);
                     f.dnn_score = score;
-                    if (!(score >= 0.0) || score < m_dnn_threshold) {
+                    const bool fire =
+                        (score >= 0.0) && (score >= m_dnn_threshold);
+                    // Record adj-veto DNN calls into the debug NPZ so
+                    // we can verify the path actually fires per ROI.
+                    // The 'fired' column reflects the adj-veto decision:
+                    // 1 = adj promotion allowed, 0 = adj promotion vetoed.
+                    if (!m_dnn_debug_path.empty()) {
+                        auto plane_it_p = ch_to_plane.find(ch_p);
+                        const int plane_p =
+                            (plane_it_p != ch_to_plane.end()
+                             && plane_it_p->second >= 0)
+                                ? plane_it_p->second : 0;
+                        ddnn_channel.push_back(ch_p);
+                        ddnn_plane.push_back(plane_p);
+                        ddnn_roi_start.push_back(roi_p.first);
+                        ddnn_roi_end.push_back(roi_p.second);
+                        ddnn_polarity.push_back(std::get<3>(t));
+                        ddnn_fired.push_back(fire ? 1 : 0);
+                        ddnn_score.push_back((float)score);
+                        ddnn_wave.insert(ddnn_wave.end(),
+                                         wave_buf.begin(), wave_buf.end());
+                        ddnn_scalars.insert(ddnn_scalars.end(),
+                                            scalar_buf.begin(),
+                                            scalar_buf.end());
+                    }
+                    if (!fire) {
                         // DNN vetoes the adjacency promotion.
                         continue;
                     }

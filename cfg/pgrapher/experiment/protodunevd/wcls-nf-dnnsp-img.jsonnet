@@ -186,11 +186,12 @@ local dnnroi_inner = [
   for n in std.range(0, std.length(tools.anodes) - 1)
 ];
 
-// PDVD round-2 hybrid-mode deploy.  Per-CRP DNN thresholds (bottom
-// 0.35 / top 0.46) and PDVD-tuned loose-heur (300, 5, 0.20) from
+// PDVD round-2 hybrid-mode deploy.  Per-CRP DNN thresholds unified at
+// 0.5 (bottom and top) and PDVD-tuned loose-heur (300, 5, 0.20) from
 // experiments/stage_a_pu_round2_pdvd/deploy_round2.md.  Bottom
-// threshold raised from 0.16 → 0.35 on 2026-05-25 to match the
-// PDHD round-4 cleanup; top threshold unchanged at 0.46.  The
+// threshold raised 0.16 → 0.35 → 0.5; top threshold raised 0.46 → 0.5
+// on 2026-05-25 to align with the PDHD round-4 cleanup and to push
+// the operating point further along precision (see doc 13).  The
 // envelope auto-disables PDVD's track-veto when
 // l1sp_pd_dump_mode=='hybrid' (see deploy_round2.md "Deviations
 // from PDHD").  Also enables DNN veto on adjacency-promoted ROIs.
@@ -199,8 +200,8 @@ local l1sp_envelope = if use_l1sp_dnn then [
                  tools, params,
                  l1sp_pd_dump_mode='hybrid',
                  l1sp_pd_torch_service=l1sp_ts,
-                 l1sp_pd_dnn_threshold_bottom=0.35,
-                 l1sp_pd_dnn_threshold_top=0.46,
+                 l1sp_pd_dnn_threshold_bottom=0.5,
+                 l1sp_pd_dnn_threshold_top=0.5,
                  l1sp_pd_adj_dnn_veto=true,
                  l1sp_pd_gmax_min=300.0,
                  l1sp_pd_min_length=5,

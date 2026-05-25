@@ -210,17 +210,17 @@ local dnnroi_inner = [
 ];
 
 // PDHD round-4 hybrid-mode deploy: loose-heur (300, 10, 0.20) +
-// DNN threshold 0.35 + L1SP DNN model l1sp/pdhd/l1sp_dnn_pdhd_v1.ts.
+// DNN threshold 0.5 + L1SP DNN model l1sp/pdhd/l1sp_dnn_pdhd_v1.ts.
 // Numbers track experiments/stage_a_pu_round4/deploy_round4.md.
-// Threshold raised from 0.10 to 0.35 (2026-05-25); see
-// l1sp_dl_tagger/docs/12-l1sp-failure-027409-evt0.md for the analysis.
+// Threshold raised 0.10 → 0.35 → 0.5 (2026-05-25); see
+// l1sp_dl_tagger/docs/13-l1sp-deploy-thresh0p5.md for the analysis.
 // Also enables DNN veto on adjacency-promoted ROIs.
 local l1sp_envelope = if use_l1sp_dnn then [
     l1sp_dnn_maker(tools.anodes[n], sp_pipes[n], dnnroi_inner[n],
                    tools, params,
                    l1sp_pd_dump_mode='hybrid',
                    l1sp_pd_torch_service=l1sp_ts,
-                   l1sp_pd_dnn_threshold=0.35,
+                   l1sp_pd_dnn_threshold=0.5,
                    l1sp_pd_adj_dnn_veto=true,
                    l1sp_pd_gmax_min=300.0,
                    l1sp_pd_min_length=10,
