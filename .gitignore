@@ -84,7 +84,8 @@ styles
 *.debug
 *.svg
 AutoDict_*
-spng
+# This file should only be committed to release branches.
+# And in any case, only matters when source lacks .git/.
 version.txt
 .cache
 .clangd

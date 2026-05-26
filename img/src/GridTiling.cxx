@@ -158,13 +158,12 @@ bool Img::GridTiling::operator()(const input_pointer& slice, output_pointer& out
     for (const auto& blob : blobs) {
         IBlob::pointer iblob = std::make_shared<Aux::SimpleBlob>(m_blobs_seen++, blob_value,
                                                                  0.0, blob, slice, m_face);
-        {                       // diagnostic message
-            Aux::BlobCategory bcat(iblob);
-            if (! bcat.ok()) {
-                log->warn("malformed blob: \"{}\"", bcat.str());
-            }
+        Aux::BlobCategory bcat(iblob);
+        if (! bcat.ok()) {
+            log->warn("malformed blob: \"{}\"", bcat.str());
+        } else {
+            sbs->m_blobs.push_back(iblob);
         }
-        sbs->m_blobs.push_back(iblob);
     }
     SPDLOG_LOGGER_TRACE(log, "anode={} face={} slice={} produced {} blobs",
                         anodeid, faceid, slice->ident(),
