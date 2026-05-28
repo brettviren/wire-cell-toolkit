@@ -9,7 +9,7 @@ local anodes = tools.anodes;
 local clus (
     anode,
     face = 0,
-    drift_speed = 1.56 * wc.mm / wc.us, // 1.56 for sbnd
+    drift_speed = 1.563 * wc.mm / wc.us, // matches simparams.jsonnet
     time_offset = -200 * wc.us,
     bee_dir = "data",
     bee_zip = "mabc.zip",
