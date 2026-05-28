@@ -10,7 +10,7 @@ local clus (
     anode,
     face = 0,
     drift_speed = 1.563 * wc.mm / wc.us, // matches simparams.jsonnet
-    time_offset = -200 * wc.us,
+    time_offset = -205 * wc.us,           // = -tick0_time (params.jsonnet sim.tick0_time)
     bee_dir = "data",
     bee_zip = "mabc.zip",
     initial_index = "0",
