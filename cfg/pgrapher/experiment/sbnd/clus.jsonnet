@@ -172,6 +172,11 @@ local clus_per_face(anode, face, dump, output_dir, runNo, subRunNo, eventNo) = {
             anodes: [wc.tn(anode)],
             face: face,
             detector_volumes: wc.tn(dv),
+            // Renumber cluster idents (insertion order, 1..N) after every
+            // clustering step.  Without this, clusters created mid-pipeline keep
+            // the unset-ident sentinel (-1) and collapse together in the Bee
+            // display.  See clustering.md "Cluster id numbering".
+            cluster_id_order: 'tree',
             bee_points_sets: [{
                 name: 'clustering',
                 detector: 'sbnd',
@@ -245,6 +250,9 @@ local clus_all_apa(anodes, dump, output_dir, runNo, subRunNo, eventNo) = {
             dead_area_version: 2,
             anodes: [wc.tn(a) for a in anodes],
             detector_volumes: wc.tn(dv),
+            // Renumber cluster idents (insertion order, 1..N) after every step;
+            // see clus_per_face above and clustering.md "Cluster id numbering".
+            cluster_id_order: 'tree',
             bee_points_sets: [
                 {
                     name: 'img',
