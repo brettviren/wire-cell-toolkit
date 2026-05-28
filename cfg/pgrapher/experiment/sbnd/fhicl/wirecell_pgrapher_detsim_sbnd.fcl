@@ -94,7 +94,7 @@ physics:
             # Transverse diffusion constant [cm2/s]
             DT: 8.8
             # Electron lifetime [ms]
-            lifetime: 10.0
+            lifetime: 35.0
             # Electron drift speed, assumes a certain applied E-field [mm/us]
             driftSpeed: 1.563
           }
