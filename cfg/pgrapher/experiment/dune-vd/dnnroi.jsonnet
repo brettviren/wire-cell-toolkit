@@ -11,7 +11,7 @@ local wc = import "wirecell.jsonnet";
 local pg = import "pgraph.jsonnet";
 
 
-function (anode, ts, prefix="dnnroi", output_scale=1.0) 
+function (anode, ts, prefix="dnnroi", output_scale=1.0, nchunks=1, sparcify=false) 
     local apaid = anode.data.ident;
     local prename = prefix + std.toString(apaid);
     local intags = ['loose_lf%d'%apaid, 'mp2_roi%d'%apaid,
@@ -24,10 +24,13 @@ function (anode, ts, prefix="dnnroi", output_scale=1.0)
             anode: wc.tn(anode),
             plane: 0,
             intags: intags,
+            summary_tag: "wiener%d" %apaid,
             decon_charge_tag: "decon_charge%d" %apaid,
             outtag: "dnnsp%du"%apaid,
             output_scale: output_scale,
-            forward: wc.tn(ts)
+            forward: wc.tn(ts),
+            nchunks: nchunks,
+            sparcify: sparcify,
         }
     }, nin=1, nout=1, uses=[ts, anode]);
     local dnnroi_v = pg.pnode({
@@ -37,10 +40,13 @@ function (anode, ts, prefix="dnnroi", output_scale=1.0)
             anode: wc.tn(anode),
             plane: 1,
             intags: intags,
+            summary_tag: "wiener%d" %apaid,
             decon_charge_tag: "decon_charge%d" %apaid,
             outtag: "dnnsp%dv"%apaid,
             output_scale: output_scale,
-            forward: wc.tn(ts)
+            forward: wc.tn(ts),
+            nchunks: nchunks,
+            sparcify: sparcify,
         }
     }, nin=1, nout=1, uses=[ts, anode]);
     local dnnroi_w = pg.pnode({
@@ -80,7 +86,7 @@ function (anode, ts, prefix="dnnroi", output_scale=1.0)
 
     local retagger = pg.pnode({
       type: 'Retagger',
-      name: 'dnnroi',
+      name: 'dnnroi%d' % apaid,
       data: {
         // Note: retagger keeps tag_rules an array to be like frame fanin/fanout.
         tag_rules: [{

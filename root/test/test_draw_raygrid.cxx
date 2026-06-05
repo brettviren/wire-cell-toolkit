@@ -15,7 +15,7 @@
 #include "TArrow.h"
 #include "TH1F.h"
 
-#include <boost/graph/graphviz.hpp>
+#include "WireCellUtil/Graph.h"
 
 #include <math.h>
 
@@ -28,10 +28,7 @@ using namespace std;
 using spdlog::info;
 using spdlog::warn;
 
-const int ndepos = 10;
-const int neles = 10;
 const double pitch_magnitude = 5;
-const double gaussian = 3;
 const double border = 10;
 const double width = 100;
 const double height = 100;

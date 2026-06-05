@@ -10,7 +10,9 @@ function(params, tools)
 {
     // Create a drifter Pnode.
     drifter: g.pnode({
-        local xregions = wc.unique_list(std.flattenArrays([v.faces for v in params.det.volumes])),
+        // local xregions = wc.unique_list(std.flattenArrays([v.faces for v in params.det.volumes])),
+        // Filter out any null values in xregions
+        local xregions = std.filter(function(x) x!= null, wc.unique_list(std.flattenArrays([v.faces for v in params.det.volumes]))),
 
         type: "Drifter",
         data: params.lar {
@@ -81,6 +83,26 @@ function(params, tools)
             nsigma: 3,
         },
     }, nin=1, nout=1, uses=[anode, tools.random, tools.dft] + pirs),
+
+    make_depotransform_withplane :: function(name, anode, plane, pirs) g.pnode({
+        type:'DepoTransform',
+        name:name,
+	data: {
+            rng: wc.tn(tools.random),
+            dft: wc.tn(tools.dft),
+            anode: wc.tn(anode),
+            pirs: std.map(function(pir) wc.tn(pir), pirs),
+            fluctuate: params.sim.fluctuate,
+            drift_speed: params.lar.drift_speed,
+            first_frame_number: params.daq.first_frame_number,
+            readout_time: params.sim.ductor.readout_time,
+            start_time: params.sim.ductor.start_time,
+            tick: params.daq.tick,
+            nsigma: 3,
+	    process_planes: plane
+        },
+    }, nin=1, nout=1, uses=[anode, tools.random, tools.dft] + pirs),
+
 
     // This may look similar to above but above is expected to diverge
     make_depozipper :: function(name, anode, pirs) g.pnode({

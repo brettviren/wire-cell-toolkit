@@ -24,7 +24,7 @@ function(params, tools, override = {}) {
       dft: wc.tn(tools.dft),
       field_response: wc.tn(tools.field),
       ftoffset: 0.0, // default 0.0
-      ctoffset: 0.0*wc.microsecond, // default -8.0
+      ctoffset: 2.0*wc.microsecond, // default -8.0
       per_chan_resp: pc.name,
       fft_flag: 0,  // 1 is faster but higher memory, 0 is slightly slower but lower memory
       elecresponse : wc.tn(tools.elec_resp),
@@ -51,6 +51,7 @@ function(params, tools, override = {}) {
       gauss_tag: 'gauss%d' % anode.data.ident,
 
       use_roi_debug_mode: false,
+      use_roi_refinement: false, // default: true
       tight_lf_tag: 'tight_lf%d' % anode.data.ident,
       loose_lf_tag: 'loose_lf%d' % anode.data.ident,
       cleanup_roi_tag: 'cleanup_roi%d' % anode.data.ident,

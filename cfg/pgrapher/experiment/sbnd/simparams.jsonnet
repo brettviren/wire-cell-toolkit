@@ -11,9 +11,9 @@ base {
     // Transverse diffusion constant
     DT :  8.8 * wc.cm2/wc.s,
     // Electron lifetime
-    lifetime : 10*wc.ms,
-    // Electron drift speed, assumes a certain applied E-field
-    drift_speed : 1.59*wc.mm/wc.us,
+    lifetime : 35*wc.ms,
+    // Electron drift speed, assumes 0.5 kV/cm and 88.4 K consistent with 1D sim
+    drift_speed : 1.563*wc.mm/wc.us,
   },
 
 
@@ -159,7 +159,7 @@ base {
   },
 
   rc_resp: {
-    width: 1.1*wc.ms,
+    width: 0.5*wc.ms,
     rc_layers: 1, // 1
   }
 }

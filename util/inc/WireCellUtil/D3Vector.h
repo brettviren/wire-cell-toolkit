@@ -1,4 +1,4 @@
-/** Vector a 3-vector of double.
+/** Implement 3-vector arithmetic with std::vector store.
  *
  * See also WireCell::Point.
  */
@@ -24,25 +24,23 @@ namespace WireCell {
         template <class U>
         friend std::ostream& operator<<(std::ostream&, const D3Vector<U>&);
 
-        typedef std::vector<T> D3VectorStore;
-        D3VectorStore m_v{3};
+        T m_v[3];
 
       public:
 
+        using value_type = T;   // mimic std::vector
         using coordinate_t = T;
 
         /// Construct from elements.
         D3Vector(const T& a = 0, const T& b = 0, const T& c = 0)
-            : m_v(3,0)
         {
             this->set(a, b, c);
         }
 
         // Copy constructor.
         D3Vector(const D3Vector& o)
-            : m_v(3,0)
         {
-            if (o) {
+            if (o.size() == 3) {
                 this->set(o.x(), o.y(), o.z());
             }
             else {
@@ -50,13 +48,13 @@ namespace WireCell {
             }
         }
 
+        // arrays do not have move constructors or move assignment operators.
         // Move constructor.
-        D3Vector(D3Vector&& o)
-            : m_v(std::move(o.m_v))
-        { }
+        // D3Vector(D3Vector&& o)
+        //     : m_v{std::move(o.m_v)}
+        // { }
 
         D3Vector(const T d[3])
-            : m_v(3,0)
         {
             this->set(d[0], d[1], d[2]);
         }
@@ -64,7 +62,7 @@ namespace WireCell {
         // Assignment.
         D3Vector& operator=(const D3Vector& o)
         {
-            if (o) {
+            if (o.size()) {
                 this->set(o.x(), o.y(), o.z());
             }
             else {
@@ -76,7 +74,6 @@ namespace WireCell {
         /// Set vector from elements;
         void set(const T& a = 0, const T& b = 0, const T& c = 0)
         {
-            m_v.resize(3, 0);
             m_v[0] = a;
             m_v[1] = b;
             m_v[2] = c;
@@ -85,10 +82,22 @@ namespace WireCell {
         T y(const T& val) { return m_v[1] = val; }
         T z(const T& val) { return m_v[2] = val; }
 
+        // make this look like std::vector
+        const T& at(size_t index) const {
+            return m_v[index];
+        }
+        T& at(size_t index) {
+            return m_v[index];
+        }
+        const T* data() const { return m_v; }
+        T* data() { return m_v; }
+        const size_t size() const { return 3; }
+        void clear() { m_v[0] = m_v[1] = m_v[2] = 0; }
+        void resize(size_t /*s*/) { /* no-op */ }
+
         /// Convert from other typed vector.
         template <class TT>
         D3Vector(const D3Vector<TT>& o)
-            : m_v(3,0)
         {
             this->set(o.x(), o.y(), o.z());
         }
@@ -99,12 +108,12 @@ namespace WireCell {
         T z() const { return m_v[2]; }
 
         /// Access elements by copy.
-        T operator[](std::size_t index) const { return m_v.at(index); }
+        T operator[](std::size_t index) const { return m_v[index]; }
 
         /// Access elements by reference.
         T& operator[](std::size_t index)
         {
-            return m_v.at(index);  // throw if out of bounds
+            return m_v[index];  // throw if out of bounds
         }
 
         /// Return the dot product of this vector and the other.
@@ -114,8 +123,22 @@ namespace WireCell {
             return scalar;
         }
 
+        /// Return angle between this vector and the other.
+        T angle(const D3Vector& rhs) const
+        {
+            T m1 = this->magnitude();
+            T m2 = rhs.magnitude();
+            if (m1 <= 0 || m2 <= 0) {
+                return 0;
+            }
+            T cosine = this->dot(rhs) / (m1 * m2);
+            return std::acos(std::min(std::max(cosine, T(-1)), T(1)));
+        }
+
         /// Return the magnitude of this vector.
-        T magnitude() const { return std::sqrt(x() * x() + y() * y() + z() * z()); }
+        T magnitude() const { return std::sqrt(magnitude2()); }
+        /// Return the magnitude-squared of this vector.
+        T magnitude2() const { return x() * x() + y() * y() + z() * z(); }
 
         /// Return a normalized vector in the direction of this vector.
         D3Vector norm() const
@@ -144,10 +167,11 @@ namespace WireCell {
 
         bool operator<(const D3Vector& rhs) const
         {
-            if (z() < rhs.z()) return true;
-            if (y() < rhs.y()) return true;
             if (x() < rhs.x()) return true;
-            return false;
+            else if (x() > rhs.x()) return false;
+            else if (y() < rhs.y()) return true;
+            else if (y() > rhs.y()) return false;
+            else return z() < rhs.z();
         }
 
         D3Vector& operator+=(const D3Vector& other)
@@ -162,13 +186,29 @@ namespace WireCell {
             return *this;
         }
 
-        bool operator!() const { return m_v.size() != 3; }
-        operator bool() const { return m_v.size() == 3; }
+        template <typename N>
+        D3Vector& operator*=(const N& a)
+        {
+            this->set(x()*a, y()*a, z()*a);
+            return *this;
+        }
+
+        template <typename N>
+        D3Vector& operator/=(const N& a)
+        {
+            this->set(x()/a, y()/a, z()/a);
+            return *this;
+        }
+
+        /// defining these opens a fairly nightmarish door.
+        /// https://www.artima.com/articles/the-safe-bool-idiom
+        // bool operator!() const { return m_v.size() != 3; }
+        // operator bool() const { return m_v.size() == 3; }
+
         // can call set(x,y,z) to revalidate.
         void invalidate()
         {
-            m_v.clear();
-            m_v.shrink_to_fit();
+            /// TODO: no op?
         }
     };
 

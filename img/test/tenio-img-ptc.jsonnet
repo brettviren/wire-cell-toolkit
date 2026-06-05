@@ -9,7 +9,8 @@ function(detector, variant="nominal",
          outfiles="pointcloud-img-%(anode)s.npz",
          anode_iota=null)
 
-    local mid = high.mid(detector, variant, options={sparse:false});
+    local params = high.params(detector, variant);  
+    local mid = high.api(detector, params, options={sparse:false});
 
     local anodes = mid.anodes();
     local iota = if std.type(anode_iota) == "null" then std.range(0, std.length(anodes)-1) else anode_iota;
@@ -23,7 +24,15 @@ function(detector, variant="nominal",
             type: "BlobSampler",
             name: anode.data.ident, 
             data: {
-                strategy: ["center","corner","edge"],
+                strategy: [
+                    "center","corner","edge","bounds","stepped",
+                    {name:"grid", step:1, planes:[0,1]},
+                    {name:"grid", step:1, planes:[1,2]},
+                    {name:"grid", step:1, planes:[2,0]},
+                    {name:"grid", step:2, planes:[0,1]},
+                    {name:"grid", step:2, planes:[1,2]},
+                    {name:"grid", step:2, planes:[2,0]},
+                ],
                 extra: [".*"] // want all the extra
             }};
 
@@ -39,7 +48,7 @@ function(detector, variant="nominal",
                 type:"BlobSampling",
                 name:anode.data.ident,
                 data: {
-                    sampler: wc.tn(bs),
+                    samplers: {samples: wc.tn(bs)},
                 },
             }, nin=1, nout=1, uses=[bs]),
 

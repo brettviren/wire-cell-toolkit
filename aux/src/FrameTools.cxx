@@ -229,13 +229,13 @@ Aux::channel_list Aux::fill(Array::array_xxf& array,
     auto tbinmm = Aux::tbin_range(traces);
     const size_t ncols = tbinmm.second - tbinmm.first;
     const size_t nrows = std::distance(ch.begin(), ch.end());
-    Array::array_xxf arr = Array::array_xxf::Zero(nrows, ncols);
-    Aux::fill(arr, traces, ch.begin(), ch.end(), tbinmm.first);
+    array = Array::array_xxf::Zero(nrows, ncols);
+    Aux::fill(array, traces, ch.begin(), ch.end(), tbinmm.first);
     return ch;
 }
 
 
-std::string Aux::taginfo(const WireCell::IFrame::pointer& frame)
+std::string Aux::taginfo(const WireCell::IFrame::pointer& frame, int verbosity)
 {
     if (! frame) {
         return "(null frame pointer)";
@@ -244,8 +244,13 @@ std::string Aux::taginfo(const WireCell::IFrame::pointer& frame)
     std::stringstream info;
     info << "frame: ident=" << frame->ident()
          << " time=" << frame->time() << " tick=" << frame->tick()
-         << " with "
-         << frame->traces()->size() << " traces.  frame tags:[ ";
+         << " with ";
+    const auto& traces = frame->traces();
+    if(!traces) {
+        info << " null trace ptr!";
+    } else {
+        info << traces->size() << " traces.  frame tags:[ ";
+    }
     for (const auto& tag : frame->frame_tags()) {
         info << "\"" << tag << "\" ";
     }
@@ -266,6 +271,17 @@ std::string Aux::taginfo(const WireCell::IFrame::pointer& frame)
         info << name << ":" << cm.size() << " ";
     }
     info << "]";
+
+    if (verbosity > 0) {
+        for (const auto& tag : ttags) {
+            double qtot = 0;
+            for (const auto& trace : Aux::tagged_traces(frame, tag)) {
+                const auto& q = trace->charge();
+                qtot = std::accumulate(q.begin(), q.end(), qtot);
+            }
+            info << " qtot[" << tag << "]=" << qtot;
+        }
+    }
     return info.str();
 }
 

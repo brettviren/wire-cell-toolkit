@@ -14,8 +14,8 @@ ValidationContext.script_templates[".jsonnet"] = "${WCSONNET} ${SCRIPT}"
 
 mydir = osp.dirname(__file__)
 
-## These are packages descriptions which fit the generic functions.
-## They will be checked in order so put any dependencies first.
+# These are packages descriptions which fit the generic functions.
+# They will be checked in order so put any dependencies first.
 package_descriptions = [
 
     # spdlog is "header only" but use library version for faster recompilation
@@ -24,25 +24,42 @@ package_descriptions = [
     ('spdlog',   dict(incs=['spdlog/spdlog.h'], libs=['spdlog'], pcname='spdlog')),
 
     ('ZLib',     dict(incs=['zlib.h'], libs=['z'], pcname='zlib')),
+    ('BZIP2',    dict(incs=['bzlib.h'], libs=['bz2'])),
     ('FFTW',     dict(incs=['fftw3.h'], libs=['fftw3f'], pcname='fftw3f')),
     ('FFTWThreads', dict(libs=['fftw3f_threads'], pcname='fftw3f', mandatory=False)),
     ('JsonCpp',  dict(incs=["json/json.h"], libs=['jsoncpp'], pcname='jsoncpp')),
 
     ('Eigen',    dict(incs=["Eigen/Dense"], pcname='eigen3')),
 
+    ('GLPK',    dict(incs=["glpk.h"], libs=["glpk"], mandatory=False)),
+
     # for faster parsing, consider:
     # ./wcb configure --with-jsonnet-libs=gojsonnet 
+    # see https://github.com/WireCell/wire-cell-toolkit/issues/342
     ('Jsonnet',  dict(incs=["libjsonnet.h"], libs=['jsonnet'])),
     ('TBB',      dict(incs=["tbb/parallel_for.h"], libs=['tbb'], pcname='tbb', mandatory=False)),
     ('HDF5',     dict(incs=["hdf5.h"], libs=['hdf5'], pcname='hdf5', mandatory=False)),
-    ('H5CPP',    dict(incs=["h5cpp/all"], mandatory=False, extuses=('HDF5',), pcname='h5cpp')),
 
     ('ZMQ',      dict(incs=["zmq.h"], libs=['zmq'], pcname='libzmq', mandatory=False)),
     ('CZMQ',     dict(incs=["czmq.h"], libs=['czmq'], pcname='libczmq', mandatory=False)),
     ('ZYRE',     dict(incs=["zyre.h"], libs=['zyre'], pcname='libzyre', mandatory=False)),
     ('ZIO',      dict(incs=["zio/node.hpp"], libs=['zio'], pcname='libzio', mandatory=False,
                       extuses=("ZYRE","CZMQ","ZMQ"))),
+    ('GRPC',     dict(incs=['grpcpp/grpcpp.h'], libs=['grpc++', 'grpc', 'gpr'], pcname='grpc++', mandatory=False)),
+    ('PROTOBUF', dict(incs=['google/protobuf/message.h'], libs=['protobuf'], pcname='protobuf', mandatory=False)),
+    ('TRITON',   dict(incs=['grpc_client.h'],
+    libs=[
+        'grpcclient',
+        'tritoncommonerror',
+        'tritoncommonmodelconfig',
+        'tritoncommonlogging',
+        'tritontableprinter',
+        'tritonthreadpool',
+        'tritonasyncworkqueue',
+    ],
+    mandatory=False)),
 
+    ('Python',   dict(incs=['Python.h'], libs=['python3.11'], pcname='python3-embed', mandatory=False)),
     # Note, this list may be modified (appended) in wscript files.
     # The list here represents the minimum wire-cell-toolkit requires.
 ]
@@ -59,10 +76,7 @@ def options(opt):
     opt.load('kokkos')
     #opt.load('protobuf')
 
-    for name,desc in package_descriptions:
-        generic._options(opt, name,
-                         desc.get("incs", None),
-                         desc.get("libs", None))
+    generic.do_options(opt, *package_descriptions)
 
     opt.add_option('--build-debug', default='-O2 -ggdb3',
                    help="Build with debug symbols")
@@ -70,8 +84,11 @@ def options(opt):
 
 def find_submodules(ctx):
     sms = list()
-    for wb in ctx.path.ant_glob("**/wscript_build"):
-        sms.append(wb.parent.name)
+    for wb in ctx.path.ant_glob("*/wscript_build"):
+        name = wb.parent.name
+        if name.startswith("prototype"):
+            continue
+        sms.append(name)
     sms.sort()
     return sms
 
@@ -81,34 +98,23 @@ def configure(cfg):
     cfg.load('boost')
     cfg.load('smplpkgs')
 
-    for name, args in package_descriptions:
-        generic._configure(cfg, name, **args)
+    generic.do_configure(cfg, *package_descriptions)
 
-    if getattr(cfg.options, "with_libtorch", False) is False:
-        info ("sans libtorch")
-    else:
+    def with_p(name):
+        return generic.with_p(cfg.options, name)
+
+    debug(f'wcb: {cfg.options=}')
+    if with_p('libtorch'):
         cfg.load('libtorch')
 
-    if getattr(cfg.options, "with_cuda", False) is False:
-        info ("sans CUDA")
-    else:
+    if with_p('cuda'):
         cfg.load('cuda')
 
-    if getattr(cfg.options, "with_kokkos", False) is False:
-        info ("sans KOKKOS")
-    else:
+    if with_p('kokkos'):
         cfg.load('kokkos')
 
-    if getattr(cfg.options, "with_root", False) is False:
-        info ("sans ROOT")
-    else:
+    if with_p('root'):
         cfg.load('rootsys')
-
-    ### not yet used
-    # if cfg.options.with_protobuf is False:
-    #     print ("sans protobuf")
-    # else:
-    #     cfg.load('protobuf')
 
 
     # Check for stuff not found in the wcb-generic way
@@ -122,6 +128,9 @@ def configure(cfg):
         else:
             info('NO %s libs'%one)
 
+    # I would like to add "serialization" to assist in writing methods for graph
+    # I/O.  The "math" lib could be useful.  But these additions will require
+    # changes to wire-cell-spack and perhaps other build methods.
     cfg.check_boost(lib='system filesystem graph thread program_options iostreams regex')
     haveit('boost')
 
@@ -138,16 +147,36 @@ def configure(cfg):
     cfg.env.LIB += ['z']
     
     submodules = find_submodules(cfg)
+    debug(f'wcb: {submodules=}')
+
+    # List any packages that may exist in the source but are not ready for
+    # release builds.  Development builds will include them.  
+    pre_release_packages = ["patrec"]
+    if cfg.env.IS_DEVELOPMENT:
+        # add any development-only config
+        debug("wcb: development build options")
+    else:
+
+        strict_flags = "-Werror -Wall -Werror=return-type -pedantic -Wno-unused-local-typedefs"
+        info(f'Adding strict compiler flags for release: "{strict_flags}"')
+        cfg.env.CXXFLAGS += strict_flags.split()
+
+        for notyet in pre_release_packages:
+            if notyet in submodules:
+                info(f'Removing package "{notyet}" due to not yet being ready for release')
+                submodules.remove(notyet)
 
     # Remove WCT packages if they an optional dependency wasn't found
     for pkg,ext in [
             ("root","HAVE_ROOTSYS"),
-            ("tbb","HAVE_TBB"),
-            ("tbb","LIB_FFTWTHREADS"),
+            ("tbb","HAVE_TBB LIB_FFTWTHREADS"),
+            ("patrec", "HAVE_GLPK"),
             ("cuda","HAVE_CUDA"),
-            ("hio", "INCLUDES_H5CPP"),
+            ("hio", "INCLUDES_HDF5"),
             ("pytorch", "LIB_LIBTORCH"),
-            ("zio", "LIB_ZIO LIB_ZYRE LIB_CZMQ LIB_ZMQ")
+            ("pyutil", "INCLUDES_PYTHON"),
+            ("zio", "LIB_ZIO LIB_ZYRE LIB_CZMQ LIB_ZMQ"),
+            ("triton", "LIB_GRPC LIB_PROTOBUF LIB_TRITON"), # LIB_PROTOBUF LIB_TRITON
     ]:
         exts = to_list(ext)
         for have in exts:
@@ -166,7 +195,8 @@ def configure(cfg):
 
     # Define env vars for wire-cell-python CLI's.
     # Extend this list manually as more are developed!
-    for one in to_list("aux gen img pgraph plot pytorch resp sigproc test util validate"):
+    # ls -l wire-cell-python/wirecell/*/__main__.py
+    for one in to_list("aux gen img ls4gan pgraph plot pytorch resp sigproc test util validate"):
         cmd = 'wirecell-' + one
         var = 'WC' + one.upper()
         cfg.find_program(cmd, var=var, mandatory=False)
@@ -219,9 +249,13 @@ def build(bld):
                     bld.install_files(bld.env.DOCS_INSTALL_PATH, out,
                                       cwd=bld_dir, relative_trick=True)
 
+    debug(f'wcb: {bld.smplpkg_names=}')
+    link_libs = 'WireCellAux WireCellIface WireCellUtil'.split()
+    debug(f'wcb: {link_libs=}')
     # Produce a pkg-config .pc file
     bld(source='wire-cell-toolkit.pc.in',
         name="pkg-config-file",
+        LLIBS = ' '.join([f'-l{n}' for n in link_libs]),
         REQUIRES = ' '.join(bld.env.REQUIRES),
         install_path = '${LIBDIR}/pkgconfig/')
 

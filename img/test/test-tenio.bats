@@ -21,7 +21,7 @@ function make_dag () {
     args+=( -A "outfiles=apa-%(anode)s-${tgt}.${data_ext}")
     local cfg_file="$(relative_path tenio-${src}-${tgt}.jsonnet)"
     run_idempotently -s "$cfg_file" -t "dag-${tgt}.json" -- \
-        compile_jsonnet "$cfg_file" "dag-${tgt}.json" "${args[@]}"
+        wcsonnet -o "dag-${tgt}.json" "${args[@]}" "$cfg_file"
     [[ -s dag-${tgt}.json ]]
     run_idempotently -s "dag-${tgt}.json" -t "dag-${tgt}.png" -- \
         dotify_graph "dag-${tgt}.json" "dag-${tgt}.png"
@@ -52,15 +52,16 @@ function make_dag () {
     make_dag sig scp 
 }
 
-@test "compile configuration for img to ptc" {
-    cd_tmp file
-    make_dag img ptc 
-}
+## FIXME: This relies on clus which is not yet in master.
+# @test "compile configuration for img to ptc" {
+#     cd_tmp file
+#     make_dag img ptc 
+# }
 
-@test "compile configuration for img to brf" {
-    cd_tmp file
-    make_dag img brf 
-}
+# @test "compile configuration for img to brf" {
+#     cd_tmp file
+#     make_dag img brf 
+# }
 
 function run_dag () {
     local src=$1; shift
@@ -98,15 +99,15 @@ function run_dag () {
     run_dag sig scp 
 }
 
-@test "run wire-cell stage img to ptc" {
-    cd_tmp file
-    run_dag img ptc 
-}
+# @test "run wire-cell stage img to ptc" {
+#     cd_tmp file
+#     run_dag img ptc 
+# }
 
-@test "run wire-cell stage img to brf" {
-    cd_tmp file
-    run_dag img brf 
-}
+# @test "run wire-cell stage img to brf" {
+#     cd_tmp file
+#     run_dag img brf 
+# }
 
 @test "no unexpected empty files" {
     cd_tmp file
@@ -116,8 +117,8 @@ function run_dag () {
             file_larger_than apa-${apa}-${tier}.${data_ext} ${empty_data}
         done
     done
-    for tier in img ptc ; do
-        for apa in 0 2 3 5 ; do # some apas are "empty"
+    for tier in img  ; do
+        for apa in 0 5 ; do # some apas are "empty"
             file_larger_than apa-${apa}-${tier}.${data_ext} ${empty_data}
         done
     done

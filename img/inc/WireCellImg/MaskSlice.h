@@ -63,6 +63,7 @@ namespace WireCell::Img {
         IAnodePlane::pointer m_anode;
         int m_tick_span{4};
         std::string m_wiener_tag{"wiener"};
+        std::string m_summary_tag{"wiener"};
         std::string m_charge_tag{"gauss"};
         std::string m_error_tag{"gauss_error"};
         std::vector<int> m_active_planes;
@@ -72,6 +73,7 @@ namespace WireCell::Img {
         double m_dummy_error{1e12};
         double m_masked_charge{0.0}; // 0.2 in previous version
         double m_masked_error{1e12};
+        /// NOTE: if set to zero then use the default threshold!!!
         std::vector<double> m_nthreshold{3.6, 3.6, 3.6};
         // from uboone u, v, w settings
         std::vector<double> m_default_threshold{5.87819e+02 * 4.0, 8.36644e+02 * 4.0, 5.67974e+02 * 4.0};

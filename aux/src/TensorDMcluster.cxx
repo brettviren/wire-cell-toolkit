@@ -1,4 +1,4 @@
-#include "WireCellAux/TensorDM.h"
+#include "WireCellAux/TensorDMcluster.h"
 #include "WireCellAux/ClusterArrays.h"
 #include "WireCellAux/SimpleTensor.h"
 #include "WireCellAux/SimpleCluster.h"
@@ -9,9 +9,9 @@ using namespace WireCell::Aux;
 using namespace WireCell::Aux::ClusterArrays;
 
 template<typename ElementType>
-ITensor::pointer make_tensor(const boost::multi_array<ElementType, 2>& arr,
-                              const std::string& datatype,
-                              const std::string & datapath)
+ITensor::pointer make_array_tensor(const boost::multi_array<ElementType, 2>& arr,
+                                   const std::string& datatype,
+                                   const std::string& datapath)
 {
     Json::Value md = Json::objectValue;
     md["datatype"] = datatype;
@@ -45,7 +45,7 @@ ITensor::vector TensorDM::as_tensors(ICluster::pointer cluster,
             const std::string ncs(1, nc);
             const std::string path = root + ncs;
             md["nodes"][ncs] = path;
-            ret.push_back(make_tensor<double>(na, "clnodeset", path));
+            ret.push_back(make_array_tensor<double>(na, "clnodeset", path));
         }
     }
 
@@ -55,7 +55,7 @@ ITensor::vector TensorDM::as_tensors(ICluster::pointer cluster,
             const std::string ecs = to_string(ec);
             const std::string path = root + ecs;
             md["edges"][ecs] = path;
-            ret.push_back(make_tensor<int>(ea, "cledgeset", path));
+            ret.push_back(make_array_tensor<int>(ea, "cledgeset", path));
         }
     }
 
@@ -67,32 +67,16 @@ ITensor::vector TensorDM::as_tensors(ICluster::pointer cluster,
 
 ICluster::pointer TensorDM::as_cluster(const ITensor::vector& tens,
                                        const IAnodePlane::vector& anodes,
-                                       const std::string datapath)
+                                       const std::string& datapath)
 {
-    // Index the tensors by datapath and find main "cluster" tensor.
-    ITensor::pointer top = nullptr;
-    std::unordered_map<std::string, ITensor::pointer> located;
-    for (const auto& iten : tens) {
-        const auto& tenmd = iten->metadata();
-        const auto dtype = tenmd["datatype"].asString();
-        const auto dpath = tenmd["datapath"].asString();
-        // std::cerr << "as_cluster: type=\"" << dtype << "\" path=\"" << dpath << "\"\n";
-
-        if (!top and dtype == "cluster") {
-            if (datapath.empty() or datapath == dpath) {
-                top = iten;
-            }
-            continue;
-        }
-        if (dtype == "clnodeset" or dtype == "cledgeset") {
-            located[dpath] = iten;
-        }
-        continue;
-    }
-
-    if (!top) {
-        THROW(ValueError() << errmsg{"no array of datatype \"cluster\""});
-    }
+    TensorIndex ti(tens);
+    return as_cluster(ti, anodes, datapath);
+}
+ICluster::pointer TensorDM::as_cluster(const TensorIndex& ti,
+                                       const IAnodePlane::vector& anodes,
+                                       const std::string& datapath)
+{
+    ITensor::pointer top = ti.at(datapath, "cluster");
 
     node_array_set_t nas;
     edge_array_set_t eas;
@@ -103,13 +87,9 @@ ICluster::pointer TensorDM::as_cluster(const ITensor::vector& tens,
     {                           // copy over node arrays
         auto paths = topmd["nodes"];
         for (const auto& code : paths.getMemberNames()) {
-            const std::string path = paths[code].asString();
-            auto it = located.find(path);
-            if (it == located.end()) {
-                THROW(ValueError() << errmsg{"no node array \"" + code + "\" at path \"" + path + "\""});
-            }
+            const std::string dpath = paths[code].asString();
+            auto ten = ti.at(dpath); // fixme: datatype
             const char nc = code[0];
-            ITensor::pointer ten = it->second;
             const double* data = reinterpret_cast<const double*>(ten->data());
             nas.emplace(nc, boost::const_multi_array_ref<double,2>(data, ten->shape()));
         }
@@ -118,14 +98,9 @@ ICluster::pointer TensorDM::as_cluster(const ITensor::vector& tens,
     {                           // copy over edge arrays
         auto paths = topmd["edges"];
         for (const auto& code : paths.getMemberNames()) {
-            const std::string path = paths[code].asString();
-            auto it = located.find(path);
-            if (it == located.end()) {
-                THROW(ValueError() << errmsg{"no edge array \"" + code + "\" at path \"" + path + "\""});
-            }
+            const std::string dpath = paths[code].asString();
+            auto ten = ti.at(dpath); // fixme: datatype
             auto ec = edge_code(code[0], code[1]);
-
-            ITensor::pointer ten = it->second;
             const int* data = reinterpret_cast<const int*>(ten->data());
             eas.emplace(ec, boost::const_multi_array_ref<int,2>(data, ten->shape()));
         }

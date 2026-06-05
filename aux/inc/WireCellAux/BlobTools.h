@@ -4,8 +4,7 @@
 #ifndef WIRECELLAUX_BLOBTOOLS
 #define WIRECELLAUX_BLOBTOOLS
 
-#include "WireCellUtil/PointCloud.h"
-#include "WireCellIface/IBlobSampler.h"
+#include "WireCellIface/IBlobSet.h"
 
 namespace WireCell::Aux {
 
@@ -54,6 +53,9 @@ namespace WireCell::Aux {
             return to_str(stat);
         }
     };
+
+    // Dump a summary of a cluster graph.  If fingerprint, include more verbosity of channel-level info.
+    std::string dumps(const IBlobSet::pointer& bs);
 
 }
 #endif

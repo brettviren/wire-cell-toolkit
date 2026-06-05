@@ -11,37 +11,22 @@ local wc = low.wc;
 local pg = low.pg;
 local idents = low.util.idents;
 
-local frs = import "frs.jsonnet";
-
 function(services, params, options={}) {
 
-    // Signal binning may be extended from nominal.
-    local sig_binning = params.ductor.binning,
-
-    local fr = frs(params).sim,
-
-    local cer = {
-        type: "ColdElecResponse",
-        data: params.elec + sig_binning,
-    },
-
-    local rc = {
-        type: 'RCResponse',
-        data: sig_binning { width: params.rc.width }
-    },
+    local res = low.resps(params).sim,
 
     // some have more than one
-    local short_responses = [ cer, ],
-    local long_responses = [ rc, ],
+    local short_responses = [ res.er, ],
+    local long_responses = [ res.rc, ],
         
     local pirs = [{
         type: 'PlaneImpactResponse',
         name: std.toString(plane),
-        uses: [fr, services.dft] + short_responses + long_responses,
-        data: sig_binning {
+        uses: [res.fr, services.dft] + short_responses + long_responses,
+        data: params.ductor.binning {
             plane: plane,
             dft: wc.tn(services.dft),
-            field_response: wc.tn(fr),
+            field_response: wc.tn(res.fr),
             short_responses: [wc.tn(sr) for sr in short_responses],
             long_responses: [wc.tn(lr) for lr in long_responses],
             overall_short_padding: 100*wc.us,
@@ -51,7 +36,7 @@ function(services, params, options={}) {
 
     // API method sim.track_depos: subgraph making some depos from
     // ideal tracks in the detector.
-    track_depos :: function(tracklist = [{
+    track_depos : function(tracklist = [{
         time: 0,
         charge: -5000,         
         ray:  {
@@ -64,29 +49,14 @@ function(services, params, options={}) {
                            params.ductor.start_time)
         ]),
         
-
-    // API method sim.reframer
-    reframer :: function(anode)
-        pg.pnode({
-            type: 'Reframer',
-            name: idents(anode),
-            data: {
-                anode: wc.tn(anode),
-                tags: [],
-                fill: 0.0,
-                toffset: 0,
-                tbin: params.ductor.tbin,
-                nticks: sig_binning.nticks - self.tbin,
-            },
-        }, nin=1, nout=1, uses=[anode]),
     
     // API method sim.signal: subgraph making pure signal voltage from
     // depos.
-    signal :: function(anode)
+    signal : function(anode, name=null)
         pg.pipeline([
             pg.pnode({
                 type: 'DepoTransform',
-                name: idents(anode),
+                name: name,
                 data: {
                     rng: wc.tn(services.random),
                     dft: wc.tn(services.dft),
@@ -97,17 +67,17 @@ function(services, params, options={}) {
                     first_frame_number: 0,
                     readout_time: params.ductor.readout_time,
                     start_time: params.ductor.start_time,
-                    tick: sig_binning.tick,
+                    tick: params.ductor.binning.tick,
                     nsigma: 3,
                 },
             }, nin=1, nout=1, uses = pirs + [anode, services.random, services.dft]),
-            $.reframer(anode)]),
+            low.reframer(params, anode, name=name)]),
 
     // API method sim.noise: subgraph adding noise to voltage
-    noise :: function(anode)
+    noise : function(anode, name)
         local model = {
             type: 'EmpiricalNoiseModel',
-            name: idents(anode),
+            name: name,
             data: params.noise.model {
                 anode: wc.tn(anode),
                 dft: wc.tn(services.dft),
@@ -117,7 +87,7 @@ function(services, params, options={}) {
         };
         pg.pnode({
             type: 'AddNoise',
-            name: idents(anode),
+            name: name,
             data: {
                 rng: wc.tn(services.random),
                 dft: wc.tn(services.dft),
@@ -126,16 +96,5 @@ function(services, params, options={}) {
                 replacement_percentage: params.noise.replacement_percentage,
             }}, nin=1, nout=1, uses=[services.random, services.dft, model]),
 
-    // API method sim.digitizer: return subgraph adding digitization
-    // of voltage to produce ADC
-    digitizer :: function(anode)
-        pg.pnode({
-            type: 'Digitizer',
-            name: idents(anode),
-            data: params.digi {
-                anode: wc.tn(anode),
-                frame_tag: "orig" + idents(anode),
-            }
-        }, nin=1, nout=1, uses=[anode]),
 
 }

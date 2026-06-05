@@ -5,15 +5,20 @@
 
 #include <cstdlib>  // for getenv, see get_path()
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 #include <boost/iostreams/copy.hpp>
 #include <boost/iostreams/filter/bzip2.hpp>
 #include <boost/iostreams/device/file.hpp>
 #include <boost/iostreams/filtering_stream.hpp>
 #include <boost/filesystem.hpp>
+#pragma GCC diagnostic pop
 
 #include <string>
 #include <sstream>
 #include <fstream>
+#include <cstring>
+#include <memory>
 
 // see #239 for why this is here.
 extern "C" {
@@ -26,6 +31,7 @@ extern "C" {
     void jsonnet_ext_code(struct JsonnetVm* vmRef, char* key, char* value);
     void jsonnet_tla_var(struct JsonnetVm* vmRef, char* key, char* value);
     void jsonnet_tla_code(struct JsonnetVm* vmRef, char* key, char* value);
+    void jsonnet_max_stack(struct JsonnetVm* vmRef, unsigned v);
     char* jsonnet_evaluate_file(struct JsonnetVm* vmRef, char* filename, int* e);
     char* jsonnet_evaluate_snippet(struct JsonnetVm* vmRef, char* filename, char* code, int* e);
 }
@@ -48,6 +54,31 @@ static std::string file_extension(const std::string& filename)
     return filename.substr(ind);
 }
 
+WireCell::Persist::TempDir::TempDir(const boost::filesystem::path& model, bool systmp, bool keep)
+    : path(systmp ? boost::filesystem::temp_directory_path() / boost::filesystem::unique_path(model) : boost::filesystem::unique_path(model))
+    , keep(keep)
+{
+    boost::filesystem::create_directories(path);
+}
+#include <iostream> // debug
+WireCell::Persist::TempDir::~TempDir()
+{
+    if (keep) return;
+
+    boost::filesystem::remove_all(path);
+    // const std::string spath = path.native();
+    // boost::system::error_code ec;
+    // std::size_t removed_count =  boost::filesystem::remove_all(path, ec);
+    // if (ec) {
+    //     //debug("Error removing directory: {}", ec.message());
+    //     std::cerr << "Error removing directory: " << ec.message() << endl;
+    // }
+    // else {
+    //     std::cerr << "Removed: " << removed_count << " from " << spath << "\n";
+    // }
+}
+
+
 void WireCell::Persist::dump(const std::string& filename, const Json::Value& jroot, bool pretty)
 {
     string ext = file_extension(filename);
@@ -60,19 +91,47 @@ void WireCell::Persist::dump(const std::string& filename, const Json::Value& jro
     }
     outfilt.push(fp);
     if (pretty) {
+// All of JsonCPP is deprecated in my but I don't want to deal with the details
+// until we make the full jump to nlohmann::json.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic warning "-Wdeprecated-declarations"
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         Json::StyledWriter jwriter;
+#pragma GCC diagnostic pop
         outfilt << jwriter.write(jroot);
     }
     else {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic warning "-Wdeprecated-declarations"
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         Json::FastWriter jwriter;
+#pragma GCC diagnostic pop
         outfilt << jwriter.write(jroot);
     }
 }
-// fixme: support pretty option for indentation
-std::string WireCell::Persist::dumps(const Json::Value& cfg, bool)
+
+std::string WireCell::Persist::dumps(const Json::Value& obj, int indent, int nsig)
 {
+    Json::StreamWriterBuilder swb;
+
+    if (indent < 0) {
+        swb["indentation"] = std::string(std::abs(indent), '\t');
+    }
+    else {
+        swb["indentation"] = std::string(indent, ' ');
+    }
+
+    const bool default_sig = nsig == 0 || nsig == 17;
+    if (! default_sig) {
+        swb["precision"] = nsig;
+        // Note: there is also a "precisionType" option.  It defaults to
+        // "significant" using "%.*g" or it can be "decimal" which uses "%.*f"
+        // sprintf codes.
+    }
+
+    std::unique_ptr<Json::StreamWriter> w(swb.newStreamWriter());
     stringstream ss;
-    ss << cfg;
+    w->write(obj, &ss);
     return ss.str();
 }
 
@@ -114,6 +173,11 @@ static std::vector<std::string> get_path()
         return ret;
     }
     for (auto path : String::split(cpath)) {
+        if (! Persist::exists(path)) {
+            debug("skip non existent directory in load path: {}", path);
+            continue;
+        }
+
         ret.push_back(path);
     }
     return ret;
@@ -183,12 +247,20 @@ Json::Value WireCell::Persist::loads(const std::string& text,
     return parser.loads(text);
 }
 
-// bundles few lines into function to avoid some copy-paste
+// Parse JSON text directly via CharReader, avoiding the stringstream/stringbuf
+// pipeline that used to materialize 2-3 extra copies of the input text for
+// large configurations.
 Json::Value WireCell::Persist::json2object(const std::string& text)
 {
     Json::Value res;
-    stringstream ss(text);
-    ss >> res;
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    std::string errs;
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    if (!reader->parse(begin, end, &res, &errs)) {
+        THROW(IOError() << errmsg{"json parse failed: " + errs});
+    }
     return res;
 }
 
@@ -265,6 +337,10 @@ WireCell::Persist::Parser::Parser(const std::vector<std::string>& load_paths, co
                                   const externalvars_t& tlacode)
     : m_jvm{jsonnet_make()}
 {
+    // Default jsonnet max stack is 500 frames, which std.foldl chews through
+    // when fed lists with hundreds of elements (e.g. 360-fold fan-out configs
+    // hitting g.uses/popuses/std.foldl).
+    jsonnet_max_stack(m_jvm, 100000);
 
     // Loading: 1) cwd, 2) passed in paths 3) environment
     m_load_paths.push_back(boost::filesystem::current_path());
@@ -278,6 +354,11 @@ WireCell::Persist::Parser::Parser(const std::vector<std::string>& load_paths, co
     }
     // load paths into jsonnet backwards to counteract its reverse ordering
     for (auto pit = m_load_paths.rbegin(); pit != m_load_paths.rend(); ++pit) {
+        if (! exists(*pit)) {
+            debug("skip non existent directory in load path: {}", pit->native());
+            continue;
+        }
+
         auto path = boost::filesystem::canonical(*pit).string();
         add_load_path(path);
     }
@@ -335,11 +416,23 @@ Json::Value WireCell::Persist::Parser::load(const std::string& filename)
         char* jtext = jsonnet_evaluate_file(m_jvm, to_chars(fname), &rc);
         if (rc) {
             error(jtext);
-            THROW(ValueError() << errmsg{jtext});
+            std::string emsg(jtext);
+            jsonnet_realloc(m_jvm, jtext, 0);
+            THROW(ValueError() << errmsg{emsg});
         }
-        std::string output(jtext);
+        // Parse directly from the libjsonnet buffer; avoids materializing a
+        // ~1 GB std::string copy of the jsonnet output before parsing.
+        Json::Value res;
+        Json::CharReaderBuilder builder;
+        std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+        std::string errs;
+        const std::size_t len = std::strlen(jtext);
+        const bool ok = reader->parse(jtext, jtext + len, &res, &errs);
         jsonnet_realloc(m_jvm, jtext, 0);
-        return json2object(output);
+        if (!ok) {
+            THROW(IOError() << errmsg{"jsonnet output JSON parse failed: " + errs});
+        }
+        return res;
     }
 
     // also support JSON, possibly compressed

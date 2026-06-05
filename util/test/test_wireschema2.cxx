@@ -2,7 +2,10 @@
 #include "WireCellUtil/Units.h"
 #include "WireCellUtil/String.h"
 #include "WireCellUtil/Testing.h"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
 #include "WireCellUtil/svg.hpp"
+#pragma GCC diagnostic pop
 
 #include <iostream>
 
@@ -147,7 +150,7 @@ int main(int argc, char* argv[])
 
             
             auto w1 = ws.front();
-            auto w2 = ws.back();
+            // auto w2 = ws.back();
             // w1.tail.x(0); w1.head.x(0); w2.tail.x(0); w2.head.x(0);
 
             auto half1 = 0.5*(w1.tail + w1.head);
@@ -155,9 +158,9 @@ int main(int argc, char* argv[])
             const double zh = half1.z();
             const double yh = half1.y();
             // make bullseye around center of first wire
-            doc << svg::Circle(svg::Point(zh, yh), wire_skip*pmean,
-                               svg::Fill(), svg::Stroke(2*pmean, plane_colors[plane_index]));
-            doc << svg::Circle(svg::Point(zh, yh), 2*pmean,
+            doc << svg::Circle(svg::Point(zh, yh), wire_skip*pmean.magnitude(),
+                               svg::Fill(), svg::Stroke(2*pmean.magnitude(), plane_colors[plane_index]));
+            doc << svg::Circle(svg::Point(zh, yh), 2*pmean.magnitude(),
                                plane_colors[plane_index]);
 
             std::cerr << "face=" << face.ident << " plane=" << plane.ident << "\n";
@@ -178,7 +181,7 @@ int main(int argc, char* argv[])
                 // double rl = ray_length(rp);
 
                 // Nudge text based on current plane to avoid overlaps
-                const auto tnudge = Vector(0,2*pmean*(plane_index+1), 0);
+                const auto tnudge = Vector(0,2*pmean.magnitude()*(plane_index+1), 0);
                 std::string lab;
                 if (ind==1) {
                     lab = format("%d: PID=%d WIP=%d WID=%d pmean=%.1fmm",
@@ -189,7 +192,7 @@ int main(int argc, char* argv[])
                                  plane_index, ind-1, one.ident, c.y(), c.z());
                 }
                 doc << svg::Text(point(c + tnudge), lab, svg::Color::Black, svg::Font(10, "Verdana"));
-                doc << svg::Circle(point(c), pmean, plane_colors[plane_index]);
+                doc << svg::Circle(point(c), pmean.magnitude(), plane_colors[plane_index]);
 
                 doc << line(r1) << line(r2) << line(Ray(c, c+rpv));
             }
@@ -213,9 +216,9 @@ int main(int argc, char* argv[])
 
 
                 // smaller, thinner bullseye 
-                doc << svg::Circle(point(tgpt), 0.5*wire_skip*pmean,
-                                   svg::Fill(), svg::Stroke(pmean, plane_colors[plane_index]));
-                doc << line(wcen, svg::Stroke(pmean, plane_colors[plane_index])); // make easy to find
+                doc << svg::Circle(point(tgpt), 0.5*wire_skip*pmean.magnitude(),
+                                   svg::Fill(), svg::Stroke(pmean.magnitude(), plane_colors[plane_index]));
+                doc << line(wcen, svg::Stroke(pmean.magnitude(), plane_colors[plane_index])); // make easy to find
                 doc << line(wcen); // draw precise 
                 doc << line(Ray(tgpt + whalf, tgpt - whalf), // check if overlaps
                             svg::Stroke(0.15*units::mm, svg::Color::Magenta));

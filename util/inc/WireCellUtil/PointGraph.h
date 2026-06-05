@@ -3,7 +3,7 @@
 
 #include "WireCellUtil/KDTree.h"
 
-#include <boost/graph/adjacency_list.hpp>
+#include "WireCellUtil/Graph.h"
 
 namespace WireCell {
 
@@ -59,8 +59,8 @@ namespace WireCell {
             if (nedges == 0) {
                 return g;
             }
-            const auto& t = m_edges.get(tails).elements<IndexType>();
-            const auto& h = m_edges.get(heads).elements<IndexType>();
+            const auto& t = m_edges.get(tails)->elements<IndexType>();
+            const auto& h = m_edges.get(heads)->elements<IndexType>();
             for (size_t ind=0; ind<nedges; ++ind) {
                 const vdesc_t tvtx = t[ind];
                 const vdesc_t hvtx = h[ind];

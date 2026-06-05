@@ -9,12 +9,24 @@
 #include "WireCellUtil/LassoModel.h"
 #include "WireCellUtil/NamedFactory.h"
 
-#include <Eigen/Dense>
+#include "WireCellUtil/Eigen.h"
 
 #include <numeric>
 #include <iostream>
 
-WIRECELL_FACTORY(L1SPFilter, WireCell::SigProc::L1SPFilter, WireCell::IFrameFilter, WireCell::IConfigurable)
+#ifdef __clang__
+#  if defined(__has_warning)
+#    define HAS_WARNING(warning) __has_warning(warning)
+#  else
+#    define HAS_WARNING(warning) 1
+#  endif
+#else
+#  define HAS_WARNING(warning) 1
+#endif
+
+WIRECELL_FACTORY(L1SPFilter,
+                 WireCell::SigProc::L1SPFilter,
+                 WireCell::INamed, WireCell::IFrameFilter, WireCell::IConfigurable)
 
 using namespace Eigen;
 using namespace WireCell;
@@ -26,7 +38,8 @@ using WireCell::Aux::DftTools::inv_c2r;
 
 L1SPFilter::L1SPFilter(double gain, double shaping, double postgain, double ADC_mV, double fine_time_offset,
                        double coarse_time_offset)
-  : m_gain(gain)
+  : Aux::Logger("L1SPFilter", "sigproc")
+  , m_gain(gain)
   , m_shaping(shaping)
   , m_postgain(postgain)
   , m_ADC_mV(ADC_mV)
@@ -82,8 +95,6 @@ void L1SPFilter::init_resp()
 
         // convolute with V and Y average responses ...
         double intrinsic_time_offset = fravg.origin / fravg.speed;
-        // std::cout << intrinsic_time_offset << " " << m_fine_time_offset << " " << m_coarse_time_offset << " " <<
-        // m_gain << " " << 14.0 * units::mV/units::fC << " " << m_shaping << " " << fravg.period << std::endl;
 
         double x0 = (-intrinsic_time_offset - m_coarse_time_offset + m_fine_time_offset);
         double xstep = fravg.period;
@@ -177,20 +188,46 @@ void L1SPFilter::configure(const WireCell::Configuration& cfg)
 
     std::string dft_tn = get<std::string>(cfg, "dft", "FftwDFT");
     m_dft = Factory::find_tn<IDFT>(dft_tn);
+
+    // Cache L1_fit config values to avoid re-parsing JSON on every call
+    // fixme: this use of units is broken!!!
+    m_overall_time_offset = get(cfg, "overall_time_offset", 0.0) * units::us;
+    m_collect_time_offset = get(cfg, "collect_time_offset", 3.0) * units::us;
+
+    m_adc_l1_threshold = get(cfg, "adc_l1_threshold", 6.0);
+    m_adc_sum_threshold = get(cfg, "adc_sum_threshold", 160.0);
+    m_adc_sum_rescaling = get(cfg, "adc_sum_rescaling", 90.0);
+    m_adc_sum_rescaling_limit = get(cfg, "adc_sum_rescaling_limit", 50.0);
+    m_adc_ratio_threshold = get(cfg, "adc_ratio_threshold", 0.2);
+
+    m_l1_seg_length = get(cfg, "l1_seg_length", 120.0);
+    m_l1_scaling_factor = get(cfg, "l1_scaling_factor", 500.0);
+    m_l1_lambda = get(cfg, "l1_lambda", 5.0);
+    m_l1_epsilon = get(cfg, "l1_epsilon", 0.05);
+    m_l1_niteration = get(cfg, "l1_niteration", 100000.0);
+    m_l1_decon_limit = get(cfg, "l1_decon_limit", 100.0);
+
+    m_l1_resp_scale = get(cfg, "l1_resp_scale", 0.5);
+    m_l1_col_scale = get(cfg, "l1_col_scale", 1.15);
+    m_l1_ind_scale = get(cfg, "l1_ind_scale", 0.5);
+
+    m_peak_threshold = get(cfg, "peak_threshold", 10000.0);
+    m_mean_threshold = get(cfg, "mean_threshold", 500.0);
+
+    m_smearing_vec = get<std::vector<double>>(cfg, "filter");
 }
 
 bool L1SPFilter::operator()(const input_pointer& in, output_pointer& out)
 {
     out = nullptr;
     if (!in) {
+        log->debug("EOS at call={}", m_count++);
         return true;  // eos
     }
 
     std::string adctag = get<std::string>(m_cfg, "adctag");
     std::string sigtag = get<std::string>(m_cfg, "sigtag");
     std::string outtag = get<std::string>(m_cfg, "outtag");
-
-    //    std::cout << smearing_vec.size() << std::endl;
 
     int roi_pad = 0;
     roi_pad = get(m_cfg, "roi_pad", roi_pad);
@@ -200,25 +237,18 @@ bool L1SPFilter::operator()(const input_pointer& in, output_pointer& out)
     double raw_ROI_th_nsigma = get(m_cfg, "raw_ROI_th_nsigma", 4);
     double raw_ROI_th_adclimit = get(m_cfg, "raw_ROI_th_adclimit", 10);
 
-    // std::cout << "Xin: " << raw_ROI_th_nsigma << " " << raw_ROI_th_adclimit << " " << overall_time_offset << " " <<
-    // collect_time_offset << " " << roi_pad << " " << adc_l1_threshold << " " << adc_sum_threshold << " " <<
-    // adc_sum_rescaling << " " << adc_sum_rescaling_limit << " " << l1_seg_length << " " << l1_scaling_factor << " " <<
-    // l1_lambda << " " << l1_epsilon << " " << l1_niteration << " " << l1_decon_limit << " " << l1_resp_scale << " " <<
-    // l1_col_scale << " " << l1_ind_scale << std::endl;
     init_resp();
 
     auto adctraces = Aux::tagged_traces(in, adctag);
     auto sigtraces = Aux::tagged_traces(in, sigtag);
 
     if (adctraces.empty() or sigtraces.empty() or adctraces.size() != sigtraces.size()) {
-        std::cerr << "L1SPFilter got unexpected input: " << adctraces.size() << " ADC traces and " << sigtraces.size()
-                  << " signal traces\n";
-        THROW(RuntimeError() << errmsg{"L1SPFilter: unexpected input"});
+        log->error("unexpected input: {} ADC traces, {} signal traces at call={}",
+                   adctraces.size(), sigtraces.size(), m_count++);
+        raise<RuntimeError>("L1SPFilter: unexpected input");
     }
 
     m_period = in->tick();
-
-    // std::cout << m_period/units::us << std::endl;
 
     /// here, use the ADC and signal traces to do L1SP
     ///  put result in out_traces
@@ -240,9 +270,6 @@ bool L1SPFilter::operator()(const input_pointer& in, output_pointer& out)
         }
 
         init_map[ch] = time_ticks;
-        // if (time_ticks.size()>0){
-        // 	std::cout << ch << " " << time_ticks.size() << std::endl;
-        // }
     }
 
     // do ROI from the raw signal
@@ -269,9 +296,6 @@ bool L1SPFilter::operator()(const input_pointer& in, output_pointer& out)
         double cut = raw_ROI_th_nsigma * sqrt((pow(mean_p1sig - mean, 2) + pow(mean_n1sig - mean, 2)) / 2.);
         if (cut < raw_ROI_th_adclimit) cut = raw_ROI_th_adclimit;
 
-        // if (ch==4090)
-        // 	std::cout << cut << " " << raw_pad << std::endl;
-
         for (int qi = 0; qi < ntbins; qi++) {
             if (fabs(charges[qi]) > cut) {
                 for (int qii = -raw_pad; qii != raw_pad + 1; qii++) {
@@ -279,9 +303,6 @@ bool L1SPFilter::operator()(const input_pointer& in, output_pointer& out)
                 }
             }
         }
-        // if (time_ticks.size()>0){
-        // 	std::cout << ch << " " << time_ticks.size() << std::endl;
-        // }
     }
 
     // create ROIs ...
@@ -332,9 +353,6 @@ bool L1SPFilter::operator()(const input_pointer& in, output_pointer& out)
         }
 
         if (rois_save.size() > 0) map_ch_rois[wire_index] = rois_save;
-        // for (auto it = rois_save.begin(); it!=rois_save.end(); it++){
-        // std::cout << wire_index << " " << it->first << " " << it->second +1 << std::endl;
-        // }
     }
 
     std::map<int, std::vector<int>> map_ch_flag_rois;
@@ -387,27 +405,27 @@ bool L1SPFilter::operator()(const input_pointer& in, output_pointer& out)
                 prev_time_tick = rois_save.back().second + 2000;
 
                 for (size_t i1 = 0; i1 != rois_save.size(); i1++) {
-                    if (prev_time_tick - rois_save.at(rois_save.size() - 1 - i1).second > 20) flag_shorted = false;
+                    size_t ri = rois_save.size() - 1 - i1;  // reverse index
+                    if (prev_time_tick - rois_save.at(ri).second > 20) flag_shorted = false;
 
-                    if (map_ch_flag_rois[trace->channel()].at(i1) == 1) {
+                    if (map_ch_flag_rois[trace->channel()].at(ri) == 1) {
                         flag_shorted = true;
                     }
-                    else if (map_ch_flag_rois[trace->channel()].at(i1) == 2) {
+                    else if (map_ch_flag_rois[trace->channel()].at(ri) == 2) {
                         if (flag_shorted) {
-                            L1_fit(newtrace, adctrace_ch_map[trace->channel()], rois_save.at(i1).first,
-                                   rois_save.at(i1).second + 1, flag_shorted);
-                            map_ch_flag_rois[trace->channel()].at(i1) = 0;
+                            L1_fit(newtrace, adctrace_ch_map[trace->channel()], rois_save.at(ri).first,
+                                   rois_save.at(ri).second + 1, flag_shorted);
+                            map_ch_flag_rois[trace->channel()].at(ri) = 0;
                         }
                     }
-                    else if (map_ch_flag_rois[trace->channel()].at(i1) == 0) {
+                    else if (map_ch_flag_rois[trace->channel()].at(ri) == 0) {
                         flag_shorted = false;
                     }
-                    prev_time_tick = rois_save.at(i1).first;
+                    prev_time_tick = rois_save.at(ri).first;
                 }
             }
         }
 
-        // std::cout << trace->channel() << std::endl;
         out_traces.push_back(newtrace);
     }
 
@@ -457,17 +475,20 @@ bool L1SPFilter::operator()(const input_pointer& in, output_pointer& out)
         out_traces.at(i2) = new_trace;
     }
 
-    std::cerr << "L1SPFilter: frame: " << in->ident() << " " << adctag << "[" << adctraces.size() << "] + " << sigtag
-              << "[" << sigtraces.size() << "] --> " << outtag << "[" << out_traces.size() << "]\n";
-
-    // Finally, we save the traces to an output frame with tags.
-
-    IFrame::trace_list_t tl(out_traces.size());
-    std::iota(tl.begin(), tl.end(), 0);
+    // Finally, we save the traces to an output frame.
 
     auto sf = new Aux::SimpleFrame(in->ident(), in->time(), out_traces, in->tick());
-    sf->tag_traces(outtag, tl);
+    if (! outtag.empty()) {
+        IFrame::trace_list_t tl(out_traces.size());
+        std::iota(tl.begin(), tl.end(), 0);
+        sf->tag_traces(outtag, tl);
+    }
     out = IFrame::pointer(sf);
+
+    log->debug("call={} adctag={} sigtag={} outtag={}", m_count, adctag, sigtag, outtag);
+    log->debug("call={} in frame: {}", m_count, Aux::taginfo(in));
+    log->debug("call={} out frame: {}", m_count, Aux::taginfo(out));
+    ++m_count;
 
     return true;
 }
@@ -476,31 +497,31 @@ int L1SPFilter::L1_fit(std::shared_ptr<Aux::SimpleTrace>& newtrace,
                        std::shared_ptr<const WireCell::ITrace>& adctrace, int start_tick, int end_tick,
                        bool flag_shorted)
 {
-    // fixme: this use of units is broken!!!
-    double overall_time_offset = get(m_cfg, "overall_time_offset", 0.0) * units::us;
-    double collect_time_offset = get(m_cfg, "collect_time_offset", 3.0) * units::us;
+    // Use cached config values (set in configure()) instead of re-parsing JSON
+    const double overall_time_offset = m_overall_time_offset;
+    const double collect_time_offset = m_collect_time_offset;
 
-    double adc_l1_threshold = get(m_cfg, "adc_l1_threshold", 6);
-    double adc_sum_threshold = get(m_cfg, "adc_sum_threshold", 160);
-    double adc_sum_rescaling = get(m_cfg, "adc_sum_rescaling", 90.0);
-    double adc_sum_rescaling_limit = get(m_cfg, "adc_sum_rescaling_limit", 50.0);
-    double adc_ratio_threshold = get(m_cfg, "adc_ratio_threshold", 0.2);
+    const double adc_l1_threshold = m_adc_l1_threshold;
+    const double adc_sum_threshold = m_adc_sum_threshold;
+    const double adc_sum_rescaling = m_adc_sum_rescaling;
+    const double adc_sum_rescaling_limit = m_adc_sum_rescaling_limit;
+    const double adc_ratio_threshold = m_adc_ratio_threshold;
 
-    double l1_seg_length = get(m_cfg, "l1_seg_length", 120);
-    double l1_scaling_factor = get(m_cfg, "l1_scaling_factor", 500);
-    double l1_lambda = get(m_cfg, "l1_lambda", 5);
-    double l1_epsilon = get(m_cfg, "l1_epsilon", 0.05);
-    double l1_niteration = get(m_cfg, "l1_niteration", 100000);
-    double l1_decon_limit = get(m_cfg, "l1_decon_limit", 100);
+    const double l1_seg_length = m_l1_seg_length;
+    const double l1_scaling_factor = m_l1_scaling_factor;
+    const double l1_lambda = m_l1_lambda;
+    const double l1_epsilon = m_l1_epsilon;
+    const double l1_niteration = m_l1_niteration;
+    const double l1_decon_limit = m_l1_decon_limit;
 
-    double l1_resp_scale = get(m_cfg, "l1_resp_scale", 0.5);
-    double l1_col_scale = get(m_cfg, "l1_col_scale", 1.15);
-    double l1_ind_scale = get(m_cfg, "l1_ind_scale", 0.5);
+    const double l1_resp_scale = m_l1_resp_scale;
+    const double l1_col_scale = m_l1_col_scale;
+    const double l1_ind_scale = m_l1_ind_scale;
 
-    double peak_threshold = get(m_cfg, "peak_threshold", 10000);
-    double mean_threshold = get(m_cfg, "mean_threshold", 500);
+    const double peak_threshold = m_peak_threshold;
+    const double mean_threshold = m_mean_threshold;
 
-    std::vector<double> smearing_vec = get<std::vector<double>>(m_cfg, "filter");
+    const std::vector<double>& smearing_vec = m_smearing_vec;
 
     // algorithm
     const int nbin_fit = end_tick - start_tick;
@@ -531,8 +552,8 @@ int L1SPFilter::L1_fit(std::shared_ptr<Aux::SimpleTrace>& newtrace,
 
     int flag_l1 = 0;  // do nothing
     // 1 do L1
-    if (temp_sum / (temp1_sum * adc_sum_rescaling * 1.0 / nbin_fit) > adc_ratio_threshold &&
-        temp1_sum > adc_sum_threshold) {
+    if (temp1_sum > adc_sum_threshold &&
+        temp_sum / (temp1_sum * adc_sum_rescaling * 1.0 / nbin_fit) > adc_ratio_threshold) {
         flag_l1 = 1;  // do L1 ...
     }
     else if (temp1_sum * adc_sum_rescaling * 1.0 / nbin_fit < adc_sum_rescaling_limit) {
@@ -541,14 +562,6 @@ int L1SPFilter::L1_fit(std::shared_ptr<Aux::SimpleTrace>& newtrace,
     else if (temp2_sum > 30 * nbin_fit && temp1_sum < 2.0 * nbin_fit && max_val - min_val < 22) {
         flag_l1 = 2;
     }
-
-    // if (adctrace->channel() == 4079){
-    // std::cout << adctrace->channel() << " " << nbin_fit << " " << start_tick << " " << end_tick << " " << temp_sum <<
-    // " " << temp1_sum << " " << temp2_sum << " " << max_val << " " << min_val << " " << flag_l1 << std::endl;
-    // }
-
-    // std::cout << temp_sum << " " << temp1_sum << " " << temp_sum/(temp1_sum*adc_sum_rescaling*1.0/nbin_fit) << " " <<
-    // adc_ratio_threshold << " " << temp1_sum*adc_sum_rescaling*1.0/nbin_fit << " " << flag_l1 << std::endl;
 
     if (flag_l1 == 1) {
         // do L1 fit ...
@@ -564,7 +577,15 @@ int L1SPFilter::L1_fit(std::shared_ptr<Aux::SimpleTrace>& newtrace,
             int temp_nbin_fit = boundaries.at(i + 1) - boundaries.at(i);
             VectorXd W = VectorXd::Zero(temp_nbin_fit);
             for (int j = 0; j != temp_nbin_fit; j++) {
+                #if HAS_WARNING("-Wstringop-overread")
+                #pragma GCC diagnostic push
+                #pragma GCC diagnostic warning "-Wstringop-overread"
+                #pragma GCC diagnostic ignored "-Wstringop-overread"
+                #endif
                 W(j) = init_W(boundaries.at(i) + j);
+                #if HAS_WARNING("-Wstringop-overread")
+                #pragma GCC diagnostic pop
+                #endif
             }
 
             // for matrix G
@@ -612,7 +633,7 @@ int L1SPFilter::L1_fit(std::shared_ptr<Aux::SimpleTrace>& newtrace,
                 l1_signal.at(j) = final_beta(j) * l1_col_scale + final_beta(nbin_fit + j) * l1_ind_scale;
             }
             int mid_bin = (smearing_vec.size() - 1) / 2;
-            // std::cout << smearing_vec.size() << " " << mid_bin << std::endl;
+
             for (int j = 0; j != nbin_fit; j++) {
                 double content = l1_signal.at(j);
                 if (content > 0) {
@@ -676,14 +697,7 @@ int L1SPFilter::L1_fit(std::shared_ptr<Aux::SimpleTrace>& newtrace,
                             l1_signal.at(k) = 0;
                         }
                     }
-                    // std::cout << max_val << " " << mean_val1 << std::endl;
                 }
-
-                // std::cout << nonzero_bins.front() << " X " << nonzero_bins.back() << std::endl;
-                // std::cout << ROIs.size() << std::endl;
-                // for (size_t i=0;i!=ROIs.size();i++){
-                //   std::cout << ROIs.at(i).first << " " << ROIs.at(i).second << std::endl;
-                // }
 
                 // finish cleaning ...
             }

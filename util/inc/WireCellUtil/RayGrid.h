@@ -11,8 +11,8 @@
 
 #include "WireCellUtil/Point.h"
 #include "WireCellUtil/ObjectArray2d.h"
-
-#include <boost/multi_array.hpp>
+#include "WireCellUtil/MultiArray.h"
+#include "WireCellUtil/Spdlog.h"
 
 #include <vector>
 #include <map>
@@ -102,7 +102,7 @@ namespace WireCell {
 
             /// Number of layers
             int nlayers() const { return m_nlayers; }
-
+ 
             /// Return array of pitch magnitudes for the layers.
             const std::vector<double>& pitch_mags() const { return m_pitch_mag; }
 
@@ -165,7 +165,11 @@ namespace WireCell {
             return os;
         }
 
+
+
     }  // namespace RayGrid
 }  // namespace WireCell
+
+template <> struct fmt::formatter<WireCell::RayGrid::coordinate_t> : fmt::ostream_formatter {};
 
 #endif

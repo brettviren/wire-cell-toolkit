@@ -24,6 +24,7 @@
 
 #include "WireCellPgraph/Node.h"
 #include "WireCellUtil/Logging.h"
+#include "WireCellUtil/ExecMon.h"
 
 #include <vector>
 #include <unordered_set>
@@ -62,15 +63,21 @@ namespace WireCell {
             bool connected();
 
             // Print out cumulated CPU time for executing each node
-            void print_timers() const;
+            void print_timers(bool include_execmon=false) const;
+
+            //Turn on/off using ExecMon
+            void set_enable_em(bool flag=false);
 
            private:
             std::vector<std::pair<Node*, Node*> > m_edges;
-            std::unordered_set<Node*> m_nodes;
+            //std::unordered_set<Node*> m_nodes;
+            std::map<size_t, Node*> m_nodes;
             std::unordered_map<Node*, std::vector<Node*> > m_edges_forward, m_edges_backward;
             Log::logptr_t l;
             Log::logptr_t l_timer;
-            std::unordered_map<Node*, float> m_nodes_timer;
+            std::unordered_map<Node*, double> m_nodes_timer;
+            bool m_enable_em = false;
+            ExecMon m_em;
         };
     }  // namespace Pgraph
 }  // namespace WireCell

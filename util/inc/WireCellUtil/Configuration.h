@@ -1,6 +1,8 @@
 #ifndef WIRECELL_CONFIGURATION
 #define WIRECELL_CONFIGURATION
 
+#include "WireCellUtil/Spdlog.h"
+
 #include <json/json.h>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
@@ -137,7 +139,7 @@ namespace WireCell {
 
 
     /// Follow a dot.separated.path and return the branch there.
-    Configuration branch(Configuration cfg, const std::string& dotpath);
+    Configuration branch(const Configuration& cfg, const std::string& dotpath);
 
     /// Merge dictionary b into a, return a
     Configuration update(Configuration& a, Configuration& b);
@@ -148,9 +150,9 @@ namespace WireCell {
 
     /// Return dictionary in given list if it value at dotpath matches
     template <typename T>
-    Configuration find(Configuration& lst, const std::string& dotpath, const T& val)
+    Configuration find(const Configuration& lst, const std::string& dotpath, const T& val)
     {
-        for (auto ent : lst) {
+        for (const auto& ent : lst) {
             auto maybe = branch(ent, dotpath);
             if (maybe.isNull()) {
                 continue;
@@ -164,7 +166,7 @@ namespace WireCell {
 
     /// Get value in configuration at the dotted path from or return default.
     template <typename T>
-    T get(Configuration cfg, const std::string& dotpath, const T& def = T())
+    T get(const Configuration& cfg, const std::string& dotpath, const T& def = T())
     {
         return convert(branch(cfg, dotpath), def);
     }
@@ -209,6 +211,20 @@ namespace WireCell {
         assign(*ptr, val);
     }
 
+    /// Return a hash of the content of the config.
+    size_t hash(const Configuration& cfg);
+
 }  // namespace WireCell
+
+template <> struct fmt::formatter<WireCell::Configuration> : fmt::ostream_formatter {};
+
+namespace std {
+    template<>
+    struct hash< WireCell::Configuration > {
+        size_t operator()(const WireCell::Configuration& cfg) const {
+            return WireCell::hash(cfg);
+        }
+    };
+}
 
 #endif

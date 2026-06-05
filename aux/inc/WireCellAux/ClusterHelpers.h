@@ -6,12 +6,15 @@
 #define WIRECELLAUX_CLUSTERJSONIFY
 
 #include "WireCellUtil/Configuration.h"
+#include "WireCellUtil/GraphTools.h"
+#include "WireCellUtil/Graph.h"
+
 #include "WireCellIface/IFrame.h"
 #include "WireCellIface/ISlice.h"
 #include "WireCellIface/ICluster.h"
 #include "WireCellIface/IAnodePlane.h"
 
-#include <boost/graph/graphviz.hpp>
+
 #include <sstream>
 #include <functional>
 #include <unordered_set>
@@ -21,7 +24,8 @@
 
 namespace WireCell::Aux {
 
-    std::string dumps(const cluster_graph_t& cgraph);
+    // Dump a summary of a cluster graph.  If fingerprint, include more verbosity of channel-level info.
+    std::string dumps(const cluster_graph_t& cgraph, bool fingerprint=false);
 
     /// Return JSON representation of the cluster.
     Json::Value jsonify(const cluster_graph_t& cgraph);
@@ -142,6 +146,37 @@ namespace WireCell::Aux {
 
     /// Return counts indexed by node and/or edge code
     std::map<std::string, size_t> count(const cluster_graph_t& cgraph, bool nodes=true, bool edges=true);
+
+    /// function to merge  boost graph
+    template <typename GraphType>
+    GraphType merge_graphs(const std::vector<std::reference_wrapper<const GraphType>>& graphs)
+    {
+        GraphType merged_graph;
+        // merge the graphs
+        for (const auto& graphr : graphs) {
+            const auto& graph = graphr.get();
+            std::unordered_map<size_t, size_t> vertex_map;
+            // add the vertices
+            for (const auto& vtx : GraphTools::mir(boost::vertices(graph))) {
+                const auto& node = graph[vtx];
+                auto new_vtx = boost::add_vertex(node, merged_graph);
+                vertex_map[vtx] = new_vtx;
+            }
+            // add the edges
+            for (const auto& edg : GraphTools::mir(boost::edges(graph))) {
+                const auto& src = boost::source(edg, graph);
+                const auto& tgt = boost::target(edg, graph);
+                const auto& edge = graph[edg];
+                auto new_src = vertex_map[src];
+                auto new_tgt = vertex_map[tgt];
+                boost::add_edge(new_src, new_tgt, edge, merged_graph);
+            }
+        }
+        return merged_graph;
+    }
+
+    /// @brief return connected blobs as "WCP Clusters". Original Projection2D::get_geom_clusters
+    std::unordered_map<int, std::set<cluster_vertex_t> > blob_clusters(const cluster_graph_t& cg);
 }
 
 #endif

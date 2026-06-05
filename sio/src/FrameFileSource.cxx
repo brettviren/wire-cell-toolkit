@@ -42,6 +42,10 @@ WireCell::Configuration FrameFileSource::default_configuration() const
 
     cfg["frame_tags"] = Json::arrayValue;
 
+    // Optional override of the per-frame sampling period.  0 means use
+    // the period stored in the input file.
+    cfg["tick"] = m_tick;
+
     return cfg;
 }
 
@@ -52,29 +56,42 @@ void FrameFileSource::configure(const WireCell::Configuration& cfg)
     m_in.clear();
     input_filters(m_in, m_inname);
     if (m_in.size() < 1) {
-        THROW(ValueError() << errmsg{"FrameFileSource: unsupported inname: " + m_inname});
+        raise<ValueError>("FrameFileSource: unsupported inname: %s", m_inname);
     }
 
     m_tags.clear();
     for (auto jtag : cfg["tags"]) {
         m_tags.push_back(jtag.asString());
     }
-    if (m_tags.empty()) {
-        m_tags.push_back("*");
-    }
 
     m_frame_tags.clear();
     for (auto jtag : cfg["frame_tags"]) {
         m_frame_tags.push_back(jtag.asString());
     }
+
+    m_tick = get(cfg, "tick", m_tick);
 }
 
-bool FrameFileSource::matches(const std::string& tag)
+bool FrameFileSource::is_excluded(const std::string& tag)
 {
+    if (is_tagged(tag)) return false;
+    if (is_untagged(tag)) return false;
+    return true;
+}
+
+bool FrameFileSource::is_untagged(const std::string& tag)
+{
+    return tag.empty() or tag == "*";
+}
+
+bool FrameFileSource::is_tagged(const std::string& tag)
+{
+    if (is_untagged(tag)) {
+        // avoid misinterpreting "" or "*" in m_tags
+        return false;
+    }
+
     for (const auto& maybe : m_tags) {
-        if (maybe == "*") {
-            return true;
-        }
         if (maybe == tag) {
             return true;
         }
@@ -96,16 +113,23 @@ bool FrameFileSource::read()
         return false;
     }
     auto parts = split(m_cur.fname, "_");
-    if (parts.size() != 3) {
+    if (parts.size() < 3) {
         // log->warn("read parse file name failed got {} parts from {}", parts.size(), m_cur.fname);
         return false;
     }
-    auto rparts = split(parts[2], ".");
+    // Filename format: <type>_<tag>_<ident>.<ext>.  The tag may itself contain
+    // underscores (e.g. "lf_noisy"), so any extra middle parts join into the tag.
+    auto rparts = split(parts.back(), ".");
     m_cur.ident = std::atoi(rparts[0].c_str());
     m_cur.okay = true;
     m_cur.type = parts[0];
     m_cur.tag = parts[1];
+    for (size_t i = 2; i + 1 < parts.size(); ++i) {
+        m_cur.tag += "_" + parts[i];
+    }
     m_cur.ext = rparts[1];
+    log->debug("read type={} tag={} ident={} ext={} at call={}",
+               m_cur.type, m_cur.tag, m_cur.ident, m_cur.ext, m_count);
     return true;
 }
 
@@ -140,6 +164,8 @@ IFrame::pointer FrameFileSource::load()
     ChannelMaskMap cmm;
 
     while (true) {
+
+        // Loop over arrays, falling through until we recognize the array type.
 
         // fixme: throw on errors but return nullptr on EOF.
 
@@ -205,9 +231,8 @@ IFrame::pointer FrameFileSource::load()
             continue;
         }
     
-
-        if (! matches(m_cur.tag)) {
-            log->trace("call={}, skipping unmatched tag=\"{}\" file={}",
+        if (is_excluded(m_cur.tag)) {
+            log->debug("call={}, skipping tag=\"{}\" file={}",
                        m_count, m_cur.tag, m_inname);
             clear();
             continue;
@@ -316,11 +341,12 @@ IFrame::pointer FrameFileSource::load()
             auto itrace = std::make_shared<Aux::SimpleTrace>(chid, tbin0, charges);
             all_traces.push_back(itrace);
         }
-        log->trace("call={}, add {} traces to total {}", m_count, nrows, all_traces.size());
+        log->trace("call={}, add {} traces from \"{}\" to total {}",
+                   m_count, nrows, framelet.tag, all_traces.size());
     }
 
     const double time = framelets[0].tickinfo[0];
-    const double tick = framelets[0].tickinfo[1];
+    const double tick = m_tick > 0.0 ? m_tick : framelets[0].tickinfo[1];
 
     auto sframe = std::make_shared<Aux::SimpleFrame>(ident, time, all_traces, tick, cmm);
     for (auto ftag : m_frame_tags) {
@@ -329,19 +355,25 @@ IFrame::pointer FrameFileSource::load()
 
     // Tag traces of each framelet
     size_t last_index=0;
-    for (const auto& tag : m_tags) {
-        auto& framelet = get_framelet(tag);
+    for (auto& framelet : framelets) {
         const size_t size = framelet.channels.size();
+
+        if (is_untagged(framelet.tag)) {
+            log->trace("call={}, {} untagged with (\"{}\")", m_count, size, framelet.tag);
+            last_index += size;
+            continue;
+        }
+
         std::vector<size_t> inds(size);
         std::iota(inds.begin(), inds.end(), last_index);
         last_index += size;
         if (framelet.summary.empty()) {
-            sframe->tag_traces(tag, inds);
+            sframe->tag_traces(framelet.tag, inds);
         }
         else {
-            sframe->tag_traces(tag, inds, framelet.summary);
+            sframe->tag_traces(framelet.tag, inds, framelet.summary);
         }
-        log->trace("call={}, tag {} traces with \"{}\"", m_count, size, tag);
+        log->trace("call={}, tag {} traces with \"{}\"", m_count, size, framelet.tag);
     }        
 
     log->trace("call={}, loaded frame with {} tags, {} traces",
@@ -363,13 +395,7 @@ bool FrameFileSource::operator()(IFrame::pointer& frame)
         return false;
     }
 
-    try {
-        frame = load();
-    }
-    catch (IOError& err) {
-        log->error("call={}: {}", m_count++, err.what());
-        return false;
-    }
+    frame = load();             // throws
 
     if (frame) {
         log->debug("call={} load frame: {}", m_count++, Aux::taginfo(frame));

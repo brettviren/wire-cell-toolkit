@@ -70,10 +70,11 @@ bats_load_library wct-bats.sh
 }
 
 @test "wcb env" {
-    [[ -z "$PREFIX" ]]
-    local prefix=$(wcb_env_value PREFIX)
-    [[ -z "$(echo $prefix | grep '"')" ]]
-    [[ -z "$PREFIX" ]]
+    # disable this as it has become common to define PREFIX in direnv
+    # [[ -z "$PREFIX" ]]
+    # local prefix=$(wcb_env_value PREFIX)
+    # [[ -z "$(echo $prefix | grep '"')" ]]
+    # [[ -z "$PREFIX" ]]
 
     # only one var
     check wcb_env_vars VERSION
@@ -98,13 +99,14 @@ bats_load_library wct-bats.sh
 
 }
 
-@test "wcb env in temp dir" {
-    cd_tmp
-    [[ -z "$PREFIX" ]]
-    local prefix=$(wcb_env_value PREFIX)
-    [[ -z "$(echo $prefix | grep '"')" ]]
-    [[ -z "$PREFIX" ]]
-}
+    # disable this as it has become common to define PREFIX in direnv
+# @test "wcb env in temp dir" {
+#     cd_tmp
+#     [[ -z "$PREFIX" ]]
+#     local prefix=$(wcb_env_value PREFIX)
+#     [[ -z "$(echo $prefix | grep '"')" ]]
+#     [[ -z "$PREFIX" ]]
+# }
 
 
 @test "have a test data file or skip" {
@@ -195,16 +197,16 @@ bats_load_library wct-bats.sh
         touch $dir/junk.txt
     done
 
-    declare -a got=( $(find_category_version_paths -c testing) )
+    declare -a got=( $(category_version_paths -c testing) )
     [[ ${#got[@]} -eq 1 ]]
     [[ ${got[0]} = "$test_data/testing/$release" ]]
 
-    got=( $(find_category_version_paths -c testing -d) )
+    got=( $(category_version_paths -c testing -d) )
     [[ ${#got[@]} -eq 2 ]]
     [[ ${got[0]} = "$test_data/testing/$release" ]]
     [[ ${got[1]} = "$test_data/testing/$dirty" ]]
 
-    got=( $(find_category_version_paths -c testing -d) )
+    got=( $(category_version_paths -c testing -d) )
     [[ ${#got[@]} -eq 2 ]]
     [[ ${got[0]} = "$test_data/testing/$release" ]]
     [[ ${got[1]} = "$test_data/testing/$dirty" ]]

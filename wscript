@@ -7,39 +7,115 @@
 # according to the LICENSE file provided as also part of this project.
 
 import os
+import sys
+import subprocess
 
 # fixme: move into waft/
-from waflib.Build import BuildContext
-from waflib.Logs import debug, info, error, warn
-import waflib.Utils
+from waflib.Logs import debug, info
 
 TOP = '.'
 APPNAME = 'WireCell'
-VERSION = os.popen("git describe --tags").read().strip()
+
+def determine_version():
+    '''
+    Determine the version of the source to bake into the build.
+    '''
+
+    # If in a git clone, git wins
+    proc = subprocess.run(["git", "describe", "--tags"], capture_output=True)
+
+    # Otherwise, we may be in a release archive.
+    if proc.returncode:
+        if os.path.exists("version.txt"):
+            return open("version.txt", "r").readlines()[0].strip()
+        raise FileNotFoundError("Wire-Cell Toolkit must either be built from a git clone or a version.txt must be provided in the source distribution")
+
+    version = proc.stdout.decode().strip()
+    proc = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True)
+    branch = proc.stdout.decode().strip()
+
+    # Check if in master or a release branch.
+    if branch == "master" or branch[0].isdecimal():
+        return version
+
+    # Feature branches get special marking
+    return f'{branch}-{version}'
+
+VERSION = determine_version()
+
+
+# Valid log level identifiers
+log_levels = "trace debug info warn error critical off "
+log_levels = (log_levels + log_levels.upper()).split()
 
 # to avoid adding tooldir="waft" in all the load()'s
-import os
-import sys
 sys.path.insert(0, os.path.realpath("./waft"))
 
 def options(opt):
     opt.load("wcb")
+    opt.load("clang_compilation_database")
 
     # this used in cfg/wscript_build
     opt.add_option('--install-config', type=str, default="",
                    help="Install configuration files for given experiment")
 
+    opt.add_option('--build-mode', type=str, default="",
+                   help="Force the build mode (default, detect based on git branch)")
+
     # fixme: add to spdlog entry in wcb.py
     opt.add_option('--with-spdlog-static', type=str, default="yes",
                    help="Def is true, set to false if your spdlog is not compiled (not recomended)")
+    opt.add_option('--with-spdlog-active-level',
+                   default = "trace",
+                   choices = log_levels,
+                   help="The compiled minimum log level for SPDLOG_<LEVEL>() macros (def=trace)")
+
+    opt.add_option('--cxxstd', default='c++17',
+                   help="Set the value for the compiler's --std= option, default 'c++17'")
+    
+
+
+def is_development():
+    '''
+    Return True if we are sitting on a "development" branch.
+
+    A "development" branch is any that is not master or a numerical release
+    branch.
+    '''
+    if VERSION == "master" or VERSION[0].isdecimal():
+        return False
+    return True
+
 
 def configure(cfg):
+
     # Save to BuildConfig.h and env
     cfg.define("WIRECELL_VERSION", VERSION)
     cfg.env.VERSION = VERSION
 
+    # see waft/wcb.py for how this is consumed.
+    cfg.env.IS_DEVELOPMENT = is_development()
+    if cfg.env.IS_DEVELOPMENT:
+        info(f"configuring for DEVELOPMENT ({VERSION})")
+        cfg.define("WIRECELL_DEVELOPMENT", VERSION)
+    else:
+        info(f"configuring for RELEASE ({VERSION})")
+        cfg.define("WIRECELL_RELEASE", VERSION)
+
+    # See https://github.com/WireCell/wire-cell-toolkit/issues/337
+    if not cfg.options.libdir and cfg.env.LIBDIR.endswith("lib64"):
+        cfg.env.LIBDIR = cfg.env.LIBDIR[:-2]
+        debug(f'configure: forcing: {cfg.env.LIBDIR=} instead of lib64/, use explicit --libdir if you really want it')
+    
+
+    # Set to DEBUG to activate SPDLOG_DEBUG() macros or TRACE to activate both
+    # those and SPDLOG_TRACE() levels.
+    lu = cfg.options.with_spdlog_active_level.upper()
+    cfg.define("SPDLOG_ACTIVE_LEVEL", 'SPDLOG_LEVEL_' + lu, quote=False)
+
     # See comments at top of Exceptions.h for context.
     cfg.load('compiler_cxx')
+    cfg.load('clang_compilation_database')
     cfg.check_cxx(lib='backtrace', use='backtrace',
                   uselib_store='BACKTRACE',
                  define_name = 'HAVE_BACKTRACE_LIB',
@@ -60,12 +136,13 @@ int main(int argc,const char *argv[])
                   mandatory=False)
 
 
-    # boost 1.59 uses auto_ptr and GCC 5 deprecates it vociferously.
-    cfg.env.CXXFLAGS += ['-Wno-deprecated-declarations']
-    cfg.env.CXXFLAGS += ['-Wall', '-Wno-unused-local-typedefs', '-Wno-unused-function']
     # cfg.env.CXXFLAGS += ['-Wpedantic', '-Werror']
-    cfg.env.CXXFLAGS += ['-std=c++17']
+    cfg.env.CXXFLAGS += ['-std='+cfg.options.cxxstd.lower()]
     
+    cfg.env.CXXFLAGS += ['-std=c++17']
+    cfg.env.CXXFLAGS += ['-DEIGEN_HAS_CXX11']
+
+
     if cfg.options.with_spdlog_static.lower() in ("yes","on","true"):
         cfg.env.CXXFLAGS += ['-DSPDLOG_COMPILED_LIB=1']
 
@@ -80,10 +157,16 @@ int main(int argc,const char *argv[])
 
 
 def build(bld):
+    ### we used to be set sloppiness globally.  Now we use #pragma to
+    ### selectively quell warnings.  See util/docs/pragma.org for some info.
+    bld.env.CXXFLAGS += '-Wall -Wpedantic'.split()
+
     bld.load('wcb')
 
+    
 def dumpenv(bld):
     bld.load('wcb')
+
 
 def packrepo(bld):
     bld.load('wcb')

@@ -21,10 +21,6 @@ using WireCell::Aux::SimpleFrame;
 
 Gen::Reframer::Reframer()
     : Aux::Logger("Reframer", "gen")
-  , m_toffset(0.0)
-  , m_fill(0.0)
-  , m_tbin(0)
-  , m_nticks(0)
 {
 }
 
@@ -39,11 +35,12 @@ WireCell::Configuration Gen::Reframer::default_configuration() const
     // tags to find input traces/frames
     cfg["tags"] = Json::arrayValue;
     // tag to apply to output frame
-    cfg["frame_tag"] = "";
+    cfg["frame_tag"] = m_frame_tag;
     cfg["tbin"] = m_tbin;
     cfg["nticks"] = m_nticks;
     cfg["toffset"] = m_toffset;
     cfg["fill"] = m_fill;
+    cfg["ignore_tags"] = m_ignore_tags;
 
     return cfg;
 }
@@ -58,17 +55,25 @@ void Gen::Reframer::configure(const WireCell::Configuration& cfg)
     for (auto jtag : cfg["tags"]) {
         m_input_tags.push_back(jtag.asString());
     }
-    m_frame_tag = get<std::string>(cfg, "frame_tag", "");
+    m_frame_tag = get<std::string>(cfg, "frame_tag", m_frame_tag);
     m_toffset = get(cfg, "toffset", m_toffset);
     m_tbin = get(cfg, "tbin", m_tbin);
     m_fill = get(cfg, "fill", m_fill);
     m_nticks = get(cfg, "nticks", m_nticks);
+    m_ignore_tags = get(cfg, "ignore_tags", m_ignore_tags);
+    if ( m_ignore_tags && m_input_tags.size() ) {
+        raise<ValueError>("providing and ignoring tags is not consistent");
+    }
 }
 
 std::pair<ITrace::vector, IFrame::trace_summary_t> Gen::Reframer::process_one(const ITrace::vector& itraces, const IFrame::trace_summary_t& isummary) {
-    if(isummary.size() !=0 && itraces.size() != isummary.size()) {
-        log->error("itraces.size() != isummary.size()");
-        THROW(RuntimeError() << errmsg{"itraces.size() != isummary.size()"});
+    if(isummary.size() != 0 && isummary.size() < itraces.size()) {
+        log->error("isummary.size()={} < itraces.size()={}", isummary.size(), itraces.size());
+        THROW(RuntimeError() << errmsg{"isummary.size() < itraces.size()"});
+    }
+    if(isummary.size() != 0 && isummary.size() != itraces.size()) {
+        log->warn("isummary.size()={} != itraces.size()={}, using first {} summary values",
+                  isummary.size(), itraces.size(), itraces.size());
     }
     // Storage for samples indexed by channel ident.
     std::map<int, std::vector<float> > waves;
@@ -143,18 +148,33 @@ bool Gen::Reframer::operator()(const input_pointer& inframe, output_pointer& out
         return true;
     }
 
+    log->debug("input : {}", Aux::taginfo(inframe, 1));
+
     // Get traces to consider
     ITrace::vector out_traces;
     std::unordered_map< std::string, IFrame::trace_list_t> tag_indicies;
     std::unordered_map< std::string, IFrame::trace_summary_t> tag_summary;
 
     if (m_input_tags.empty()) {
+        auto ttags = inframe->trace_tags();
+        if (! ttags.empty()) {
+            std::stringstream ss;
+            for (const auto& tag : ttags) {
+                ss << " " << tag;
+            }
+            if (! m_ignore_tags) {
+                log->warn("will combine traces from {} trace tags in frame:{}", ttags.size(), ss.str());
+            }
+        }
+        log->debug("reframing monolithic frame");
         out_traces = process_one(*(inframe->traces()));
     }
     else {
-        for (const auto tag : m_input_tags) {
+        for (const auto& tag : m_input_tags) {
             const auto& isummary = inframe->trace_summary(tag);
             ITrace::vector in_traces = Aux::tagged_traces(inframe, tag);
+            log->debug("reframing tag {} with {} traces", tag, in_traces.size());
+
             auto [out_one, threshold] = process_one(in_traces, isummary);
             tag_summary[tag] = threshold;
             size_t nbeg = out_traces.size();
@@ -171,15 +191,13 @@ bool Gen::Reframer::operator()(const input_pointer& inframe, output_pointer& out
         sframe->tag_frame(m_frame_tag);
     }
 
-    for (const auto tag : m_input_tags) {
+    for (const auto& tag : m_input_tags) {
         sframe->tag_traces(tag, tag_indicies.at(tag), tag_summary[tag]);
     }
 
     outframe = sframe;
 
-    log->debug("input : {}", Aux::taginfo(inframe));
-    log->debug("output: {}", Aux::taginfo(outframe));
-
+    log->debug("output: {}", Aux::taginfo(outframe, 1));
     ++m_count;
     return true;
 }

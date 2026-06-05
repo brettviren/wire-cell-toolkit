@@ -12,6 +12,8 @@
 #include "WireCellIface/IApplication.h"
 #include "WireCellIface/IBlob.h"
 #include "WireCellIface/IBlobDepoFill.h"
+#include "WireCellIface/IBlobSampler.h"
+#include "WireCellIface/IBlobSampling.h"
 #include "WireCellIface/IBlobSet.h"
 #include "WireCellIface/IBlobSetFanin.h"
 #include "WireCellIface/IBlobSetFanout.h"
@@ -22,6 +24,7 @@
 #include "WireCellIface/IChannelSpectrum.h"
 #include "WireCellIface/IChannelStatus.h"
 #include "WireCellIface/IClusterFanin.h"
+#include "WireCellIface/IClusterFaninTensorSet.h"
 #include "WireCellIface/IClusterFanout.h"
 #include "WireCellIface/IClusterFilter.h"
 #include "WireCellIface/IClusterFramer.h"
@@ -36,6 +39,7 @@
 #include "WireCellIface/IDepoFilter.h"
 #include "WireCellIface/IDepoFramer.h"
 #include "WireCellIface/IDepoMerger.h"
+#include "WireCellIface/IDepos2DeposOrFrame.h"
 #include "WireCellIface/IDepoSet.h"
 #include "WireCellIface/IDepoSetFanin.h"
 #include "WireCellIface/IDepoSetFanout.h"
@@ -57,6 +61,7 @@
 #include "WireCellIface/IFrameFanout.h"
 #include "WireCellIface/IFrameFilter.h"
 #include "WireCellIface/IFrameJoiner.h"
+#include "WireCellIface/IFrameMerge.h"
 #include "WireCellIface/IFrameSink.h"
 #include "WireCellIface/IFrameSlicer.h"
 #include "WireCellIface/IFrameSlices.h"
@@ -90,6 +95,7 @@
 #include "WireCellIface/IStripeSet.h"
 #include "WireCellIface/ITensorForward.h"
 #include "WireCellIface/ITensorPacker.h"
+#include "WireCellIface/ITensorSetFanin.h"
 #include "WireCellIface/ITensorSetFilter.h"
 #include "WireCellIface/ITensorSetUnpacker.h"
 #include "WireCellIface/ITerminal.h"
@@ -104,6 +110,7 @@
 #include "WireCellIface/IWireSource.h"
 #include "WireCellIface/IWireSummarizer.h"
 #include "WireCellIface/IWireSummary.h"
+#include "WireCellIface/IYZMap.h"
 
 using namespace WireCell;
 
@@ -112,6 +119,8 @@ IAnodePlane::~IAnodePlane() {}
 IApplication::~IApplication() {}
 IBlob::~IBlob() {}
 IBlobDepoFill::~IBlobDepoFill() {}
+IBlobSampler::~IBlobSampler() {}
+IBlobSampling::~IBlobSampling() {}
 IBlobSet::~IBlobSet() {}
 IBlobSetFanin::~IBlobSetFanin() {}
 IBlobSetFanout::~IBlobSetFanout() {}
@@ -122,6 +131,7 @@ IChannelResponse::~IChannelResponse() {}
 IChannelSpectrum::~IChannelSpectrum() {}
 IChannelStatus::~IChannelStatus() {}
 IClusterFanin::~IClusterFanin() {}
+IClusterFaninTensorSet::~IClusterFaninTensorSet() {}
 IClusterFanout::~IClusterFanout() {}
 IClusterFilter::~IClusterFilter() {}
 IClusterFramer::~IClusterFramer() {}
@@ -136,6 +146,7 @@ IDepoFanout::~IDepoFanout() {}
 IDepoFilter::~IDepoFilter() {}
 IDepoFramer::~IDepoFramer() {}
 IDepoMerger::~IDepoMerger() {}
+IDepos2DeposOrFrame::~IDepos2DeposOrFrame() {}
 IDepoSet::~IDepoSet() {}
 IDepoSetFanin::~IDepoSetFanin() {}
 IDepoSetFanout::~IDepoSetFanout() {}
@@ -157,6 +168,7 @@ IFrameFanin::~IFrameFanin() {}
 IFrameFanout::~IFrameFanout() {}
 IFrameFilter::~IFrameFilter() {}
 IFrameJoiner::~IFrameJoiner() {}
+IFrameMerge::~IFrameMerge() {}
 IFrameSink::~IFrameSink() {}
 IFrameSlicer::~IFrameSlicer() {}
 IFrameSlices::~IFrameSlices() {}
@@ -189,6 +201,7 @@ IStripe::~IStripe() {}
 IStripeSet::~IStripeSet() {}
 ITensorForward::~ITensorForward() {}
 ITensorPacker::~ITensorPacker() {}
+ITensorSetFanin::~ITensorSetFanin() {}
 ITensorSetFilter::~ITensorSetFilter() {}
 ITensorSetUnpacker::~ITensorSetUnpacker() {}
 ITerminal::~ITerminal() {}
@@ -203,4 +216,5 @@ IWireSchema::~IWireSchema() {}
 IWireSource::~IWireSource() {}
 IWireSummarizer::~IWireSummarizer() {}
 IWireSummary::~IWireSummary() {}
+IYZMap::~IYZMap() {}
 

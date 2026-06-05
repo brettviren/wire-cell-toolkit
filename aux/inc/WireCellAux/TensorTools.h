@@ -4,10 +4,8 @@
 #include "WireCellIface/ITensorSet.h"
 #include "WireCellIface/IDFT.h"
 #include "WireCellUtil/Exceptions.h"
-#include "WireCellUtil/PointCloud.h"
 
-
-#include <Eigen/Core>
+#include "WireCellUtil/Eigen.h"
 #include <complex>
 
 namespace WireCell::Aux {

@@ -16,12 +16,12 @@ local input = std.extVar('input');
 //     process_crm: 'test1',
 // };
 local fcl_params = {
-    response_plane: 18.92*wc.cm,
+    response_plane: 18.1*wc.cm, // synced to protodunevd
     nticks: 8500,
     wires: 'dunevd10kt_3view_30deg_v5_refactored_1x8x6ref.json.bz2',
     ncrm: 24,
     use_dnnroi: false,
-    process_crm: 'test1',
+    process_crm: 'test1', //'full', 'test1'
 };
 local params_maker =
 if fcl_params.ncrm ==320 then import 'pgrapher/experiment/dune-vd/params-10kt.jsonnet'
@@ -40,8 +40,8 @@ local params = params_maker(fcl_params) {
   },
   files: super.files {
       wires: fcl_params.wires,
-      fields: [ 'dunevd-resp-isoc3views-18d92.json.bz2', ],
-      noise: 'dunevd10kt-1x6x6-3view-noise-spectra-v1.json.bz2',
+      fields: [ 'protodunevd_FR_imbalance3p_260501.json.bz2', ], // synced to protodunevd
+      noise: 'pdvd-top-noise-spectra-v3.json.bz2',               // synced to protodunevd
   },
 };
 
@@ -50,7 +50,7 @@ local tools =
 if fcl_params.process_crm == "partial"
 then tools_all {anodes: [tools_all.anodes[n] for n in std.range(32, 79)]}
 else if fcl_params.process_crm == "test1"
-then tools_all {anodes: [tools_all.anodes[n] for n in [0,1,4,5]]}
+then tools_all {anodes: [tools_all.anodes[n] for n in [5,8,9,12,13,16,20]]}
 else if fcl_params.process_crm == "test2"
 then tools_all {anodes: [tools_all.anodes[n] for n in std.range(0, 7)]}
 else tools_all;
@@ -99,7 +99,23 @@ local reframers_sp = [
 
 local img = import 'pgrapher/experiment/dune-vd/img.jsonnet';
 local img_maker = img();
-local img_pipes = [img_maker.per_anode(a) for a in tools.anodes];
+local img_pipes = [img_maker.per_anode(a, "multi-3view", add_dump = false) for a in tools.anodes];
+
+local clus = import 'pgrapher/experiment/dune-vd/clus.jsonnet';
+local clus_maker = clus();
+// local clus_pipes = [clus_maker.per_volume(tools.anodes[0], face=0, dump=true), clus_maker.per_volume(tools.anodes[1], face=1, dump=true)];
+local clus_pipes = [clus_maker.per_face(tools.anodes[n], face=0, dump=true) for n in std.range(0, std.length(tools.anodes) - 1)];
+
+local img_clus_pipe = [g.intern(
+    innodes = [img_pipes[n]],
+    centernodes = [],
+    outnodes = [clus_pipes[n]],
+    edges = [
+        g.edge(img_pipes[n], clus_pipes[n], p, p)
+        for p in std.range(0, 1)
+    ]
+)
+for n in std.range(0, std.length(tools.anodes) - 1)];
 
 local magoutput = 'mag-sim-sp.root';
 local magnify = import 'pgrapher/experiment/dune-vd/magnify-sinks.jsonnet';
@@ -148,7 +164,7 @@ local parallel_pipes = [
                 // sinks.decon_pipe[n],
                 // sinks.debug_pipe[n], // use_roi_debug_mode=true in sp.jsonnet
                 // g.pnode({type: "DumpFrames", name: "dumpframes-%d"%tools.anodes[n].data.ident}, nin = 1, nout=0)
-                img_pipes[n],
+                img_clus_pipe[n],
           ], 
           'parallel_pipe_%d' % n) 
   for n in std.range(0, std.length(tools.anodes) - 1)];
@@ -164,14 +180,47 @@ local tag_rules = {
         + {['dnnsp%d' % anode.data.ident]: ['dnnsp%d' % anode.data.ident] for anode in tools.anodes},
 };
 
+local make_switch_pipe = function(d2f, anode ) {
+    local ds_filter = g.pnode({
+        type: "DepoSetFilter",
+        name: "ds-filter-switch-%d" % anode.data.ident,
+        data: {anode: wc.tn(anode)},
+        }, nin=1, nout=1, uses=[anode]),
+    local dorb = g.pnode({
+        type: "DeposOrBust",
+        name: "dorb-switch-%d" % anode.data.ident,
+        }, nin=1, nout=2),
+    local frame_sync = g.pnode({
+        type: "FrameSync",
+        name: "frame-sync-switch-%d" % anode.data.ident,
+        }, nin=2, nout=1),
+    ret1: g.intern(
+        innodes=[ds_filter],
+        outnodes=[frame_sync],
+        centernodes=[dorb, d2f],
+        edges=
+            [g.edge(ds_filter, dorb, 0, 0),
+            g.edge(dorb, d2f, 0, 0),
+            g.edge(d2f, frame_sync, 0, 0),
+            g.edge(dorb, frame_sync, 1, 1)]),
+    ret2: g.pipeline([ds_filter, d2f]),
+}.ret1;
+
+local switch_pipes = [
+    g.pipeline([make_switch_pipe(parallel_pipes[n], tools.anodes[n]), img_clus_pipe[n]])
+    for n in std.range(0, std.length(tools.anodes) - 1)
+];
+
 // local parallel_graph = f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1,4], [4,1], [1,4], [4,1], 'sn_mag', outtags, tag_rules);
 local parallel_graph = 
 if fcl_params.process_crm == "test1"
 // then f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1,4], [4,1], [1,4], [4,1], 'sn_mag', outtags, tag_rules)
-then f.multifanout('DepoSetFanout', parallel_pipes, [1,4], [4,1], 'sn_mag', tag_rules)
+then f.multifanout('DepoSetFanout', parallel_pipes, [1,7], [7,1], 'sn_mag', tag_rules)
 else if fcl_params.process_crm == "test2"
 then f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1,8], [8,1], [1,8], [8,1], 'sn_mag', outtags, tag_rules)
-else f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1,2,8,32], [2,4,4,10], [1,2,8,32], [2,4,4,10], 'sn_mag', outtags, tag_rules);
+// else f.multifanout('DepoSetFanout', switch_pipes, [1,4], [4,6], 'sn_mag', tag_rules);
+else f.multifanout('DepoSetFanout', parallel_pipes, [1,4], [4,6], 'sn_mag', tag_rules);
+// else f.multifanpipe('DepoSetFanout', parallel_pipes, 'FrameFanin', [1,2,8,32], [2,4,4,10], [1,2,8,32], [2,4,4,10], 'sn_mag', outtags, tag_rules);
 
 
 // Only one sink ////////////////////////////////////////////////////////////////////////////
@@ -182,6 +231,7 @@ local sink = sim.frame_sink;
 
 // Final pipeline //////////////////////////////////////////////////////////////////////////////
 local graph = g.pipeline([depo_source, setdrifter, parallel_graph], "main"); // no Fanin
+// local graph = g.pipeline([depo_source, setdrifter, parallel_pipes[0]], "main"); // no Fanin
 // local graph = g.pipeline([depo_source, setdrifter, parallel_graph, sink], "main"); // ending with Fanin
 
 local app = {
@@ -194,7 +244,7 @@ local app = {
 local cmdline = {
     type: "wire-cell",
     data: {
-        plugins: ["WireCellGen", "WireCellPgraph", "WireCellSio", "WireCellSigProc", "WireCellImg", "WireCellRoot", "WireCellTbb"/*, "WireCellCuda"*/],
+        plugins: ["WireCellGen", "WireCellPgraph", "WireCellSio", "WireCellSigProc", "WireCellImg", "WireCellRoot", "WireCellTbb", "WireCellClus"],
         apps: ["TbbFlow"]
     }
 };

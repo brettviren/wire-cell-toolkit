@@ -56,7 +56,8 @@ namespace WireCell {
                            int plane,
                            const std::vector<float>& perwire_rmses,
                            IFrame::trace_summary_t& threshold,
-                           const std::string& loglabel);
+                           const std::string& loglabel,
+                           const bool save_negative_charge = false);
 
             // save ROI into the out frame (set use_roi_debug_mode=true)
             void save_roi(ITrace::vector& itraces, IFrame::trace_list_t& indices, int plane,
@@ -65,7 +66,7 @@ namespace WireCell {
             // save Multi-Plane ROI into the out frame (set use_roi_debug_mode=true)
             // mp_rois: osp-chid, start -> start, end
             void save_mproi(ITrace::vector& itraces, IFrame::trace_list_t& indices, int plane,
-                            std::multimap<std::pair<int, int>, std::pair<int, int> > mp_rois);
+                            const std::multimap<std::pair<int, int>, std::pair<int, int> > &mp_rois);
 
             void save_ext_roi(ITrace::vector& itraces, IFrame::trace_list_t& indices, int plane,
                               std::vector<std::list<SignalROI*> >& roi_channel_list);
@@ -74,7 +75,7 @@ namespace WireCell {
             void init_overall_response(IFrame::pointer frame);
 
             void restore_baseline(WireCell::Array::array_xxf& arr);
-	    void rebase_waveform(WireCell::Array::array_xxf& arr, const int& nbins);
+	    void rebase_waveform(Eigen::Ref<Array::array_xxf> arr, const int& nbins);
             // This little struct is used to map between WCT channel idents
             // and internal OmnibusSigProc wire/channel numbers.  See
             // m_channel_map and m_channel_range below.
@@ -95,6 +96,10 @@ namespace WireCell {
 
             // find if neighbor channels hare masked.
             bool masked_neighbors(const std::string& cmname, OspChan& ochan, int nnn);
+
+            //Unpad the data
+            void unpad_data(int plane);
+            void pad_data(int plane);
 
             // Anode plane for geometry
             std::string m_anode_tn{"AnodePlane"};
@@ -153,8 +158,28 @@ namespace WireCell {
             double m_r_sigma{2.0};
             double m_r_th_percent{0.1};
 
+            // Filter names
+            std::string m_ROI_tight_lf_filter{"ROI_tight_lf"};
+            std::string m_ROI_tighter_lf_filter{"ROI_tighter_lf"};
+            std::string m_ROI_loose_lf_filter{"ROI_loose_lf"};
+            
+            std::string m_Gaus_wide_filter{"Gaus_wide"};
+            
+            std::vector<std::string> m_Wiener_tight_filters{"Wiener_tight_U", "Wiener_tight_V", "Wiener_tight_W"};
+            std::vector<std::string> m_Wiener_wide_filters{"Wiener_wide_U", "Wiener_wide_V", "Wiener_wide_W"};
+            std::vector<std::string> m_Wire_filters{"Wire_ind", "Wire_ind", "Wire_col"};
+
             // specify the planes to process
             std::vector<int> m_process_planes{0,1,2};
+
+            // Assign different layer indices for U/V/W planes (default 0,1,2)
+            // Fixme: it's a temporary solution for the collective V plane in PDHD, see:
+            // https://github.com/WireCell/wire-cell-toolkit/issues/322
+            std::vector<int> m_plane2layer{0,1,2};
+
+            // MP threshold feature_val method, 0: ThreePointCheck, 1: MaxPointCheck
+            int m_MP_feature_val_method{0};
+
 
             // fixme: this is apparently not used:
             // channel offset
@@ -195,17 +220,29 @@ namespace WireCell {
             Array::array_xxf m_r_data[3];
             Array::array_xxc m_c_data[3];
 
+            // Pre-Wire-filter, pre-ROI deconvolved waveform per plane.
+            // Populated by decon_2D_init() only when m_rawdecon_tag is set.
+            // Special debug-mode tap for offline filter tuning; off in
+            // production runs.
+            Array::array_xxf m_rawdecon_r_data[3];
+
             // average overall responses
             std::vector<Waveform::realseq_t> overall_resp[3];
+            // filters for overall responses
+            std::vector<std::string> m_filter_resps_tn{};
 
             // tag name for traces
             std::string m_wiener_tag{"wiener"};
 //            std::string m_wiener_threshold_tag;
             std::string m_decon_charge_tag{"decon_charge"};
+            // Special-mode tag for pre-Wire-filter, pre-ROI deconvolved
+            // waveform.  Empty string disables (production default).
+            std::string m_rawdecon_tag{""};
             std::string m_gauss_tag{"gauss"};
             std::string m_frame_tag{"sigproc"};
 
             bool m_use_roi_debug_mode{false};
+            bool m_save_negative_charge{false};
             bool m_use_roi_refinement{true};
             std::string m_tight_lf_tag{"tight_lf"};
             std::string m_loose_lf_tag{"loose_lf"};
@@ -216,6 +253,7 @@ namespace WireCell {
             std::string m_extend_roi_tag{"extend_roi"};
 
             bool m_use_multi_plane_protection{false};
+            bool m_do_not_mp_protect_traditional{false};
             std::string m_mp3_roi_tag{"mp3_roi"};
             std::string m_mp2_roi_tag{"mp2_roi"};
             double m_mp_th1{1000.};
@@ -223,10 +261,16 @@ namespace WireCell {
             int m_mp_tick_resolution{4};
 
 	    //Rebase waveforms for each channel of spesific wire-plane. 
-	    std::vector<int> m_rebase_planes{}; 
+	    std::vector<int> m_rebase_planes{0,1,2}; 
             int m_rebase_nbins=200;
 
             bool m_isWrapped{false};
+
+            // Diagnostic: dump the 2D (wire x time-freq) input, response and
+            // deconvolved spectra inside decon_2D_init() to NPZ files named
+            // <m_dump_2d_prefix>_anode<N>_plane{U,V,W}.npz.  Off by default.
+            bool m_dump_2d_spectra{false};
+            std::string m_dump_2d_prefix{"sp_dump"};
 
             // If true, safe output as a sparse frame.  Traces will only
             // cover segments of waveforms which have non-zero signal
@@ -237,6 +281,13 @@ namespace WireCell {
             int m_verbose{0};
 
             IDFT::pointer m_dft;
+
+            //------Padding members
+            //Needed when physically separate planes are concatenated together
+            //for processing. i.e. DUNE collection planes on opposite faces or
+            //ICARUS electrically-separate induction plane 1
+            std::vector<std::vector<int>> m_nwires_separate_planes;
+            int m_avg_response_nwires;
         };
     }  // namespace SigProc
 }  // namespace WireCell

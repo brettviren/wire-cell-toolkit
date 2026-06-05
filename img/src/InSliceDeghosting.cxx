@@ -1,4 +1,3 @@
-
 #include "WireCellImg/InSliceDeghosting.h"
 #include "WireCellImg/CSGraph.h"
 #include "WireCellImg/GeomClusteringUtil.h"
@@ -51,8 +50,7 @@ void Img::InSliceDeghosting::configure(const WireCell::Configuration& cfg)
     m_deghost_th = get<float>(cfg, "deghost_th", m_deghost_th);
     m_deghost_th1 = get<float>(cfg, "deghost_th1", m_deghost_th1);
 
-    Json::FastWriter jwriter;
-    log->debug("{}", jwriter.write(cfg));
+    log->debug("{}", cfg);
 }
 
 namespace {
@@ -65,7 +63,7 @@ namespace {
         if (tag)
             pack |= (1 << p);
         else
-            pack &= (0 << p);
+            pack &= ~(1 << p);
     }
 
     template <class Map, class Key, class Pos>
@@ -106,42 +104,169 @@ namespace {
         return cidents;
     }
 
-    bool adjacent(std::unordered_map<WireCell::WirePlaneLayer_t, std::set<int> >& cid1,
-                  std::unordered_map<WireCell::WirePlaneLayer_t, std::set<int> >& cid2)
+    // bool adjacent(std::unordered_map<WireCell::WirePlaneLayer_t, std::set<int> >& cid1,
+    //               std::unordered_map<WireCell::WirePlaneLayer_t, std::set<int> >& cid2)
+    // {
+    //     std::map<WireCell::WirePlaneLayer_t, std::pair<int, int> > map1_plane_chs, map2_plane_chs;
+    //     std::map<WireCell::WirePlaneLayer_t, int> map_plane_score;
+
+    //     for (auto it = cid1.begin(); it != cid1.end(); it++) {
+    //         map_plane_score[it->first] = 0;
+    //         map1_plane_chs[it->first] = std::make_pair(*it->second.begin(), *it->second.rbegin());
+    //     }
+
+    //     for (auto it = cid2.begin(); it != cid2.end(); it++) {
+    //         map2_plane_chs[it->first] = std::make_pair(*it->second.begin(), *it->second.rbegin());
+    //     }
+
+    //     int sum_score = 0;
+    //     for (auto it = map_plane_score.begin(); it != map_plane_score.end(); it++) {
+    //         if (map1_plane_chs[it->first].first == map2_plane_chs[it->first].second + 1 ||
+    //             map2_plane_chs[it->first].first == map1_plane_chs[it->first].second + 1) {
+    //             map_plane_score[it->first] = 1;
+    //         }
+    //         else if (map1_plane_chs[it->first].first <= map2_plane_chs[it->first].second &&
+    //                  map2_plane_chs[it->first].first <= map1_plane_chs[it->first].second) {
+    //             map_plane_score[it->first] = 2;
+    //         }
+
+    //         if (map_plane_score[it->first] == 0) return false;
+    //         sum_score += map_plane_score[it->first];
+    //     }
+
+    //     if (sum_score >= 5) {
+    //         return true;
+    //     }
+    //     else {
+    //         return false;
+    //     }
+    // }
+
+    bool adjacent(const std::unordered_map<WireCell::WirePlaneLayer_t, std::set<int>>& cid1,
+        const std::unordered_map<WireCell::WirePlaneLayer_t, std::set<int>>& cid2)
     {
-        std::map<WireCell::WirePlaneLayer_t, std::pair<int, int> > map1_plane_chs, map2_plane_chs;
-        std::map<WireCell::WirePlaneLayer_t, int> map_plane_score;
-
-        for (auto it = cid1.begin(); it != cid1.end(); it++) {
-            map_plane_score[it->first] = 0;
-            map1_plane_chs[it->first] = std::make_pair(*it->second.begin(), *it->second.rbegin());
-        }
-
-        for (auto it = cid2.begin(); it != cid2.end(); it++) {
-            map2_plane_chs[it->first] = std::make_pair(*it->second.begin(), *it->second.rbegin());
-        }
-
         int sum_score = 0;
-        for (auto it = map_plane_score.begin(); it != map_plane_score.end(); it++) {
-            if (map1_plane_chs[it->first].first == map2_plane_chs[it->first].second + 1 ||
-                map2_plane_chs[it->first].first == map1_plane_chs[it->first].second + 1) {
-                map_plane_score[it->first] = 1;
-            }
-            else if (map1_plane_chs[it->first].first <= map2_plane_chs[it->first].second &&
-                     map2_plane_chs[it->first].first <= map1_plane_chs[it->first].second) {
-                map_plane_score[it->first] = 2;
-            }
 
-            if (map_plane_score[it->first] == 0) return false;
-            sum_score += map_plane_score[it->first];
+        // Iterate through all planes in cid1
+        for (const auto& [plane, channels1] : cid1) {
+        // Skip if this plane isn't in cid2
+        auto it2 = cid2.find(plane);
+        if (it2 == cid2.end()) continue;
+        
+        const auto& channels2 = it2->second;
+        
+        // Check for overlap and adjacency in a single pass
+        bool has_overlap = false;
+        bool is_adjacent = false;
+        
+        // Iterate through the smaller set for efficiency
+        const auto& smaller = (channels1.size() <= channels2.size()) ? channels1 : channels2;
+        const auto& larger = (channels1.size() <= channels2.size()) ? channels2 : channels1;
+        
+        for (int ch : smaller) {
+            // Check for overlap
+            if (larger.find(ch) != larger.end()) {
+                has_overlap = true;
+                if (is_adjacent) break; // If we already found adjacency, we can stop
+            }
+            
+            // Check for adjacency
+            if (larger.find(ch + 1) != larger.end() || larger.find(ch - 1) != larger.end()) {
+                is_adjacent = true;
+                if (has_overlap) break; // If we already found overlap, we can stop
+            }
+        }
+        
+        // Apply scoring logic
+        int score = 0;
+        if (is_adjacent && !has_overlap) {
+            score = 1;
+        } else if (has_overlap) {
+            score = 2;
+        }
+        
+        // For planes that exist in both maps, a score of 0 means immediate failure
+        if (score == 0) return false;
+        
+        sum_score += score;
+        
+        // Early exit if the sum is already >= 5
+        if (sum_score >= 5) return true;
         }
 
-        if (sum_score >= 5) {
-            return true;
+        return sum_score >= 5;
+    }
+
+
+    // bool adjacent(std::unordered_map<WireCell::WirePlaneLayer_t, std::set<int>>& cid1,
+    //     std::unordered_map<WireCell::WirePlaneLayer_t, std::set<int>>& cid2)
+    // {
+    //     std::map<WireCell::WirePlaneLayer_t, int> map_plane_score;
+
+    //     // Initialize score map
+    //     for (auto it = cid1.begin(); it != cid1.end(); it++) {
+    //         map_plane_score[it->first] = 0;
+    //     }
+
+    //     int sum_score = 0;
+    //     for (auto it = map_plane_score.begin(); it != map_plane_score.end(); it++) {
+    //         WireCell::WirePlaneLayer_t plane = it->first;
+            
+    //         // Skip if this plane doesn't exist in both maps
+    //         if (cid1.find(plane) == cid1.end() || cid2.find(plane) == cid2.end()) {
+    //             continue;
+    //         }
+
+    //         const std::set<int>& set1 = cid1[plane];
+    //         const std::set<int>& set2 = cid2[plane];
+            
+    //         // Check for overlap between sets
+    //         bool has_overlap = false;
+    //         for (int ch1 : set1) {
+    //             if (set2.find(ch1) != set2.end()) {
+    //                 has_overlap = true;
+    //                 break;
+    //             }
+    //         }
+            
+    //         // Check for adjacency (difference of 1) between any elements
+    //         bool is_adjacent = false;
+    //         for (int ch1 : set1) {
+    //             if (set2.find(ch1 + 1) != set2.end() || set2.find(ch1 - 1) != set2.end()) {
+    //                 is_adjacent = true;
+    //                 break;
+    //             }
+    //         }
+            
+    //         // Apply the same scoring logic
+    //         if (is_adjacent && !has_overlap) {
+    //             map_plane_score[plane] = 1;
+    //         }
+    //         else if (has_overlap) {
+    //             map_plane_score[plane] = 2;
+    //         }
+
+    //         if (map_plane_score[plane] == 0) return false;
+    //         sum_score += map_plane_score[plane];
+    //     }
+
+    //     return sum_score >= 5;
+    // }
+
+
+    // Helper function to calculate overlap ratio between two sets of wires.
+    // Uses counting iterator to avoid allocating a temporary vector.
+    double calculate_wire_overlap(const std::set<int>& wires1, const std::set<int>& wires2) {
+        if (wires1.empty()) return 0.0;
+        size_t common_count = 0;
+        auto it1 = wires1.begin();
+        auto it2 = wires2.begin();
+        while (it1 != wires1.end() && it2 != wires2.end()) {
+            if (*it1 < *it2) { ++it1; }
+            else if (*it2 < *it1) { ++it2; }
+            else { ++common_count; ++it1; ++it2; }
         }
-        else {
-            return false;
-        }
+        return common_count * 1.0 / wires1.size();
     }
 
 }  // namespace
@@ -363,33 +488,27 @@ void InSliceDeghosting::local_deghosting1(const cluster_graph_t& cg, vertex_tags
                 const auto imeasure = get<cluster_node_t::meas_t>(cg[mea].ptr);
                 // blob_planes[bvtx].insert(imeasure->planeid().layer());
                 if (flag_plane[imeasure->planeid().layer()]) {
-                    int mcell_lwire = *two_view_chs[imeasure->planeid().layer()].begin();
-                    int mcell_hwire = *two_view_chs[imeasure->planeid().layer()].rbegin();
-
-                    // find the merged blob associated with the merged wire ...
+                    auto& wires1 = two_view_chs[imeasure->planeid().layer()];
                     auto blobs = neighbors_oftype<cluster_node_t::blob_t>(cg, mea);
                     for (auto blob : blobs) {
                         if (blob == *it) continue;
-                        auto& blob_chs = blob_channels[blob];  // connected_channels(cg, blob);
+                        auto& blob_chs = blob_channels[blob];
+                        auto& wires2 = blob_chs[imeasure->planeid().layer()];
                         const auto iblob2 = get<cluster_node_t::blob_t>(cg[blob].ptr);
-                        double current_q2 = iblob2->value();  // charge ...
+                        double current_q2 = iblob2->value();
 
                         if (blob_high_score_map[blob] > m_deghost_th) {
-                            int mcell1_lwire = *blob_chs[imeasure->planeid().layer()].begin();
-                            int mcell1_hwire = *blob_chs[imeasure->planeid().layer()].rbegin();
-                            int min_wire = std::max(mcell_lwire, mcell1_lwire);
-                            int max_wire = std::min(mcell_hwire, mcell1_hwire);
+                            // Calculate overlap ratio between the wire sets
+                            double overlap_ratio = calculate_wire_overlap(wires1, wires2);
 
                             // /// DEBUGONLY:
                             // const auto islice = get<cluster_node_t::slice_t>(cg[svtx].ptr);
-                            // log->debug("start: {} three {} two {} cnrm {} score {} {} {} {} {} {} ", islice->start()
-                            // /   islice->span(), 	       view_groups[3].size(), view_groups[2].size(), cannot_remove.size(),
-                            // 	       current_q1, imeasure->planeid().layer(),
-                            // 	       current_q2, min_wire, max_wire, (max_wire - min_wire + 1.0) / (mcell_hwire -
-                            // mcell_lwire + 1.0) );
+                            // log->debug("start: {} three {} two {} cnrm {} ratio {} q1 {} q2 {}", 
+                            //     islice->start() / islice->span(), view_groups[3].size(), 
+                            //     view_groups[2].size(), cannot_remove.size(),
+                            //     overlap_ratio, current_q1, current_q2);
 
-                            if ((max_wire - min_wire + 1.0) / (mcell_hwire - mcell_lwire + 1.0) >= m_deghost_th &&
-                                current_q2 > current_q1 * m_deghost_th) {
+                            if (overlap_ratio >= m_deghost_th && current_q2 > current_q1 * m_deghost_th) {
                                 count++;
                                 break;
                             }

@@ -1,7 +1,7 @@
 import os
 import os.path as osp
 import waflib
-import waflib.Utils
+from waflib.Utils import to_list
 from waflib.Configure import conf
 from waflib.Logs import debug
 
@@ -43,6 +43,19 @@ def check_root(cfg, mandatory=False):
     cfg.check_cfg(path=cfg.env['ROOT_CONFIG'], uselib_store='ROOTSYS',
                   args = '--cflags --libs --ldflags', package='', mandatory=mandatory)
 
+    # TMVA is not included in root-config --libs in ROOT 6; add it explicitly if available
+    import subprocess
+    try:
+        root_libdir = subprocess.check_output([cfg.env['ROOT_CONFIG'][0], '--libdir']).decode().strip()
+        tmva_lib = osp.join(root_libdir, 'libTMVA.so')
+        if osp.exists(tmva_lib):
+            cfg.env.append_value('LIB_ROOTSYS', ['TMVA'])
+            cfg.env.append_value('LIBPATH_ROOTSYS', [root_libdir])
+            debug('root: found TMVA at %s, adding to ROOTSYS libs' % tmva_lib)
+        else:
+            debug('root: no libTMVA.so in %s, skipping' % root_libdir)
+    except Exception as e:
+        debug('root: could not check for TMVA: %s' % e)
 
     cfg.find_program('rootcling', var='ROOTCLING', path_list=path_list, mandatory=mandatory)
     # cfg.find_program('rootcint', var='ROOTCINT', path_list=path_list, mandatory=mandatory)
@@ -62,16 +75,17 @@ def gen_rootcling_dict(bld, name, linkdef, headers = '', includes = '', use=''):
     '''
     rootcling -f NAMEDict.cxx -rml libNAME.so -rmf libNAME.rootmap myHeader1.h myHeader2.h ... LinkDef.h
     '''
-    use = waflib.Utils.to_list(use) + ['ROOTSYS']
-    includes = waflib.Utils.to_list(includes)
-    for u in use:
-        more = bld.env['INCLUDES_'+u]
-        debug('root: USE(%s)=%s: %s' % (name, u, more))
-        includes += more
+    use = to_list(use) + ['ROOTSYS']
+    includes = to_list(includes)
+    # for u in use:
+    #     more = bld.env['INCLUDES_'+u]
+    #     debug('root: USE(%s)=%s: %s' % (name, u, more))
+    #     includes += more
 
     # make into -I...
     incs = list()
     for inc in includes:
+        debug(f'root: INC({name}): {inc}')
         if inc.startswith('/'):
             newinc = '-I%s' % inc
         else:
@@ -91,8 +105,9 @@ def gen_rootcling_dict(bld, name, linkdef, headers = '', includes = '', use=''):
 
     if type(linkdef) == type(""):
         linkdef = bld.path.find_resource(linkdef)
-    source_nodes = headers + [linkdef]
+    source_nodes = to_list(headers) + [linkdef]
     sources = ' '.join([x.abspath() for x in source_nodes])
+    debug(f'root: SOURCES({name}): {sources}')
     rule = '${ROOTCLING} -f ${TGT[0].abspath()} -rml %s -rmf ${TGT[1].abspath()} %s %s' % (dict_lib, incs, sources)
     bld(source = source_nodes,
         target = [dict_src, dict_map, dict_pcm],
@@ -112,8 +127,8 @@ def gen_rootcint_dict(bld, name, linkdef, headers = '', includes=''):
     '''Generate a rootcint dictionary, compile it to a shared lib,
     produce its rootmap file and install it all.
     '''
-    headers = waflib.Utils.to_list(headers)
-    incs = ['-I%s' % bld.path.find_dir(x).abspath() for x in waflib.Utils.to_list(includes)]
+    headers = to_list(headers)
+    incs = ['-I%s' % bld.path.find_dir(x).abspath() for x in to_list(includes)]
     incs = ' '.join(incs)
     
     dict_src = name + 'Dict.cxx'

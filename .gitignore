@@ -58,6 +58,7 @@ ltximg
 *.vtu
 *.pdf
 *.json
+!sigproc/test/data/*.json
 .snakemake
 *.old
 *.junk
@@ -70,11 +71,30 @@ svg-inkscape
 *.html
 tmp
 *.tar
-*.md
 README.tex
 larsoft-cfg
 *.dot
-configure
+configure*
+*.sh
 
 *.gz
 styles
+*.heap
+*.prof
+*.debug
+*.svg
+AutoDict_*
+# This file should only be committed to release branches.
+# And in any case, only matters when source lacks .git/.
+version.txt
+.cache
+.clangd
+junk*
+downloads
+tmp*
+
+doxy
+*.bak
+doxy_quick
+html
+latex

@@ -52,6 +52,8 @@
 #include "WireCellUtil/Point.h"
 #include "WireCellUtil/NamedFactory.h"
 
+#include <algorithm>
+#include <vector>
 
 WIRECELL_FACTORY(DepoTransform, WireCell::Gen::DepoTransform, WireCell::IDepoFramer, WireCell::IConfigurable)
 
@@ -94,6 +96,19 @@ void Gen::DepoTransform::configure(const WireCell::Configuration& cfg)
     m_drift_speed = get<double>(cfg, "drift_speed", m_drift_speed);
     m_frame_count = get<int>(cfg, "first_frame_number", m_frame_count);
 
+    m_process_planes = {0,1,2};
+
+    if (cfg["process_planes"].isArray()) {
+      m_process_planes.clear();
+      for (auto jplane : cfg["process_planes"]) {
+	m_process_planes.push_back(jplane.asInt());
+      }
+    }
+
+    log->debug("tick={} us, start={} us, readin={} us, drift_speed={} mm/us",
+               m_tick/units::us, m_start_time/units::us,
+               m_readout_time/units::us, m_drift_speed/(units::mm/units::us));
+
     auto jpirs = cfg["pirs"];
     if (jpirs.isNull() or jpirs.empty()) {
         std::string msg = "must configure with some plane impact response components";
@@ -118,11 +133,11 @@ WireCell::Configuration Gen::DepoTransform::default_configuration() const
     put(cfg, "fluctuate", false);
 
     /// The open a gate.  This is actually a "readin" time measured at
-    /// the input ("reference") plane.
+    /// the input ("response") plane.
     put(cfg, "start_time", m_start_time);
 
     /// The time span for each readout.  This is actually a "readin"
-    /// time span measured at the input ("reference") plane.
+    /// time span measured at the input ("response") plane.
     put(cfg, "readout_time", m_readout_time);
 
     /// The sample period
@@ -144,6 +159,11 @@ WireCell::Configuration Gen::DepoTransform::default_configuration() const
 
     // type-name for the DFT to use
     cfg["dft"] = "FftwDFT";
+
+    // Need to REMOVE this otherwise [] will be the default
+    // NOTE: People doing similar things should be aware of this!!!
+    // Ref: https://github.com/LArSoft/larwirecell/pull/55
+    // cfg["process_planes"] = Json::arrayValue;
 
     return cfg;
 }
@@ -170,6 +190,13 @@ bool Gen::DepoTransform::operator()(const input_pointer& in, output_pointer& out
         int iplane = -1;
         for (auto plane : face->planes()) {
             ++iplane;
+
+	    int plane_index = plane->planeid().index();
+
+	    if (std::find(m_process_planes.begin(),  m_process_planes.end(), plane_index) == m_process_planes.end()) {
+          log->debug("skip plane {}", plane_index);         
+	      continue;
+	    }
 
             const Pimpos* pimpos = plane->pimpos();
 
@@ -202,6 +229,9 @@ bool Gen::DepoTransform::operator()(const input_pointer& in, output_pointer& out
                 auto trace = make_shared<SimpleTrace>(chid, tbin, charge);
                 traces.push_back(trace);
             }
+            // fixme: use SPDLOG_LOGGER_DEBUG
+            log->debug("plane={} face={} depos={} total traces={}",
+                       iplane, face->ident(), face_depos.size(), traces.size());
         }
     }
 

@@ -2,6 +2,7 @@
 #include "WireCellUtil/NamedFactory.h"
 #include "WireCellUtil/Units.h"
 #include "WireCellUtil/String.h"
+#include "WireCellUtil/Persist.h"
 
 #include "WireCellIface/IAnodePlane.h"
 #include "WireCellIface/IAnodeFace.h"
@@ -33,30 +34,15 @@ bool Gen::Drifter::DepoTimeCompare::operator()(const IDepo::pointer& lhs, const 
 // Xregion helper
 
 Gen::Drifter::Xregion::Xregion(Configuration cfg)
-  : anode(0.0)
-  , response(0.0)
-  , cathode(0.0)
+    : anode(make_coordbounds(cfg["anode"]))
+    , response(make_coordbounds(cfg["response"]))
+    , cathode(make_coordbounds(cfg["cathode"]))
+    , bulk(*response, *cathode)
+    , near(*anode, *response)
 {
-    auto ja = cfg["anode"];
-    auto jr = cfg["response"];
-    auto jc = cfg["cathode"];
-    if (ja.isNull()) {
-        ja = jr;
-    }
-    if (jr.isNull()) {
-        jr = ja;
-    }
-    anode = ja.asDouble();
-    response = jr.asDouble();
-    cathode = jc.asDouble();
 }
-bool Gen::Drifter::Xregion::inside_response(double x) const
-{
-    return (anode < x and x < response) or (response < x and x < anode);
-}
-bool Gen::Drifter::Xregion::inside_bulk(double x) const
-{
-    return (response < x and x < cathode) or (cathode < x and x < response);
+Gen::Drifter::Xregion::operator bool() const {
+    return anode && response && cathode;
 }
 
 Gen::Drifter::Drifter()
@@ -69,6 +55,7 @@ Gen::Drifter::Drifter()
   , m_fluctuate(true)
   , m_speed(1.6 * units::mm / units::us)
   , m_toffset(0.0)
+  , m_scale_factor(1.0)
   , n_dropped(0)
   , n_drifted(0)
 {
@@ -85,6 +72,7 @@ WireCell::Configuration Gen::Drifter::default_configuration() const
     cfg["fluctuate"] = m_fluctuate;
     cfg["drift_speed"] = m_speed;
     cfg["time_offset"] = m_toffset;
+    cfg["charge_scale"] = m_scale_factor;
 
     // see comments in .h file
     cfg["xregions"] = Json::arrayValue;
@@ -104,6 +92,7 @@ void Gen::Drifter::configure(const WireCell::Configuration& cfg)
     m_fluctuate = get<bool>(cfg, "fluctuate", m_fluctuate);
     m_speed = get<double>(cfg, "drift_speed", m_speed);
     m_toffset = get<double>(cfg, "time_offset", m_toffset);
+    m_scale_factor = get<double>(cfg, "charge_scale", m_scale_factor);
 
     auto jxregions = cfg["xregions"];
     if (jxregions.empty()) {
@@ -111,7 +100,13 @@ void Gen::Drifter::configure(const WireCell::Configuration& cfg)
         THROW(ValueError() << errmsg{"no xregions given"});
     }
     for (auto jone : jxregions) {
-        m_xregions.push_back(Xregion(jone));
+        if (!jone.isNull()) {
+          m_xregions.emplace_back(Xregion(jone));
+          if (! m_xregions.back()) {
+              raise<ValueError>("Incomplete Xregion from cfg: %s",
+                                Persist::dumps(jone));
+          }
+        }
     }
     log->debug("time offset: {} ms, drift speed: {} mm/us", m_toffset / units::ms,
              m_speed / (units::mm / units::us));
@@ -141,13 +136,13 @@ bool Gen::Drifter::insert(const input_pointer& depo)
         // Back up in space and time.  This is a best effort fudge.  See:
         // https://github.com/WireCell/wire-cell-gen/issues/22
 
-        respx = xrit->response;
+        respx = xrit->response->location();
         direction = -1.0;
     }
     else {
         xrit = std::find_if(m_xregions.begin(), m_xregions.end(), Gen::Drifter::IsInsideBulk(depo));
         if (xrit != m_xregions.end()) {  // in bulk
-            respx = xrit->response;
+            respx = xrit->response->location();
             direction = 1.0;
         }
     }
@@ -184,7 +179,8 @@ bool Gen::Drifter::insert(const input_pointer& depo)
         dT = sqrt(2.0 * m_DT * dt + dT * dT);
     }
 
-    auto newdepo = make_shared<Aux::SimpleDepo>(depo->time() + direction * dt + m_toffset, pos, Qf, depo, dL, dT);
+    auto newdepo = make_shared<Aux::SimpleDepo>(depo->time() + direction * dt + m_toffset,
+                                                pos, Qf*m_scale_factor, depo, dL, dT, depo->id());
     xrit->depos.insert(newdepo);
     return true;
 }
@@ -195,8 +191,6 @@ bool by_time(const IDepo::pointer& lhs, const IDepo::pointer& rhs) { return lhs-
 void Gen::Drifter::flush(output_queue& outq)
 {
     for (auto& xr : m_xregions) {
-        log->debug("xregion: anode: {} mm, response: {} mm, cathode: {} mm, flushing {}", xr.anode / units::mm,
-                 xr.response / units::mm, xr.cathode / units::mm, xr.depos.size());
         outq.insert(outq.end(), xr.depos.begin(), xr.depos.end());
         xr.depos.clear();
     }

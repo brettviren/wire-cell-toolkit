@@ -1,0 +1,719 @@
+#include "WireCellClus/IEnsembleVisitor.h"
+#include "WireCellClus/ClusteringFuncs.h"
+#include "WireCellClus/ClusteringFuncsMixins.h"
+
+#include "WireCellIface/IConfigurable.h"
+
+#include "WireCellUtil/NamedFactory.h"
+
+class ClusteringConnect1;
+WIRECELL_FACTORY(ClusteringConnect1, ClusteringConnect1,
+                 WireCell::IConfigurable, WireCell::Clus::IEnsembleVisitor)
+
+using namespace WireCell;
+using namespace WireCell::Clus;
+using namespace WireCell::Clus::Facade;
+using namespace WireCell::PointCloud::Tree;
+
+static void clustering_connect1(Grouping& live_grouping, 
+                                IDetectorVolumes::pointer dv,
+                                const Tree::Scope& scope);
+
+class ClusteringConnect1 : public IConfigurable, public Clus::IEnsembleVisitor, private NeedDV, private NeedScope {
+public:
+    ClusteringConnect1() {}
+    virtual ~ClusteringConnect1() {}
+
+    void configure(const WireCell::Configuration& config) {
+        NeedDV::configure(config);
+        NeedScope::configure(config);
+    }
+
+    void visit(Ensemble& ensemble) const {
+        auto& live = *ensemble.with_name("live").at(0);
+        clustering_connect1(live, m_dv, m_scope);
+    }
+    virtual Configuration default_configuration() const {
+        Configuration cfg;
+        return cfg;
+    }
+};
+
+
+// The original developers do not care.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wparentheses"
+
+// #define __DEBUG__
+#ifdef __DEBUG__
+#define LogDebug(x) std::cout << "[yuhw]: " << __LINE__ << " : " << x << std::endl
+#else
+#define LogDebug(x)
+#endif
+
+// This is for only one APA/face
+void clustering_connect1(
+    Grouping& live_grouping, 
+    const IDetectorVolumes::pointer dv,
+    const Tree::Scope& scope)
+{
+    // Check that live_grouping has less than one wpid
+    if (live_grouping.wpids().size() > 1) {
+        for (const auto& wpid : live_grouping.wpids()) {
+            std::cout << "Live grouping wpid: " << wpid.name() << std::endl;
+        }
+        raise<ValueError>("Live %d > 1", live_grouping.wpids().size());
+    }
+    // Example usage in clustering_parallel_prolong()
+    auto [drift_dir, angle_u, angle_v, angle_w] = extract_geometry_params(live_grouping, dv);
+    geo_point_t drift_dir_abs(1,0,0);
+
+    int apa = (*live_grouping.wpids().begin()).apa();
+    int face = (*live_grouping.wpids().begin()).face();
+
+    std::map<int, std::pair<double, double>>& dead_u_index = live_grouping.get_dead_winds(apa, face, 0);
+    std::map<int, std::pair<double, double>>& dead_v_index = live_grouping.get_dead_winds(apa, face, 1);
+    std::map<int, std::pair<double, double>>& dead_w_index = live_grouping.get_dead_winds(apa, face, 2);
+
+    // Get all the wire plane IDs from the grouping
+    const auto& wpids = live_grouping.wpids();
+    // Key: WirePlaneId (one per APA/face), Value: drift_dir, angle_u, angle_v, angle_w
+    std::map<WirePlaneId , std::tuple<geo_point_t, double, double, double>> wpid_params;
+
+    for (const auto& wpid : wpids) {
+        int apa = wpid.apa();
+        int face = wpid.face();
+
+        // Create wpids for all three planes with this APA and face
+        WirePlaneId wpid_u(kUlayer, face, apa);
+        WirePlaneId wpid_v(kVlayer, face, apa);
+        WirePlaneId wpid_w(kWlayer, face, apa);
+
+        // Get drift direction based on face orientation
+        int face_dirx = dv->face_dirx(wpid_u);
+        geo_point_t drift_dir(face_dirx, 0, 0);
+
+        // Get wire directions for all planes
+        Vector wire_dir_u = dv->wire_direction(wpid_u);
+        Vector wire_dir_v = dv->wire_direction(wpid_v);
+        Vector wire_dir_w = dv->wire_direction(wpid_w);
+
+        // Calculate angles
+        double angle_u = std::atan2(wire_dir_u.z(), wire_dir_u.y());
+        double angle_v = std::atan2(wire_dir_v.z(), wire_dir_v.y());
+        double angle_w = std::atan2(wire_dir_w.z(), wire_dir_w.y());
+
+        wpid_params[wpid] = std::make_tuple(drift_dir, angle_u, angle_v, angle_w);
+    }
+
+
+    // auto global_point_cloud = std::make_shared<DynamicPointCloudLegacy>(angle_u, angle_v, angle_w);
+    auto global_point_cloud = std::make_shared<DynamicPointCloud>(wpid_params);
+
+    for (Cluster *cluster : live_grouping.children()) {
+        if(!cluster->get_scope_filter(scope)) continue;
+        // global_point_cloud->add_points(cluster, 0);
+        if (cluster->get_default_scope().hash() != scope.hash()) {
+            cluster->set_default_scope(scope);
+            // std::cout << "Test: Set default scope: " << pc_name << " " << coords[0] << " " << coords[1] << " " << coords[2] << " " << cluster->get_default_scope().hash() << " " << scope.hash() << std::endl;
+        }
+        // debug ... 
+        // {
+        //     const size_t num_points = cluster->npoints();
+        //     const size_t kd_num_points = cluster->kd3d().npoints();
+        //     std::cout << "Xin: " << num_points << " " << kd_num_points << std::endl;
+        // }
+        global_point_cloud->add_points(make_points_cluster(cluster, wpid_params));
+    }
+    // sort the clusters length ...
+    std::vector<Cluster *> live_clusters = live_grouping.children();  // copy
+    std::sort(live_clusters.begin(), live_clusters.end(), [](const Cluster *cluster1, const Cluster *cluster2) {
+        return cluster1->get_length() > cluster2->get_length();
+    });
+
+
+    // auto global_skeleton_cloud = std::make_shared<DynamicPointCloudLegacy>(angle_u, angle_v, angle_w);
+    auto global_skeleton_cloud = std::make_shared<DynamicPointCloud>(wpid_params);
+
+    double extending_dis = 50 * units::cm;
+    double angle = 7.5;
+    double loose_dis_cut = 7.5 * units::cm;
+
+    // std::set<std::pair<Cluster *, Cluster *>> to_be_merged_pairs;
+    cluster_connectivity_graph_t  g;
+    std::unordered_map<int, int> ilive2desc;  // added live index to graph descriptor
+    std::map<const Cluster*, int, ClusterLess> map_cluster_index;
+    for (const Cluster* live : live_grouping.children()) {
+        if (!live->get_scope_filter(scope)) continue;
+        size_t ilive = map_cluster_index.size();
+        map_cluster_index[live] = ilive;
+        ilive2desc[ilive] = boost::add_vertex(ilive, g);
+    }
+
+    std::map<const Cluster *, geo_point_t, ClusterLess> map_cluster_dir1;
+    std::map<const Cluster *, geo_point_t, ClusterLess> map_cluster_dir2;
+
+    geo_point_t U_dir(0,cos(angle_u),sin(angle_u));
+    geo_point_t V_dir(0,cos(angle_v),sin(angle_v));
+    geo_point_t W_dir(0,cos(angle_w),sin(angle_w));
+    // geo_point_t U_dir(0, cos(60. / 180. * 3.1415926), sin(60. / 180. * 3.1415926));
+    // geo_point_t V_dir(0, cos(60. / 180. * 3.1415926), -sin(60. / 180. * 3.1415926));
+    // geo_point_t W_dir(0, 1, 0);
+
+    for (size_t i = 0; i != live_clusters.size(); i++) {
+        const Cluster *cluster = live_clusters.at(i);
+        if(!cluster->get_scope_filter(scope)) continue;
+        assert (cluster->npoints() > 0); // preempt segfault in get_two_extreme_points()
+
+        // if (cluster->get_length()/units::cm>5){
+        //     std::cout << "Connect 0: " << cluster->get_length()/units::cm << " " << cluster->get_pca().center << std::endl;
+        // }
+
+
+        // cluster->Create_point_cloud();
+
+        std::pair<geo_point_t, geo_point_t> extreme_points = cluster->get_two_extreme_points();
+        geo_point_t main_dir(extreme_points.second.x() - extreme_points.first.x(),
+                          extreme_points.second.y() - extreme_points.first.y(),
+                          extreme_points.second.z() - extreme_points.first.z());
+        geo_point_t dir1, dir2;
+        bool flag_para_1 = false;
+        bool flag_prol_1 = false;
+        bool flag_para_2 = false;
+        bool flag_prol_2 = false;
+
+        if (main_dir.magnitude() > 10 * units::cm &&
+            fabs(main_dir.angle(drift_dir_abs) - 3.1415926 / 2.) < 5 * 3.1415926 / 180.) {
+            dir1 = main_dir;
+            dir1 = dir1* -1;
+            dir2 = main_dir;
+        }
+        else if (cluster->get_length() > 25 * units::cm) {
+            dir1 = cluster->vhough_transform(extreme_points.first, 80 * units::cm);
+            if (dir1.magnitude() != 0) dir1 = dir1.norm();
+            if (fabs(dir1.angle(drift_dir_abs) - 3.1415926 / 2.) < 5 * 3.1415926 / 180.) {
+                dir1.set(dir1.x(), (extreme_points.second.y() - extreme_points.first.y()) / main_dir.magnitude(),
+                            (extreme_points.second.z() - extreme_points.first.z()) / main_dir.magnitude());
+                dir1 = dir1 * -1;
+            }
+            dir2 = cluster->vhough_transform(extreme_points.second, 80 * units::cm);
+            if (dir2.magnitude() != 0) dir2 = dir2.norm();
+            if (fabs(dir2.angle(drift_dir_abs) - 3.1415926 / 2.) < 5 * 3.1415926 / 180.) {
+                dir2.set(dir2.x(), (extreme_points.second.y() - extreme_points.first.y()) / main_dir.magnitude(),
+                            (extreme_points.second.z() - extreme_points.first.z()) / main_dir.magnitude());
+            }
+            if (dir1.dot(main_dir) > 0) dir1 *= -1;
+            if (dir2.dot(dir1) > 0) dir2 *= -1;
+        }
+        else {
+            dir1 = global_point_cloud->vhough_transform(extreme_points.first, extending_dis);
+            dir2 = global_point_cloud->vhough_transform(extreme_points.second, extending_dis);
+            if (dir1.dot(main_dir) > 0) dir1 *= -1;
+            if (dir2.dot(dir1) > 0) dir2 *= -1;
+        }
+
+        bool flag_add_dir1 = true;
+        bool flag_add_dir2 = true;
+        map_cluster_dir1[cluster] = dir1;
+        map_cluster_dir2[cluster] = dir2;
+
+        if (fabs(dir1.angle(drift_dir_abs) - 3.1415926 / 2.) < 7.5 * 3.1415926 / 180.) {
+            flag_para_1 = true;
+        }
+        else {
+            geo_point_t tempV1(0, dir1.y(), dir1.z());
+            geo_point_t tempV5;
+            double angle1 = tempV1.angle(U_dir);
+            tempV5.set(fabs(dir1.x()), sqrt(pow(dir1.y(), 2) + pow(dir1.z(), 2)) * sin(angle1), 0);
+            angle1 = tempV5.angle(drift_dir_abs);
+
+            if (angle1 < 7.5 / 180. * 3.1415926) {
+                flag_prol_1 = true;
+            }
+            else {
+                angle1 = tempV1.angle(V_dir);
+                tempV5.set(fabs(dir1.x()), sqrt(pow(dir1.y(), 2) + pow(dir1.z(), 2)) * sin(angle1), 0);
+                angle1 = tempV5.angle(drift_dir_abs);
+
+                if (angle1 < 7.5 / 180. * 3.1415926) {
+                    flag_prol_1 = true;
+                }
+                else {
+                    angle1 = tempV1.angle(W_dir);
+                    tempV5.set(fabs(dir1.x()), sqrt(pow(dir1.y(), 2) + pow(dir1.z(), 2)) * sin(angle1), 0);
+                    angle1 = tempV5.angle(drift_dir_abs);
+
+                    if (angle1 < 7.5 / 180. * 3.1415926) {
+                        flag_prol_1 = true;
+                    }
+                }
+            }
+        }
+
+        if (fabs(dir2.angle(drift_dir_abs) - 3.1415926 / 2.) < 7.5 * 3.1415926 / 180.) {
+            flag_para_2 = true;
+        }
+        else {
+            geo_point_t tempV2(0, dir2.y(), dir2.z());
+            geo_point_t tempV6;
+            double angle2 = tempV2.angle(U_dir);
+            tempV6.set(fabs(dir2.x()), sqrt(pow(dir2.y(), 2) + pow(dir2.z(), 2)) * sin(angle2), 0);
+            angle2 = tempV6.angle(drift_dir_abs);
+            if (angle2 < 7.5 / 180. * 3.1415926) {
+                flag_prol_2 = true;
+            }
+            else {
+                angle2 = tempV2.angle(V_dir);
+                tempV6.set(fabs(dir2.x()), sqrt(pow(dir2.y(), 2) + pow(dir2.z(), 2)) * sin(angle2), 0);
+                angle2 = tempV6.angle(drift_dir_abs);
+                if (angle2 < 7.5 / 180. * 3.1415926) {
+                    flag_prol_2 = true;
+                }
+                else {
+                    angle2 = tempV2.angle(W_dir);
+                    tempV6.set(fabs(dir2.x()), sqrt(pow(dir2.y(), 2) + pow(dir2.z(), 2)) * sin(angle2), 0);
+                    angle2 = tempV6.angle(drift_dir_abs);
+                    if (angle2 < 7.5 / 180. * 3.1415926) {
+                        flag_prol_2 = true;
+                    }
+                }
+            }
+        }
+
+        if ((flag_para_1 || flag_prol_1) && cluster->get_length() < 15 * units::cm) {
+            flag_add_dir1 = true;
+        }
+        else if (cluster->get_length() >= 15 * units::cm) {
+            flag_add_dir1 = true;
+        }
+        else {
+            flag_add_dir1 = false;
+        }
+
+        if ((flag_para_2 || flag_prol_2) && cluster->get_length() < 15 * units::cm) {
+            flag_add_dir2 = true;
+        }
+        else if (cluster->get_length() >= 15 * units::cm) {
+            flag_add_dir2 = true;
+        }
+        else {
+            flag_add_dir2 = false;
+        }
+
+        if (fabs(dir1.angle(drift_dir_abs) - 3.1415926 / 2.) < 5 * 3.1415926 / 180.) {
+            flag_para_1 = true;
+        }
+        else {
+            flag_para_1 = false;
+        }
+        if (fabs(dir2.angle(drift_dir_abs) - 3.1415926 / 2.) < 5 * 3.1415926 / 180.) {
+            flag_para_2 = true;
+        }
+        else {
+            flag_para_2 = false;
+        }
+        
+
+        
+
+        if (i == 0) {
+            if (flag_para_1 || flag_prol_1) {
+                // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle);
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params));
+                dir1 *= -1;
+                // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle);
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params));
+            }
+            else {
+                // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle);
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                dir1 *= -1;
+                // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle);
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+            }
+
+            if (flag_para_2 || flag_prol_2) {
+                // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle);
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params));
+                dir2 *= -1;
+                // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle);
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params));
+            }
+            else {
+                // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle);
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                dir2 *= -1;
+                // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle);
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+            }
+        }
+        else {
+            // NB: && binds tighter than || — this parses as A || (B && C && D), matching prototype intent.
+            if (cluster->get_length() < 100 * units::cm ||
+                fabs(dir2.angle(drift_dir_abs) - 3.1415926 / 2.) < 5 * 3.1415926 / 180. &&
+                    fabs(dir1.angle(drift_dir_abs) - 3.1415926 / 2.) < 5 * 3.1415926 / 180. &&
+                    cluster->get_length() < 200 * units::cm) {
+                int num_total_points = cluster->npoints();
+                const auto& winds = cluster->wire_indices();
+                int num_unique[3] = {0, 0, 0};  // points unique (not overlapping with any earlier cluster)
+                std::map<const Cluster *, int, ClusterLess> map_cluster_num[3];
+
+                // Lambda: process one wire plane per point.
+                // If the point falls in a dead wire region, use a fixed 2/3*loose_dis_cut threshold
+                // (prototype behaviour); otherwise use the per-extrapolation-point dist_cut stored
+                // in the skeleton cloud.  This avoids 3x code duplication across U/V/W planes.
+                const auto& skel_pts = global_skeleton_cloud->get_points();
+                auto process_plane = [&](int plane,
+                                         const std::map<int, std::pair<double, double>>& dead_index,
+                                         int wire_idx, double raw_x,
+                                         const geo_point_t& test_point,
+                                         int& num_unique_ref) {
+                    auto dit = dead_index.find(wire_idx);
+                    bool flag_dead = (dit != dead_index.end() &&
+                                      raw_x >= dit->second.first &&
+                                      raw_x <= dit->second.second);
+                    auto results = global_skeleton_cloud->get_2d_points_info(
+                        test_point, loose_dis_cut, plane, face, apa);
+                    bool flag_unique = true;
+                    if (!results.empty()) {
+                        std::set<const Cluster *, ClusterLess> tmp;
+                        for (const auto& [dist, cl, gidx] : results) {
+                            const double cut = flag_dead ? (loose_dis_cut / 3. * 2.)
+                                                         : skel_pts[gidx].dist_cut[plane];
+                            if (dist < cut) { flag_unique = false; tmp.insert(cl); }
+                        }
+                        for (const Cluster* cl : tmp) ++map_cluster_num[plane][cl];
+                    }
+                    if (flag_unique) ++num_unique_ref;
+                };
+
+                for (int j = 0; j != num_total_points; j++) {
+                    const auto p3 = cluster->point3d(j);
+                    const geo_point_t test_point(p3.x(), p3.y(), p3.z());
+                    const double raw_x = cluster->point3d_raw(j).x();
+                    process_plane(0, dead_u_index, winds[0][j], raw_x, test_point, num_unique[0]);
+                    process_plane(1, dead_v_index, winds[1][j], raw_x, test_point, num_unique[1]);
+                    process_plane(2, dead_w_index, winds[2][j], raw_x, test_point, num_unique[2]);
+                } // loop over points
+                
+
+                bool flag_merge = false;
+
+                {
+                    const Cluster *max_cluster_u = 0, *max_cluster_v = 0, *max_cluster_w = 0;
+                    int max_value_u[3] = {0, 0, 0};
+                    int max_value_v[3] = {0, 0, 0};
+                    int max_value_w[3] = {0, 0, 0};
+
+                    auto lookup_count = [&](int plane, const Cluster* cl) -> int {
+                        auto it = map_cluster_num[plane].find(cl);
+                        return (it != map_cluster_num[plane].end()) ? it->second : 0;
+                    };
+
+                    for (const auto& [cl, cnt] : map_cluster_num[0]) {
+                        if (cnt > max_value_u[0]) {
+                            max_value_u[0] = cnt;
+                            max_cluster_u = cl;
+                            max_value_u[1] = lookup_count(1, cl);
+                            max_value_u[2] = lookup_count(2, cl);
+                        }
+                    }
+                    for (const auto& [cl, cnt] : map_cluster_num[1]) {
+                        if (cnt > max_value_v[1]) {
+                            max_value_v[1] = cnt;
+                            max_cluster_v = cl;
+                            max_value_v[0] = lookup_count(0, cl);
+                            max_value_v[2] = lookup_count(2, cl);
+                        }
+                    }
+                    for (const auto& [cl, cnt] : map_cluster_num[2]) {
+                        if (cnt > max_value_w[2]) {
+                            max_value_w[2] = cnt;
+                            max_cluster_w = cl;
+                            max_value_w[1] = lookup_count(1, cl);
+                            max_value_w[0] = lookup_count(0, cl);
+                        }
+                    }
+
+                    int max_value[3] = {0, 0, 0};
+                    const Cluster *max_cluster = 0;
+
+                    if ((max_value_u[0] > 0.33 * num_total_points || max_value_u[0] > 100) &&
+                        (max_value_u[1] > 0.33 * num_total_points || max_value_u[1] > 100) &&
+                        (max_value_u[2] > 0.33 * num_total_points || max_value_u[2] > 100)) {
+                        if (max_value_u[0] + max_value_u[1] + max_value_u[2] >
+                            max_value[0] + max_value[1] + max_value[2]) {
+                            max_value[0] = max_value_u[0];
+                            max_value[1] = max_value_u[1];
+                            max_value[2] = max_value_u[2];
+                            max_cluster = max_cluster_u;
+                        }
+                    }
+                    if ((max_value_v[0] > 0.33 * num_total_points || max_value_v[0] > 100) &&
+                        (max_value_v[1] > 0.33 * num_total_points || max_value_v[1] > 100) &&
+                        (max_value_v[2] > 0.33 * num_total_points || max_value_v[2] > 100)) {
+                        if (max_value_v[0] + max_value_v[1] + max_value_v[2] >
+                            max_value[0] + max_value[1] + max_value[2]) {
+                            max_value[0] = max_value_v[0];
+                            max_value[1] = max_value_v[1];
+                            max_value[2] = max_value_v[2];
+                            max_cluster = max_cluster_v;
+                        }
+                    }
+                    if ((max_value_w[0] > 0.33 * num_total_points || max_value_w[0] > 100) &&
+                        (max_value_w[1] > 0.33 * num_total_points || max_value_w[1] > 100) &&
+                        (max_value_w[2] > 0.33 * num_total_points || max_value_w[2] > 100)) {
+                        if (max_value_w[0] + max_value_w[1] + max_value_w[2] >
+                            max_value[0] + max_value[1] + max_value[2]) {
+                            max_value[0] = max_value_w[0];
+                            max_value[1] = max_value_w[1];
+                            max_value[2] = max_value_w[2];
+                            max_cluster = max_cluster_w;
+                        }
+                    }
+
+                    // if (max_cluster != 0)
+                    // if (fabs(cluster->get_length()/units::cm - 50) < 5 ){
+                    //     std::cout << "Check: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << max_cluster->get_pca().center << " " << max_value[0] << " " << max_value[1] << " " << max_value[2] << " " << num_total_points << " " << num_unique[0] << " " << num_unique[1] << " " << num_unique[2] << " "  << std::endl;
+                    // }
+
+                    // if overlap a lot merge
+                    if ((max_value[0] + max_value[1] + max_value[2]) >
+                            0.75 * (num_total_points + num_total_points + num_total_points) &&
+                        ((num_unique[1] + num_unique[0] + num_unique[2]) < 0.24 * num_total_points ||
+                         ((num_unique[1] + num_unique[0] + num_unique[2]) < 0.45 * num_total_points &&
+                          (num_unique[1] + num_unique[0] + num_unique[2]) < 25))) {
+
+                        
+
+                        if (fabs(dir1.angle(map_cluster_dir1[max_cluster]) - 3.1415926 / 2.) >= 70 * 3.1415926 / 180. ||
+                            fabs(dir1.angle(map_cluster_dir2[max_cluster]) - 3.1415926 / 2.) >= 70 * 3.1415926 / 180. ||
+                            fabs(dir2.angle(map_cluster_dir1[max_cluster]) - 3.1415926 / 2.) >= 70 * 3.1415926 / 180. ||
+                            fabs(dir2.angle(map_cluster_dir2[max_cluster]) - 3.1415926 / 2.) >= 70 * 3.1415926 / 180.) {
+                            flag_merge = true;
+                            // to_be_merged_pairs.insert(std::make_pair(cluster, max_cluster));
+                            boost::add_edge(ilive2desc[map_cluster_index[cluster]],
+                                            ilive2desc[map_cluster_index[max_cluster]], g);
+                            // std::cout << "Connect 1 1: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << max_cluster->get_pca().center << std::endl;
+                            // curr_cluster = max_cluster;
+                        }
+
+                 
+                        if (fabs(dir1.angle(map_cluster_dir1[max_cluster]) - 3.1415926 / 2.) < 75 * 3.1415926 / 180. &&
+                            fabs(dir1.angle(map_cluster_dir2[max_cluster]) - 3.1415926 / 2.) < 75 * 3.1415926 / 180.) {
+                            flag_add_dir1 = false;
+                        }
+                        else {
+                            flag_add_dir1 = true;
+                        }
+                        if (fabs(dir2.angle(map_cluster_dir1[max_cluster]) - 3.1415926 / 2.) < 75 * 3.1415926 / 180. &&
+                            fabs(dir2.angle(map_cluster_dir2[max_cluster]) - 3.1415926 / 2.) < 75 * 3.1415926 / 180.) {
+                            flag_add_dir2 = false;
+                        }
+                        else {
+                            flag_add_dir2 = true;
+                        }
+                    }
+
+                    if ((max_value[0] + max_value[1] + max_value[2]) > 300 && !flag_merge) {
+                        if (cluster->get_length() > 25 * units::cm ||
+                            max_cluster->get_length() > 25 * units::cm) {
+                            // if overlap significant, compare the PCA
+
+                            geo_point_t p1_c = cluster->get_pca().center;
+                            geo_point_t p1_dir(cluster->get_pca().axis.at(0).x(),
+                                               cluster->get_pca().axis.at(0).y(),
+                                               cluster->get_pca().axis.at(0).z());
+
+                            geo_point_t p2_c = max_cluster->get_pca().center;
+                            geo_point_t p2_dir(max_cluster->get_pca().axis.at(0).x(),
+                                               max_cluster->get_pca().axis.at(0).y(),
+                                               max_cluster->get_pca().axis.at(0).z());
+
+                            double angle_diff = p1_dir.angle(p2_dir) / 3.1415926 * 180.;
+                            double angle1_drift = p1_dir.angle(drift_dir_abs) / 3.1415926 * 180.;
+                            double angle2_drift = p2_dir.angle(drift_dir_abs) / 3.1415926 * 180.;
+                            Ray l1(p1_c, p1_c+p1_dir);
+                            Ray l2(p2_c, p2_c+p2_dir);
+                            // double dis = l1.closest_dis(l2);
+                            double dis = ray_length(ray_pitch(l1, l2));
+                            double dis1 =
+                                sqrt(pow(p1_c.x() - p2_c.x(), 2) + pow(p1_c.y() - p2_c.y(), 2) + pow(p1_c.z() - p2_c.z(), 2));
+
+                            // if (fabs(cluster->get_length()/units::cm - 50) < 5 ){
+                            //     std::cout << "Check 1: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << angle_diff << " " << dis/units::cm << " " << dis1/units::cm << " " << angle1_drift << " " << angle2_drift << std::endl;
+                            // }
+
+                            if ((angle_diff < 5 || angle_diff > 175 ||
+                                 fabs(angle1_drift - 90) < 5 && fabs(angle2_drift - 90) < 5 &&
+                                     fabs(angle1_drift - 90) + fabs(angle2_drift - 90) < 6 &&
+                                     (angle_diff < 30 || angle_diff > 150)) &&
+                                    dis < 1.5 * units::cm ||
+                                (angle_diff < 10 || angle_diff > 170) && dis < 0.9 * units::cm &&
+                                    dis1 > (cluster->get_length() + max_cluster->get_length()) / 3.) {
+                                // to_be_merged_pairs.insert(std::make_pair(cluster, max_cluster));
+                                boost::add_edge(ilive2desc[map_cluster_index[cluster]],
+                                                ilive2desc[map_cluster_index[max_cluster]], g);
+
+                                // std::cout << "Connect 1 2: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << max_cluster->get_pca().center << std::endl;
+                                // curr_cluster = max_cluster;
+                                flag_merge = true;
+                            }
+                            else if (((angle_diff < 5 || angle_diff > 175) && dis < 2.5 * units::cm ||
+                                      (angle_diff < 10 || angle_diff > 170) && dis < 1.2 * units::cm) &&
+                                     dis1 > (cluster->get_length() + max_cluster->get_length()) / 3.) {
+                                // to_be_merged_pairs.insert(std::make_pair(cluster, max_cluster));
+                                boost::add_edge(ilive2desc[map_cluster_index[cluster]],
+                                                ilive2desc[map_cluster_index[max_cluster]], g);
+
+                                // std::cout << "Connect 1 3: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << max_cluster->get_pca().center << std::endl;
+                                flag_merge = true;
+                            }
+
+                            if ((fabs(dir2.angle(drift_dir_abs) - 3.1415926 / 2.) < 5 * 3.1415926 / 180. &&
+                                 fabs(dir1.angle(drift_dir_abs) - 3.1415926 / 2.) < 5 * 3.1415926 / 180.) &&
+                                (max_value[0] + max_value[1] + max_value[2]) >
+                                    0.7 * (num_total_points + num_total_points + num_total_points)) {
+                                // to_be_merged_pairs.insert(std::make_pair(cluster, max_cluster));
+                                boost::add_edge(ilive2desc[map_cluster_index[cluster]],
+                                                ilive2desc[map_cluster_index[max_cluster]], g);
+                                // std::cout << "Connect 1 4: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << max_cluster->get_pca().center << std::endl;
+                                flag_merge = true;
+                            }
+                        }
+                    }
+                }
+            }  // length cut ...
+
+
+            // if (cluster->get_length()/units::cm>5){
+            //     std::cout << "Connect 0-1: " << cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << flag_add_dir1 << " " << flag_add_dir2 << " " << flag_para_1 << " " << flag_prol_1 << " " << flag_para_2 << " " << flag_prol_2 << " " << extreme_points.first << " " << extreme_points.second << " " << dir1 << " " << dir2 << " " << extending_dis << " " << angle << std::endl;
+            // }
+
+            if (flag_add_dir1) {
+                // add extension points in ...
+                if (flag_para_1 || flag_prol_1) {
+                    // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle);
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params));
+                    dir1 *= -1;
+                    // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle);
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params));
+                }
+                else {
+                    // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle);
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                    dir1 *= -1;
+                    // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle);
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                    
+                }
+            }
+
+            if (flag_add_dir2) {
+                if (flag_para_2 || flag_prol_2) {
+                    // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle);
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params));
+                    dir2 *= -1;
+                    // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle);
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params));
+                }
+                else {
+                    // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle);
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                    dir2 *= -1;
+                    // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle);
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                }
+            }
+        }  // not the first cluster ...
+    }  // loop over clusters ...
+
+
+    // merge clusters
+
+
+    auto new_clusters = merge_clusters(g, live_grouping);
+    live_clusters.clear();
+    live_clusters = live_grouping.children();  // copy
+    std::sort(live_clusters.begin(), live_clusters.end(), [](const Cluster *cluster1, const Cluster *cluster2) {
+        return cluster1->get_length() > cluster2->get_length();
+    });
+    cluster_connectivity_graph_t  g2;
+    ilive2desc.clear();  // added live index to graph descriptor
+    map_cluster_index.clear();
+    for (const Cluster* live : live_grouping.children()) {
+        if (!live->get_scope_filter(scope)) continue;
+        size_t ilive = map_cluster_index.size();
+        map_cluster_index[live] = ilive;
+        ilive2desc[ilive] = boost::add_vertex(ilive, g2);
+    }
+
+    // to_be_merged_pairs.clear(); // clear it for other usage ...
+    for (auto it = new_clusters.begin(); it != new_clusters.end(); it++) {
+        const Cluster *cluster_1 = (*it);
+        if (!cluster_1->get_scope_filter(scope)) continue;
+        const auto& pca1 = cluster_1->get_pca();
+        geo_point_t p1_c = pca1.center;
+        geo_point_t p1_dir = pca1.axis.at(0);
+        Ray l1(p1_c, p1_c+p1_dir);
+        for (auto it1 = live_clusters.begin(); it1 != live_clusters.end(); it1++) {
+            Cluster *cluster_2 = (*it1);
+            if (!cluster_2->get_scope_filter(scope)) continue;
+            if (cluster_2->get_length() < 3 * units::cm) continue;
+            if (cluster_2 == cluster_1) continue;
+
+            const auto& pca2 = cluster_2->get_pca();
+            if (cluster_1->get_length() > 25 * units::cm || cluster_2->get_length() > 25 * units::cm ||
+                (cluster_1->get_length() + cluster_2->get_length()) > 30 * units::cm) {
+                // cluster_2->Calc_PCA();
+                geo_point_t p2_c = pca2.center;
+                geo_point_t p2_dir = pca2.axis.at(0);
+
+                geo_point_t cc_dir(p2_c.x() - p1_c.x(), p2_c.y() - p1_c.y(), p2_c.z() - p1_c.z());
+
+                double angle_diff = fabs(p1_dir.angle(p2_dir) - 3.1415926 / 2.) / 3.1415926 * 180.;
+                double angle_diff1 = fabs(cc_dir.angle(p1_dir) - 3.1415926 / 2.) / 3.1415926 * 180;
+                double angle_diff2 = fabs(cc_dir.angle(p2_dir) - 3.1415926 / 2.) / 3.1415926 * 180;
+
+                Ray l2(p2_c, p2_c+p2_dir);
+                // double dis = l1.closest_dis(l2);
+                double dis = ray_length(ray_pitch(l1, l2));
+
+                double dis1 = sqrt(pow(p1_c.x() - p2_c.x(), 2) + pow(p1_c.y() - p2_c.y(), 2) + pow(p1_c.z() - p2_c.z(), 2));
+
+                if (p1_dir.magnitude() != 0) p1_dir = p1_dir.norm();
+                if (p2_dir.magnitude() != 0) p2_dir = p2_dir.norm();
+
+                // bool flag_merge = false;
+
+                // if (cluster_1->get_length()>300*units::cm) std::cout << "Check 2: " << cluster_1->get_length()/units::cm << " " << cluster_2->get_length()/units::cm << " " << angle_diff << " " << dis/units::cm << " " << dis1/units::cm << " " << angle_diff1 << " " << angle_diff2 << std::endl;
+
+                if (((angle_diff > 85) && (angle_diff1 > 90 - 1.5 * (90 - angle_diff)) &&
+                         (angle_diff2 > 90 - 1.5 * (90 - angle_diff)) && dis < 2.5 * units::cm ||
+                     (angle_diff > 80) && angle_diff1 > 80 && angle_diff2 > 80 && dis < 1.2 * units::cm) &&
+                    dis1 > (cluster_2->get_length() + cluster_1->get_length()) / 3.) {
+                    // to_be_merged_pairs.insert(std::make_pair(cluster_1, cluster_2));
+                    boost::add_edge(ilive2desc[map_cluster_index[cluster_1]],
+                                    ilive2desc[map_cluster_index[cluster_2]], g2);
+                    // std::cout << "Connect 2: " << cluster_1->get_length()/units::cm << " " << cluster_2->get_length()/units::cm << " " << pca1.center << " " << pca2.center << std::endl;
+                    // flag_merge = true;
+                }
+                else if ((angle_diff > 87) && (angle_diff1 > 90 - 1.5 * (90 - angle_diff)) &&
+                         (angle_diff2 > 90 - 1.5 * (90 - angle_diff)) && dis < 4.0 * units::cm &&
+                         dis1 > (cluster_2->get_length() + cluster_1->get_length()) / 2. &&
+                         cluster_2->get_length() > 15 * units::cm &&
+                         cluster_1->get_length() > 15 * units::cm &&
+                         cluster_2->get_length() + cluster_1->get_length() > 45 * units::cm) {
+                    // to_be_merged_pairs.insert(std::make_pair(cluster_1, cluster_2));
+                    boost::add_edge(ilive2desc[map_cluster_index[cluster_1]],
+                                    ilive2desc[map_cluster_index[cluster_2]], g2);
+                    // std::cout << "Connect 2: " << cluster_1->get_length()/units::cm << " " << cluster_2->get_length()/units::cm << " " << pca1.center << " " << pca2.center << std::endl;
+                    // flag_merge = true;
+                }
+            }
+        }
+    }
+
+    new_clusters = merge_clusters(g2, live_grouping);
+
+}

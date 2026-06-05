@@ -23,10 +23,19 @@ static bool adjacent(const std::set<double>& times, const double& time1, const d
     double tmax = time2;
     if (time1 > time2) std::swap(tmin, tmax);
     auto iter1 = times.find(tmin);
-    if (iter1 == times.end()) THROW(ValueError() << errmsg{String::format("tmin \"%d\" not in \"times\"", tmin)});
+    if (iter1 == times.end()) THROW(ValueError() << errmsg{String::format("tmin \"%f\" not in \"times\"", tmin)});
     auto iter2 = times.find(tmax);
-    if (iter2 == times.end()) THROW(ValueError() << errmsg{String::format("tmax \"%d\" not in \"times\"", tmin)});
+    if (iter2 == times.end()) THROW(ValueError() << errmsg{String::format("tmax \"%f\" not in \"times\"", tmax)});
     return (std::distance(iter1, iter2) == 1);
+}
+
+/// two slices are adjacent if they are within an offset, e.g., 4 ticks, of each other
+/// TODO: confirm with Xin
+static bool adjacent_dead(const ISlice::pointer slice1, const ISlice::pointer slice2, const double offset = 4*500*units::us)
+{
+    if (slice2->start() >= slice1->start() and slice2->start() < slice1->start() + slice1->span() + offset) return true;
+    if (slice1->start() >= slice2->start() and slice1->start() < slice2->start() + slice1->span() + offset) return true;
+    return false;
 }
 
 void WireCell::Img::geom_clustering(cluster_indexed_graph_t& grind, IBlobSet::vector::iterator beg,
@@ -38,7 +47,7 @@ void WireCell::Img::geom_clustering(cluster_indexed_graph_t& grind, IBlobSet::ve
         return;
     }
 
-    std::unordered_set<std::string> known_policies = {"simple", "uboone", "uboone_local"};
+    std::unordered_set<std::string> known_policies = {"simple", "uboone", "uboone_local", "dead_clus"};
     if (known_policies.find(policy) == known_policies.end()) {
         THROW(ValueError() << errmsg{String::format("policy \"%s\" not implemented!", policy)});
     }
@@ -85,7 +94,9 @@ void WireCell::Img::geom_clustering(cluster_indexed_graph_t& grind, IBlobSet::ve
         auto assoc = [&](RayGrid::blobref_t& a, RayGrid::blobref_t& b) {
             int an = a - beg1;
             int bn = b - beg2;
-            grind.edge(iblobs1[an], iblobs2[bn]);
+            // make sure the blobs that are connected have the same face ...
+            if (iblobs1[an]->face() == iblobs2[bn]->face())
+               grind.edge(iblobs1[an], iblobs2[bn]);
         };
         bool verbose = false;
         TolerantVisitor tv{map_gap_tol[rel_diff], verbose};
@@ -195,7 +206,7 @@ void WireCell::Img::geom_clustering(cluster_indexed_graph_t& grind, IBlobSet::ve
 void WireCell::Img::grouped_geom_clustering(cluster_graph_t& cg, std::string policy,
                                             const std::unordered_map<cluster_vertex_t, int> groups)
 {
-    std::unordered_set<std::string> known_policies = {"simple", "uboone", "uboone_local"};
+    std::unordered_set<std::string> known_policies = {"simple", "uboone", "uboone_local", "dead_clus"};
     if (known_policies.find(policy) == known_policies.end()) {
         THROW(ValueError() << errmsg{String::format("policy \"%s\" not implemented!", policy)});
     }
@@ -212,6 +223,11 @@ void WireCell::Img::grouped_geom_clustering(cluster_graph_t& cg, std::string pol
     if (policy == "simple") {
         // max_rel_diff = 1;
         map_gap_tol = {{1, 0}};
+    }
+
+    if (policy == "dead_clus") {
+        // max_rel_diff = 1;
+        map_gap_tol = {{0, 1}, {1, 1}};
     }
 
     // overlap + tolerance
@@ -258,6 +274,13 @@ void WireCell::Img::grouped_geom_clustering(cluster_graph_t& cg, std::string pol
             int rel_diff = std::round(fabs((islice1->start() - islice2->start()) / islice1->span()));
             if (map_gap_tol.find(rel_diff) == map_gap_tol.end()) continue;
             if (policy == "uboone_local" && !adjacent(slice_times, islice1->start(), islice2->start())) continue;
+            if (policy == "dead_clus") {
+                // std::cout << "adjacent_dead: "
+                //           << islice1->start() << " " << islice1->span() << " "
+                //           << islice2->start() << " " << islice2->span() << std::endl;
+                if (!adjacent_dead(islice1, islice2)) continue;
+                rel_diff = 0; // use 1 as wire offset
+            }
             auto bdescs2 = neighbors_oftype<cluster_node_t::blob_t>(cg, *siter2);
 
             RayGrid::blobs_t blobs2 = gen(bdescs2);
@@ -273,7 +296,9 @@ void WireCell::Img::grouped_geom_clustering(cluster_graph_t& cg, std::string pol
                     if (iter2 == groups.end()) return;
                     if (iter1->second != iter2->second) return;
                 }
-                boost::add_edge(bdescs1[an], bdescs2[bn], cg);
+                // make sure the face are the same
+                if (get<cluster_node_t::blob_t>(cg[bdescs1[an]].ptr)->face() == get<cluster_node_t::blob_t>(cg[bdescs2[bn]].ptr)->face())
+                    boost::add_edge(bdescs1[an], bdescs2[bn], cg);
             };
             bool verbose = false;
             TolerantVisitor tv{map_gap_tol[rel_diff], verbose};

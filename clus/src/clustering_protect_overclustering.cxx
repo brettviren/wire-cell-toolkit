@@ -1,0 +1,583 @@
+#include "WireCellClus/IEnsembleVisitor.h"
+#include "WireCellClus/ClusteringFuncs.h"
+#include "WireCellClus/ClusteringFuncsMixins.h"
+
+#include "WireCellIface/IConfigurable.h"
+
+#include "WireCellUtil/NamedFactory.h"
+
+#include "WireCellUtil/Graph.h"
+
+class ClusteringProtectOverclustering;
+WIRECELL_FACTORY(ClusteringProtectOverclustering, ClusteringProtectOverclustering,
+                 WireCell::IConfigurable, WireCell::Clus::IEnsembleVisitor)
+
+
+using namespace WireCell;
+using namespace WireCell::Clus;
+using namespace WireCell::Clus::Graphs;
+using namespace WireCell::Clus::Facade;
+using namespace WireCell::PointCloud::Tree;
+
+static void clustering_protect_overclustering(
+    Grouping &live_grouping,
+    IDetectorVolumes::pointer dv,
+    IPCTransformSet::pointer pcts,
+    const Tree::Scope& scope
+    );
+
+class ClusteringProtectOverclustering : public IConfigurable, public Clus::IEnsembleVisitor, private NeedDV, private NeedPCTS, private NeedScope {
+public:
+    ClusteringProtectOverclustering() {}
+    virtual ~ClusteringProtectOverclustering() {}
+
+    void configure(const WireCell::Configuration& config) {
+        NeedDV::configure(config);
+        NeedPCTS::configure(config);
+        NeedScope::configure(config);
+    }
+
+    void visit(Ensemble& ensemble) const {
+        auto& live = *ensemble.with_name("live").at(0);
+        clustering_protect_overclustering(live, m_dv, m_pcts, m_scope);
+    }
+
+};
+
+// NOTE: This function implements the same physics logic as
+// Graphs::connect_graph_relaxed() in connect_graph_relaxed.cxx.
+// Bug fixes applied there (especially multi-APA handling) must be
+// mirrored here.  See examine_graph_review.md §B.4 for details.
+static std::map<int, Cluster *> Separate_overclustering(
+    Cluster *cluster,
+    IDetectorVolumes::pointer dv,
+    IPCTransformSet::pointer pcts,
+    const Scope& scope)
+{
+    // can follow ToyClustering_separate to add clusters ...
+    auto* grouping = cluster->grouping();
+
+    auto wpids = grouping->wpids();
+    std::map<WirePlaneId, double> map_wpid_nticks_live;
+    for (const auto& wpid : wpids) {
+        map_wpid_nticks_live[wpid] = dv->metadata(wpid)["nticks_live_slice"].asDouble();  
+    }
+
+
+    // cluster->Create_point_cloud();
+    const int N = cluster->npoints();
+    auto graph = std::make_shared<Weighted::Graph>(N);
+
+    // ToyPointCloud *point_cloud = cluster->get_point_cloud();
+    std::vector<Blob*> mcells = cluster->children();
+
+    // Map blob pointer → position index in mcells for deterministic (non-pointer) container keying.
+    std::map<const Blob*, int> blob_to_idx;
+    for (int bi = 0; bi < (int)mcells.size(); ++bi) {
+        blob_to_idx[mcells[bi]] = bi;
+    }
+
+    // plane -> point -> wire index; indexed by blob position (not pointer) for determinism.
+    const auto& winds = cluster->wire_indices();
+    std::vector<std::map<int, std::set<int>>> map_mcell_wind_wcps[3];
+    for (size_t pi = 0; pi < 3; ++pi) {
+        map_mcell_wind_wcps[pi].resize(mcells.size());
+    }
+
+    for (int bi = 0; bi < (int)mcells.size(); ++bi) {
+        Blob *mcell = mcells[bi];
+        const std::vector<int> &wcps = cluster->get_blob_indices(mcell);
+        for (const int point_index : wcps) {
+            for (size_t plane_ind=0; plane_ind!=3; ++plane_ind) {
+                const int wind = winds[plane_ind][point_index];
+                map_mcell_wind_wcps[plane_ind][bi][wind].insert(point_index);
+            }
+        }
+    }
+
+    // create graph for points inside the same mcell
+    for (auto it = mcells.begin(); it != mcells.end(); it++) {
+        Blob *mcell = (*it);
+        // std::vector<int> &wcps = point_cloud->get_mcell_indices(mcell);
+        const std::vector<int> &wcps = cluster->get_blob_indices(mcell);
+        int max_wire_interval = mcell->get_max_wire_interval();
+        int min_wire_interval = mcell->get_min_wire_interval();
+        std::map<int, std::set<int>> *map_max_index_wcps;
+        std::map<int, std::set<int>> *map_min_index_wcps;
+       
+        const int max_wire_type = mcell->get_max_wire_type();
+        const int min_wire_type = mcell->get_min_wire_type();
+        map_max_index_wcps = &map_mcell_wind_wcps[max_wire_type][blob_to_idx.at(mcell)];
+        map_min_index_wcps = &map_mcell_wind_wcps[min_wire_type][blob_to_idx.at(mcell)];
+
+        for (const int index1 : wcps) {
+            // WCPointCloud<double>::WCPoint &wcp1 = cloud.pts[*it1];
+            // int index1 = wcp1.index;
+            // std::cout << winds.size() << " " << max_wire_type << " " << min_wire_type << " " << winds[max_wire_type].size() << winds[min_wire_type].size() << std::endl;
+            int index_max_wire = winds[max_wire_type][index1];
+            int index_min_wire = winds[min_wire_type][index1];
+            
+
+            std::vector<std::set<int> *> max_wcps_set;
+            std::vector<std::set<int> *> min_wcps_set;
+
+            // Use lower/upper_bound for O(log W) range lookup instead of linear scan (C.2 fix).
+            {
+                auto lo = map_max_index_wcps->lower_bound(index_max_wire - max_wire_interval);
+                auto hi = map_max_index_wcps->upper_bound(index_max_wire + max_wire_interval);
+                for (auto it2 = lo; it2 != hi; ++it2)
+                    max_wcps_set.push_back(&(it2->second));
+            }
+            {
+                auto lo = map_min_index_wcps->lower_bound(index_min_wire - min_wire_interval);
+                auto hi = map_min_index_wcps->upper_bound(index_min_wire + min_wire_interval);
+                for (auto it2 = lo; it2 != hi; ++it2)
+                    min_wcps_set.push_back(&(it2->second));
+            }
+
+            std::set<int> wcps_set1;
+            std::set<int> wcps_set2;
+
+            for (auto it2 = max_wcps_set.begin(); it2 != max_wcps_set.end(); it2++) {
+                wcps_set1.insert((*it2)->begin(), (*it2)->end());
+            }
+            for (auto it3 = min_wcps_set.begin(); it3 != min_wcps_set.end(); it3++) {
+                wcps_set2.insert((*it3)->begin(), (*it3)->end());
+            }
+
+         
+            {
+                std::set<int> common_set;
+                set_intersection(wcps_set1.begin(), wcps_set1.end(), wcps_set2.begin(), wcps_set2.end(),
+                                 std::inserter(common_set, common_set.begin()));
+
+                //	std::cout << "S0: " << common_set.size() << std::endl;
+
+                const geo_point_t wcp1 = cluster->point3d(index1);
+                for (const int index2 : common_set) {
+                    if (index2 != index1) {
+                        const geo_point_t wcp2 = cluster->point3d(index2);
+                        const double dis = sqrt(pow(wcp1.x()-wcp2.x(),2)+pow(wcp1.y()-wcp2.y(),2)+pow(wcp1.z()-wcp2.z(),2));
+                        add_edge(index1, index2, dis, *graph);
+                    }
+                }
+            }
+        }
+    }
+
+    // Build connected blob pairs from same-slice and adjacent-slice overlaps.
+    // Iterate time_blob_map() directly (no intermediate af_time_slices copy).
+    const auto& time_cells_set_map = cluster->time_blob_map();
+    std::vector<std::pair<const Blob*, const Blob*>> connected_mcells;
+
+    for (const auto& [apa, face_map] : time_cells_set_map) {
+        for (const auto& [face, slice_map] : face_map) {
+            const int nticks = grouping->get_nticks_per_slice().at(apa).at(face);
+            for (auto it_s = slice_map.begin(); it_s != slice_map.end(); ++it_s) {
+                const int t = it_s->first;
+                const BlobSet& mcells_set = it_s->second;
+
+                // same time-slice pairs
+                if (mcells_set.size() >= 2) {
+                    for (auto it2 = mcells_set.begin(); it2 != mcells_set.end(); ++it2) {
+                        for (auto it3 = std::next(it2); it3 != mcells_set.end(); ++it3)
+                            if ((*it2)->overlap_fast(**it3, 2))
+                                connected_mcells.push_back({*it2, *it3});
+                    }
+                }
+
+                // adjacent slices (+1 tick, possibly +2 ticks)
+                std::vector<const BlobSet*> next_sets;
+                auto it_next = std::next(it_s);
+                if (it_next != slice_map.end()) {
+                    const int dt = it_next->first - t;
+                    if (dt == nticks) {
+                        next_sets.push_back(&it_next->second);
+                        auto it_next2 = std::next(it_next);
+                        if (it_next2 != slice_map.end() && it_next2->first - t == 2*nticks)
+                            next_sets.push_back(&it_next2->second);
+                    } else if (dt == 2*nticks) {
+                        next_sets.push_back(&it_next->second);
+                    }
+                }
+                for (const BlobSet* nset : next_sets) {
+                    for (auto it1 = mcells_set.begin(); it1 != mcells_set.end(); ++it1)
+                        for (auto it2 = nset->begin(); it2 != nset->end(); ++it2)
+                            if ((*it1)->overlap_fast(**it2, 2))
+                                connected_mcells.push_back({*it1, *it2});
+                }
+            }
+        }
+    }
+
+    // For each connected blob pair, accumulate the top-5 nearest-neighbour candidates
+    // into closest_index.  The lambda runs the wire-overlap intersection from the src
+    // blob's interval against the dst blob's wire-index map.
+    const size_t max_num_nodes = 5;
+    std::map<std::pair<int, int>, std::set<std::pair<double, int>>> closest_index;
+
+    auto accumulate_closest = [&](const Blob* mcell_src, const Blob* mcell_dst,
+                                   const std::vector<int>& wcps_src) {
+        const int max_w_interval = mcell_src->get_max_wire_interval();
+        const int min_w_interval = mcell_src->get_min_wire_interval();
+        const int max_wtype     = mcell_src->get_max_wire_type();
+        const int min_wtype     = mcell_src->get_min_wire_type();
+        const auto& map_max = map_mcell_wind_wcps[max_wtype][blob_to_idx.at(mcell_dst)];
+        const auto& map_min = map_mcell_wind_wcps[min_wtype][blob_to_idx.at(mcell_dst)];
+
+        for (const int index1 : wcps_src) {
+            const int idx_max = winds[max_wtype][index1];
+            const int idx_min = winds[min_wtype][index1];
+
+            std::set<int> wcps_set1, wcps_set2;
+            for (const auto& [wind, pts] : map_max)
+                if (std::abs(wind - idx_max) <= max_w_interval)
+                    wcps_set1.insert(pts.begin(), pts.end());
+            for (const auto& [wind, pts] : map_min)
+                if (std::abs(wind - idx_min) <= min_w_interval)
+                    wcps_set2.insert(pts.begin(), pts.end());
+
+            std::set<int> common_set;
+            set_intersection(wcps_set1.begin(), wcps_set1.end(),
+                             wcps_set2.begin(), wcps_set2.end(),
+                             std::inserter(common_set, common_set.begin()));
+
+            const geo_point_t wcp1 = cluster->point3d(index1);
+            for (const int index2 : common_set) {
+                if (index2 == index1) continue;
+                const geo_point_t wcp2 = cluster->point3d(index2);
+                const double dis = sqrt(pow(wcp1.x()-wcp2.x(),2)+pow(wcp1.y()-wcp2.y(),2)+pow(wcp1.z()-wcp2.z(),2));
+                const int time2 = cluster->blob_with_point(index2)->slice_index_min();
+                auto& ci_entry = closest_index[{index1, time2}];
+                ci_entry.insert({dis, index2});
+                if (ci_entry.size() > max_num_nodes)
+                    ci_entry.erase(std::next(ci_entry.begin(), max_num_nodes), ci_entry.end());
+            }
+        }
+    };
+
+    for (const auto& [mcell1, mcell2] : connected_mcells) {
+        accumulate_closest(mcell1, mcell2, cluster->get_blob_indices(mcell1)); // test mcell2 wires against mcell1 points
+        accumulate_closest(mcell2, mcell1, cluster->get_blob_indices(mcell2)); // test mcell1 wires against mcell2 points
+    }
+
+    for (auto it4 = closest_index.begin(); it4 != closest_index.end(); it4++) {
+        int index1 = it4->first.first;
+        for (auto it5 = it4->second.begin(); it5!=it4->second.end(); it5++){
+            int index2 = (*it5).second;
+            double dis = (*it5).first;
+            add_edge(index1,index2,dis,*graph);
+            // protect against dead cells ...
+            //std::cout << dis/units::cm << std::endl;
+            if (it5 == it4->second.begin() && dis > 0.25*units::cm)
+                break;
+        }
+
+    
+    }
+    // end of copying ...
+
+    // now form the connected components, point -> component
+    std::vector<int> component(num_vertices(*graph));
+    const int num = connected_components(*graph, &component[0]);
+
+    // Create ordered components
+    std::vector<ComponentInfo> ordered_components;
+    ordered_components.reserve(num);  // num components, not num vertices (B.5 fix)
+    for (size_t i = 0; i < component.size(); ++i) {
+        ordered_components.emplace_back(i);
+    }
+
+    // Assign vertices to components
+    for (size_t i = 0; i < component.size(); ++i) {
+        ordered_components[component[i]].add_vertex(i);
+    }
+
+    if (num <= 1) return {};
+
+    // Sort components by minimum vertex index
+    std::sort(ordered_components.begin(), ordered_components.end(),
+        [](const ComponentInfo& a, const ComponentInfo& b) {
+            return a.min_vertex < b.min_vertex;
+        });
+
+
+
+    // if (num > 1) {
+        // For each component, create a point cloud
+    std::vector<std::shared_ptr<Simple3DPointCloud>> pt_clouds;
+    std::vector<std::vector<size_t>> pt_clouds_global_indices;
+    for (const auto& comp : ordered_components) {
+        auto pt_cloud = std::make_shared<Simple3DPointCloud>();
+        std::vector<size_t> global_indices;
+        
+        for (size_t vertex_idx : comp.vertex_indices) {
+            geo_point_t pt = cluster->point3d(vertex_idx);
+            pt_cloud->add({pt.x(), pt.y(), pt.z()});
+            global_indices.push_back(vertex_idx);
+        }
+        
+        pt_clouds.push_back(pt_cloud);
+        pt_clouds_global_indices.push_back(global_indices);
+    }
+
+
+        // Sentinel (-1,-1,1e9): indices <0 means "no valid closest pair yet". (C.3 fix)
+        const auto kNoEntry = std::make_tuple(-1, -1, 1e9);
+        std::vector<std::vector<std::tuple<int, int, double>>> index_index_dis(
+            num, std::vector<std::tuple<int, int, double>>(num, kNoEntry));
+        std::vector<std::vector<std::tuple<int, int, double>>> index_index_dis_mst(
+            num, std::vector<std::tuple<int, int, double>>(num, kNoEntry));
+        std::vector<std::vector<std::tuple<int, int, double>>> index_index_dis_dir1(
+            num, std::vector<std::tuple<int, int, double>>(num, kNoEntry));
+        std::vector<std::vector<std::tuple<int, int, double>>> index_index_dis_dir2(
+            num, std::vector<std::tuple<int, int, double>>(num, kNoEntry));
+        std::vector<std::vector<std::tuple<int, int, double>>> index_index_dis_dir_mst(
+            num, std::vector<std::tuple<int, int, double>>(num, kNoEntry));
+
+        // Hoist scope-transform computation out of per-step path-check loops.
+        const bool needs_scope_transform = cluster->get_default_scope().hash() != cluster->get_raw_scope().hash();
+        const auto scope_transform = needs_scope_transform
+            ? pcts->pc_transform(cluster->get_scope_transform(cluster->get_default_scope()))
+            : std::shared_ptr<IPCTransform>{};
+        const double cluster_t0 = needs_scope_transform ? cluster->get_cluster_t0() : 0.0;
+
+        // Walk a 1 cm-step path between the two closest points and count steps
+        // that fail is_good_point. If too many bad steps, invalidate the entry.
+        // Guard: if std::get<0>(entry) < 0 the entry is already invalid — skip.
+        auto check_path = [&](std::tuple<int,int,double>& entry,
+                               const Simple3DPointCloud& cloud_j,
+                               const std::vector<size_t>& gidx_j,
+                               const Simple3DPointCloud& cloud_k,
+                               const std::vector<size_t>& gidx_k) {
+            if (std::get<0>(entry) < 0) return;
+            geo_point_t p1 = cloud_j.point(std::get<0>(entry));
+            auto wpid_p1 = cluster->wire_plane_id(gidx_j.at(std::get<0>(entry)));
+            geo_point_t p2 = cloud_k.point(std::get<1>(entry));
+            auto wpid_p2 = cluster->wire_plane_id(gidx_k.at(std::get<1>(entry)));
+            const double dis = sqrt(pow(p1.x()-p2.x(),2)+pow(p1.y()-p2.y(),2)+pow(p1.z()-p2.z(),2));
+            const int num_steps = dis / (1.0*units::cm) + 1;
+            int num_bad = 0;
+            geo_point_t test_p;
+            for (int ii = 0; ii != num_steps; ++ii) {
+                test_p.set(p1.x() + (p2.x()-p1.x())/num_steps*(ii+1),
+                           p1.y() + (p2.y()-p1.y())/num_steps*(ii+1),
+                           p1.z() + (p2.z()-p1.z())/num_steps*(ii+1));
+                auto test_wpid = get_wireplaneid(test_p, wpid_p1, wpid_p2, dv);
+                if (test_wpid.apa() != -1) {
+                    geo_point_t test_p_raw = test_p;
+                    if (needs_scope_transform)
+                        test_p_raw = scope_transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
+                    if (!cluster->grouping()->is_good_point(test_p_raw, test_wpid.apa(), test_wpid.face()))
+                        ++num_bad;
+                }
+                else {
+                    // Point is between APA volumes — treat as a bad step so the
+                    // bad-step fraction is not artificially diluted (B.2 fix).
+                    ++num_bad;
+                }
+            }
+            if (num_bad > 7 || (num_bad > 2 && num_bad >= 0.75 * num_steps))
+                entry = std::make_tuple(-1, -1, 1e9);
+        };
+
+        // check against the closest distance ...
+        // no need to have MST ...
+        for (int j = 0; j != num; j++) {
+            for (int k = j + 1; k != num; k++) {
+                index_index_dis[j][k] = pt_clouds.at(j)->get_closest_points(*pt_clouds.at(k));
+
+                if ((num < 100 && pt_clouds.at(j)->get_num_points() > 100 && pt_clouds.at(k)->get_num_points() > 100 &&
+                        (pt_clouds.at(j)->get_num_points() + pt_clouds.at(k)->get_num_points()) > 400) ||
+                    (pt_clouds.at(j)->get_num_points() > 500 && pt_clouds.at(k)->get_num_points() > 500)) {
+                    // WCPointCloud<double>::WCPoint wp1 = cloud.pts.at(std::get<0>(index_index_dis[j][k]));
+                    // WCPointCloud<double>::WCPoint wp2 = cloud.pts.at(std::get<1>(index_index_dis[j][k]));
+                    // Point p1(wp1.x, wp1.y, wp1.z);
+                    // Point p2(wp2.x, wp2.y, wp2.z);
+                    geo_point_t p1 = pt_clouds.at(j)->point(std::get<0>(index_index_dis[j][k]));
+                    geo_point_t p2 = pt_clouds.at(k)->point(std::get<1>(index_index_dis[j][k]));
+
+                    // TVector3 dir1 = cluster->VHoughTrans(p1, 30 * units::cm, pt_clouds.at(j));
+                    // TVector3 dir2 = cluster->VHoughTrans(p2, 30 * units::cm, pt_clouds.at(k));
+                    // dir1 *= -1;
+                    // dir2 *= -1;
+
+                    geo_point_t dir1 = cluster->vhough_transform(p1, 30 * units::cm, Cluster::HoughParamSpace::theta_phi, pt_clouds.at(j), pt_clouds_global_indices.at(j));
+                    geo_point_t dir2 = cluster->vhough_transform(p2, 30 * units::cm, Cluster::HoughParamSpace::theta_phi, pt_clouds.at(k), pt_clouds_global_indices.at(k));
+                    dir1 = dir1 * -1;
+                    dir2 = dir2 * -1;
+
+                    std::pair<int, double> result1 = pt_clouds.at(k)->get_closest_point_along_vec(
+                        p1, dir1, 80 * units::cm, 5 * units::cm, 7.5, 3 * units::cm);
+
+                    if (result1.first >= 0) {
+                        index_index_dis_dir1[j][k] =
+                            std::make_tuple(std::get<0>(index_index_dis[j][k]), result1.first, result1.second);
+                    }
+
+                    std::pair<int, double> result2 = pt_clouds.at(j)->get_closest_point_along_vec(
+                        p2, dir2, 80 * units::cm, 5 * units::cm, 7.5, 3 * units::cm);
+
+                    if (result2.first >= 0) {
+                        index_index_dis_dir2[j][k] =
+                            std::make_tuple(result2.first, std::get<1>(index_index_dis[j][k]), result2.second);
+                    }
+                }
+
+                // Check path quality; invalidate entries with too many bad steps.
+                check_path(index_index_dis[j][k],
+                           *pt_clouds.at(j), pt_clouds_global_indices.at(j),
+                           *pt_clouds.at(k), pt_clouds_global_indices.at(k));
+                check_path(index_index_dis_dir1[j][k],
+                           *pt_clouds.at(j), pt_clouds_global_indices.at(j),
+                           *pt_clouds.at(k), pt_clouds_global_indices.at(k));
+                check_path(index_index_dis_dir2[j][k],
+                           *pt_clouds.at(j), pt_clouds_global_indices.at(j),
+                           *pt_clouds.at(k), pt_clouds_global_indices.at(k));
+            }
+        }
+
+        // deal with MST
+        {
+            const int N = num;
+            Weighted::Graph temp_graph(N);
+
+            for (int j = 0; j != num; j++) {
+                for (int k = j + 1; k != num; k++) {
+                    int index1 = j;
+                    int index2 = k;
+                    if (std::get<0>(index_index_dis[j][k]) >= 0)
+                        /*auto edge =*/ add_edge(index1, index2, std::get<2>(index_index_dis[j][k]), temp_graph);
+                }
+            }
+
+             // Process MST
+            process_mst_deterministically(temp_graph, index_index_dis, index_index_dis_mst);
+
+        }
+
+        // deal with MST for directionality
+        {
+            const int N = num;
+            Weighted::Graph temp_graph(N);
+
+            for (int j = 0; j != num; j++) {
+                for (int k = j + 1; k != num; k++) {
+                    int index1 = j;
+                    int index2 = k;
+                    if (std::get<0>(index_index_dis_dir1[j][k]) >= 0 || std::get<0>(index_index_dis_dir2[j][k]) >= 0)
+                        /*auto edge =*/ add_edge(
+                            index1, index2,
+                            std::min(std::get<2>(index_index_dis_dir1[j][k]), std::get<2>(index_index_dis_dir2[j][k])),
+                            temp_graph);
+                }
+            }
+
+            process_mst_deterministically(temp_graph, index_index_dis, index_index_dis_dir_mst);
+           
+        }
+
+        for (int j = 0; j != num; j++) {
+            for (int k = j + 1; k != num; k++) {
+                if (std::get<2>(index_index_dis[j][k]) < 3 * units::cm) {
+                    index_index_dis_mst[j][k] = index_index_dis[j][k];
+                }
+
+                // establish the path ...
+                if (std::get<0>(index_index_dis_mst[j][k]) >= 0) {
+                    // auto edge = add_edge(std::get<0>(index_index_dis_mst[j][k]), std::get<1>(index_index_dis_mst[j][k]),
+                    //                      *graph);
+                    // if (edge.second) {
+                    const int gind1 = pt_clouds_global_indices.at(j).at(std::get<0>(index_index_dis_mst[j][k]));
+                    const int gind2 = pt_clouds_global_indices.at(k).at(std::get<1>(index_index_dis_mst[j][k]));
+                    const float dis = std::get<2>(index_index_dis_mst[j][k]);  // B.6: collapsed dead if/else
+                    // }
+
+                    /*auto edge =*/ add_edge(gind1, gind2, dis,*graph);
+                }
+
+                if (std::get<0>(index_index_dis_dir_mst[j][k]) >= 0) {
+                    if (std::get<0>(index_index_dis_dir1[j][k]) >= 0) {
+                        // auto edge = add_edge(std::get<0>(index_index_dis_dir1[j][k]),
+                        //                      std::get<1>(index_index_dis_dir1[j][k]), *graph);
+                        // if (edge.second) {
+                        const int gind1 = pt_clouds_global_indices.at(j).at(std::get<0>(index_index_dis_dir1[j][k]));
+                        const int gind2 = pt_clouds_global_indices.at(k).at(std::get<1>(index_index_dis_dir1[j][k]));
+                        const float dis = std::get<2>(index_index_dis_dir1[j][k]);  // B.6: collapsed dead if/else
+                        // }
+                        /*auto edge =*/ add_edge(gind1, gind2, dis,*graph);
+                    }
+                    if (std::get<0>(index_index_dis_dir2[j][k]) >= 0) {
+                        // auto edge = add_edge(std::get<0>(index_index_dis_dir2[j][k]),
+                        //                      std::get<1>(index_index_dis_dir2[j][k]), *graph);
+                        // if (edge.second) {
+                        const int gind1 = pt_clouds_global_indices.at(j).at(std::get<0>(index_index_dis_dir2[j][k]));
+                        const int gind2 = pt_clouds_global_indices.at(k).at(std::get<1>(index_index_dis_dir2[j][k]));
+                        const float dis = std::get<2>(index_index_dis_dir2[j][k]);  // B.6: collapsed dead if/else
+                        // }
+                        /*auto edge =*/ add_edge(gind1, gind2, dis, *graph);
+                    }
+                }
+                // end check ...
+            }
+        }
+
+        // study the independent component again ...
+        {
+            // point -> component
+            std::vector<int> component1(num_vertices(*graph));
+            const int num1 = connected_components(*graph, &component1[0]);
+
+            if (num1 > 1) {
+
+                
+                std::vector<int> b2groupid(cluster->nchildren(), -1);
+                std::vector<int>::size_type i;
+                for (i = 0; i != component1.size(); ++i) {
+                    const int bind = cluster->kd3d().major_index(i);
+                    b2groupid.at(bind) = component1[i];
+                }
+                auto id2clusters = grouping->separate(cluster, b2groupid, true);
+                return id2clusters;
+            }
+        }
+
+       
+    return {};
+}
+
+static void clustering_protect_overclustering(
+    Grouping &live_grouping,
+    IDetectorVolumes::pointer dv,
+    IPCTransformSet::pointer pcts,
+    const Tree::Scope& scope)
+{
+    std::vector<Cluster *> live_clusters = live_grouping.children();  // copy
+
+    for (size_t i = 0; i != live_clusters.size(); i++) {
+        Cluster *cluster = live_clusters.at(i);
+        if (!cluster->get_scope_filter(scope)) continue;
+        if (cluster->get_default_scope().hash() != scope.hash()) {
+            cluster->set_default_scope(scope);
+            // std::cout << "Test: Set default scope: " << pc_name << " " << coords[0] << " " << coords[1] << " " << coords[2] << " " << cluster->get_default_scope().hash() << " " << scope.hash() << std::endl;
+        }
+        // std::cout << "Cluster: " << i << " " << cluster->npoints() << std::endl;
+        Separate_overclustering(cluster, dv, pcts, scope);
+    }
+
+    //   {
+    //     auto live_clusters = live_grouping.children(); // copy
+    //      // Process each cluster
+    //      for (size_t iclus = 0; iclus < live_clusters.size(); ++iclus) {
+    //          Cluster* cluster = live_clusters.at(iclus);
+    //          auto& scope = cluster->get_default_scope();
+    //          std::cout << "Test: " << iclus << " " << cluster->nchildren() << " " << scope.pcname << " " << scope.coords[0] << " " << scope.coords[1] << " " << scope.coords[2] << " " << cluster->get_scope_filter(scope)<< " " << cluster->get_pca().center) << std::endl;
+    //      }
+    //    }
+
+
+
+
+
+
+}

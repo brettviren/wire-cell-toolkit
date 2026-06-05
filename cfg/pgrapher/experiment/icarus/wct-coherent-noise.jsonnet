@@ -49,11 +49,11 @@ local chndb = [{
   type: 'OmniChannelNoiseDB',
   name: 'ocndbperfect%d' % n,
   data: perfect(params, tools.anodes[n], tools.field, n){dft:wc.tn(tools.dft)},
-  uses: [tools.anodes[n], tools.field, tools.dft],
+  uses: [tools.anodes[n], tools.field, tools.dft],  // pnode extension
 } for n in anode_iota];
 
 local nf_maker = import 'pgrapher/experiment/icarus/nf.jsonnet';
-local nf_pipes = [nf_maker(params, tools.anodes[n], chndb[n], n, name='nf%d' % n) for n in std.range(0, std.length(tools.anodes) - 1)];
+local nf_pipes = [nf_maker(params, tools.anodes[n], chndb[n], tools, name='nf%d' % n) for n in std.range(0, std.length(tools.anodes) - 1)];
 
 local sp_maker = import 'pgrapher/experiment/icarus/sp.jsonnet';
 local sp = sp_maker(params, tools);
@@ -94,16 +94,15 @@ local add_noise = function(model, n) g.pnode({
 local noises = [add_noise(noise_model, n) for n in std.range(0,3)];
 
 local add_coherent_noise = function(n) g.pnode({
-      type: "AddCoherentNoise",
-      name: "addcoherentnoise%d" %n,
+      type: "AddGroupNoise",
+      name: "addgroupnoise%d" %n,
       data: {
-          spectra_file: params.files.coherent_noise,
+          spectra_file: params.files.noisegroups[n],
+          map_file: params.files.wiregroups,
           rng: wc.tn(tools.random),
           dft: wc.tn(tools.dft),
           nsamples: params.daq.nticks,
-          random_fluctuation_amplitude: 0.1,
-          period: params.daq.tick,
-          normalization: 1
+          spec_scale: 1.1,
       }}, nin=1, nout=1, uses=[tools.random, tools.dft]);
 local coherent_noises = [add_coherent_noise(n) for n in std.range(0,3)];
 

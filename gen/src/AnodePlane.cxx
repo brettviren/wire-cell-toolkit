@@ -148,6 +148,8 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& cfg)
 
     m_faces.resize(nfaces);
     // note, WireSchema requires front/back face ordering in an anode
+    // note, iface is a per-anode index and can be different with the per-anode ident
+    // it will be used as WirePlandID::face() and IAnodeFace::which()
     for (size_t iface = 0; iface < nfaces; ++iface) {
         const auto& ws_face = ws_faces[iface];
         std::vector<WireSchema::Plane> ws_planes = ws_store.planes(ws_face);
@@ -160,11 +162,31 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& cfg)
             sensitive_face = false;
             log->debug("anode {} face {} is not sensitive", m_ident, iface);
         }
+        else if (!jface["response"].isNumeric() or !jface["anode"].isNumeric()) {
+            log->critical("Non-scalar value for response_x or anode_x is not supported.");
+            THROW(ValueError() << errmsg{"AnodePlane: error in configuration, expect scalar values for response_x and anode_x."});
+        }
         const double response_x = jface["response"].asDouble();
         const double anode_x = get(jface, "anode", response_x);
-        const double cathode_x = jface["cathode"].asDouble();
-        log->debug("X planes: \"cathode\"@ {}m, \"response\"@{}m, \"anode\"@{}m", cathode_x / units::m,
-                 response_x / units::m, anode_x / units::m);
+        // const double cathode_x = jface["cathode"].asDouble();
+        double cathode_xref = response_x; // illegal/insensitive
+        if (jface["cathode"].isNumeric()) {
+            cathode_xref = jface["cathode"].asDouble();
+        }
+        else if (jface["cathode"].isMember("x")) {
+            auto xvec = get<std::vector<double>>(jface["cathode"], "x");
+            const auto [vmin, vmax] = std::minmax_element(xvec.begin(), xvec.end());
+            cathode_xref = *vmin < response_x ? *vmin : *vmax;
+        }
+        else {
+            log->warn("No 'cathode' location defined for xregion, making short drift for face {} anode {}", iface, m_ident);
+        }
+        const double cathode_x = cathode_xref;
+
+        const int dirx = response_x > anode_x ? +1 : -1;
+
+        log->debug("X planes: \"cathode\"@ {}m, \"response\"@{}m, \"anode\"@{}m, dirx={}", cathode_x / units::m,
+                   response_x / units::m, anode_x / units::m, dirx);
 
         IWirePlane::vector planes(nplanes);
         // note, WireSchema requires U/V/W plane ordering in a face.
@@ -211,7 +233,8 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& cfg)
             const double pitchmax = wire_pitch_dirs.second.dot(wires[nwires - 1]->center() - plane_center);
             const Vector pimpos_origin(response_x, plane_center.y(), plane_center.z());
 
-            log->debug("face:{}, plane:{}, origin:{} mm", iface, iplane, pimpos_origin / units::mm);
+            log->debug("face:{}, plane:{}, origin:{} mm, wpid:{}",
+                       iface, iplane, pimpos_origin / units::mm, wire_plane_id);
 
             Pimpos* pimpos = new Pimpos(nwires, pitchmin, pitchmax, wire_pitch_dirs.first, wire_pitch_dirs.second,
                                         pimpos_origin, nimpacts);
@@ -291,7 +314,7 @@ void Gen::AnodePlane::configure(const WireCell::Configuration& cfg)
         log->debug("face:{} with {} planes and sensvol: {}",
                    ws_face.ident, planes.size(), sensvol.bounds());
 
-        m_faces[iface] = make_shared<AnodeFace>(ws_face.ident, planes, sensvol, iface, m_ident);
+        m_faces[iface] = make_shared<AnodeFace>(ws_face.ident, planes, sensvol, iface, m_ident, dirx);
     }  // face
 
     // remove any duplicate channels

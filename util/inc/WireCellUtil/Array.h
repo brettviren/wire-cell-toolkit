@@ -26,9 +26,8 @@
 #define WIRECELL_ARRAY
 
 #include "WireCellUtil/Waveform.h"
-
-#include <Eigen/Core>
-#include <Eigen/Eigenvalues> 
+#include "WireCellUtil/Eigen.h"
+#include "WireCellUtil/Spdlog.h"
 
 #include <memory>
 #include <vector>
@@ -78,12 +77,17 @@ namespace WireCell {
          */
         array_xxf baseline_subtraction(const array_xxf& in);
 
-        // Perform principle component analysis nrows of vectors each
-        // of ncols of features aka coordinates.  The return value has
-        // .eigenvalue() and .eigenvectors() methods to get these
-        // results.  Eigenvalues are sorted in ascending order and the
-        // eigenvectors matrix has the vectors as columns that
-        // correspond to order of eigenvalues.
+        /** Principle component analysis
+           
+
+           Perform PCA on nrows number of vectors each vector of
+           length ncols holding features (typically coordinates).
+
+           The return value has .eigenvalue() and .eigenvectors()
+           methods to get the results.  Eigenvalues are sorted in
+           ascending order and the eigenvectors matrix has the vectors
+           as columns that correspond to order of eigenvalues.
+        */
         template<typename MatrixType=Eigen::MatrixXd>
         Eigen::SelfAdjointEigenSolver<MatrixType> pca(const MatrixType& mat) {
             MatrixType centered = mat.rowwise() - mat.colwise().mean();
@@ -95,5 +99,8 @@ namespace WireCell {
 
     }  // namespace Array
 }  // namespace WireCell
+
+template <> struct fmt::formatter<Eigen::Matrix<double,-1,-1>> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<Eigen::Matrix<double,-1, 1>> : fmt::ostream_formatter {};
 
 #endif

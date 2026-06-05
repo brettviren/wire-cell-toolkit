@@ -1,5 +1,5 @@
-#ifndef WIRECELLGEN_GaussianDiffusion
-#define WIRECELLGEN_GaussianDiffusion
+#ifndef WIRECELLGEN_GAUSSIANDIFFUSION
+#define WIRECELLGEN_GAUSSIANDIFFUSION
 
 #include "WireCellUtil/Array.h"
 #include "WireCellUtil/Binning.h"
@@ -7,7 +7,6 @@
 #include "WireCellIface/IRandom.h"
 
 #include <memory>
-#include <iostream>
 
 namespace WireCell {
     namespace Gen {
@@ -126,6 +125,11 @@ namespace WireCell {
 
             int m_toffset_bin;
             int m_poffset_bin;
+        };
+
+        struct GausDiffTimeCompare{
+            bool operator()(const std::shared_ptr<Gen::GaussianDiffusion>& lhs,
+                            const std::shared_ptr<Gen::GaussianDiffusion>& rhs) const;
         };
     }  // namespace Gen
 }  // namespace WireCell

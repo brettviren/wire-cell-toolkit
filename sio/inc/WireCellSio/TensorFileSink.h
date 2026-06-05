@@ -7,7 +7,10 @@
 #include "WireCellAux/Logger.h"
 
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 #include <boost/iostreams/filtering_stream.hpp>
+#pragma GCC diagnostic pop
 
 namespace WireCell::Sio {
 
@@ -76,6 +79,9 @@ namespace WireCell::Sio {
             the remainder.  Include it in the prefix if it is wanted.
         */
         std::string m_prefix{""};
+
+        // if true, disable writing to file which makes it faster to debug
+        bool m_dump_mode{false};
 
       private:
         
