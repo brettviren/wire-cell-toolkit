@@ -21,6 +21,35 @@ namespace WireCell::Clus::PR {
         kUndefined = 0,
         /// The vertex is determined to location of neutrino interaction.
         kNeutrinoVertex = 1<<1,
+        /// The vertex entered determine_main_vertex's candidate list for its
+        /// cluster, i.e. it is one of the vertices the main-vertex scorer chose
+        /// between.  This is the toolkit's stand-in for the prototype's
+        /// `map_cluster_main_candidate_vertices` (NeutrinoID_track_shower.h:1332,
+        /// exposed by NeutrinoID.h:1720), which has no port -- see
+        /// sbnd_xin/docs/pr/32 §10.5 / §11.  Set only when
+        /// PatternAlgorithms::m_main_vertex_candidate_flag is true.  DIAGNOSTIC
+        /// ONLY: no algorithm reads it, exactly as in the prototype where every
+        /// consumer is an app-level output-tree filler.
+        kMainCandidate = 1<<2,
+        /// The vertex was created by a high-confidence break (the two-end
+        /// dQ/dx back-to-back break, or a C4/A0 kink accept under
+        /// kink_break_protect) and must not be absorbed or merged away by the
+        /// structure/vertex examiner cleanup passes (examine_structure_2/3,
+        /// examine_vertices_1/2/4, examine_structure_final_1).  Set only by
+        /// default-OFF knob paths (doc sbnd_xin/docs/pr/48); when no vertex
+        /// carries it every examiner check is a no-op => byte-identical.
+        kProtectedBreak = 1<<3,
+        /// The vertex was created by snap_main_vertex_to_kink (doc
+        /// sbnd_xin/docs/pr/50): the main vertex re-seated onto an image
+        /// corner of one of its arms.  Such a vertex also carries
+        /// kProtectedBreak (to survive the examiner re-merges), but unlike
+        /// a two-end dQ/dx break it makes no physics claim about being a
+        /// junction -- snap_main_vertex_to_junction (doc pr/104) may
+        /// arbitrate it against a nearby multi-prong junction when
+        /// vjs_override_kink_snap is set.  Nothing serialises the raw flags
+        /// word (only named bits are ever tested), so the bit is inert in
+        /// every output; it is set on the kink snap's own product only.
+        kKinkSnap = 1<<4,
     };
 
     /** A PR::Vertex instance represents a connection with one or more PR::Segment intances.

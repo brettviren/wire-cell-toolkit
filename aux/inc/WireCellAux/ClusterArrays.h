@@ -88,6 +88,10 @@ namespace WireCell::Aux::ClusterArrays {
     // invalidate neither node nor edge descriptors.
     cluster_graph_t bodge_channel_slice(cluster_graph_t graph);
 
+    // Same as bodge_channel_slice() but modifies the graph in place
+    // (no copy of a whole-event graph beyond the caller's own).
+    void bodge_channel_slice_inplace(cluster_graph_t& graph);
+
 
     // Fill array sets from cluster.
     void to_arrays(const cluster_graph_t& cgraph,
@@ -106,10 +110,16 @@ namespace WireCell::Aux::ClusterArrays {
     // fall on a strip edge and collapses dead-region polygons at the
     // detector boundary.
     using anodes_t = std::vector<IAnodePlane::pointer>;
+    // When restore_corners is true, the original per-blob corners stored in the
+    // numpy 'b' array (count at col (sigu_col+1)+4+6, then y,z pairs) are carried
+    // onto the loaded SimpleBlob (set_stored_corners) so the dead-area "corner"
+    // point cloud reproduces the imaging-time corners instead of re-deriving them
+    // from the reloaded shape.  Default false keeps behaviour byte-identical.
     cluster_graph_t to_cluster(const node_array_set_t& nas,
                                const edge_array_set_t& eas,
                                const anodes_t& anodes,
-                               double nudge = 1e-3);
+                               double nudge = 1e-3,
+                               bool restore_corners = false);
 
 
     /// See TensorDM for conversion between ICluster and ITensor.

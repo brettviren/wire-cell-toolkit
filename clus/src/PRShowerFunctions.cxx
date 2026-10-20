@@ -6,6 +6,19 @@ using namespace WireCell::Clus::PR;
 
 namespace WireCell::Clus::PR {
 
+    // Stable-order iteration over a shower's edges: shower.edges() is an
+    // unordered (pointer-hashed) set, so iterate sorted by the stable
+    // EdgeBundle::index (filtered-graph flavor of PR::ordered_edges).
+    template <typename ViewGraph>
+    static std::vector<edge_descriptor> shower_ordered_edges(const Shower& shower, const ViewGraph& g) {
+        std::vector<edge_descriptor> result(shower.edges().begin(), shower.edges().end());
+        std::sort(result.begin(), result.end(),
+                  [&g](const edge_descriptor& a, const edge_descriptor& b) {
+                      return g[a].index < g[b].index;
+                  });
+        return result;
+    }
+
     std::pair<double, WireCell::Point> shower_get_closest_point(Shower& shower, const WireCell::Point& point, const std::string& cloud_name /* = "fit" */){
         // Get the dynamic point cloud from the shower
         auto pcloud = shower.get_pcloud(cloud_name);
@@ -34,10 +47,7 @@ namespace WireCell::Clus::PR {
         const double distance = sqrt(results[0].second);  // KD-tree returns squared distance
         
         // Get the actual point from the point cloud
-        const auto& points = pcloud->get_points();
-        const auto& closest_pt = points[idx];
-        
-        return std::make_pair(distance, WireCell::Point(closest_pt.x, closest_pt.y, closest_pt.z));
+        return std::make_pair(distance, pcloud->point3d(idx));
     }
 
     double shower_get_closest_dis(Shower& shower, SegmentPtr seg, const std::string& cloud_name /* = "fit" */){
@@ -47,13 +57,12 @@ namespace WireCell::Clus::PR {
             return -1.0;
         }
         
-        const auto& seg_points = seg_dpc->get_points();
-        if (seg_points.empty()) {
+        if (seg_dpc->npoints() == 0) {
             return -1.0;
         }
         
         // Use the first point from segment's point cloud
-        WireCell::Point first_point(seg_points.front().x, seg_points.front().y, seg_points.front().z);
+        WireCell::Point first_point = seg_dpc->point3d(0);
         
         // Step 1: Get closest point in shower to the first point of the segment
         WireCell::Point test_p = shower_get_closest_point(shower, first_point, cloud_name).second;
@@ -78,34 +87,35 @@ namespace WireCell::Clus::PR {
             return -1.0;
         }
         
-        const auto& seg_points = seg_dpc->get_points();
-        if (seg_points.empty()) {
+        if (seg_dpc->npoints() == 0) {
             return -1.0;
         }
         
-        WireCell::Point test_p(seg_points.front().x, seg_points.front().y, seg_points.front().z);
+        WireCell::Point test_p = seg_dpc->point3d(0);
         
         // Get the view graph to access segments
         const auto& view = shower.view_graph();
         
-        // First iteration: find the closest point in any shower segment to test_p
-        for (auto edesc : shower.edges()) {
+        // First iteration: find the closest point in any shower segment to
+        // test_p.  Stable edge-index order: min_point is a tie-broken argmin
+        // that seeds the second-stage query.
+        for (auto edesc : shower_ordered_edges(shower, view)) {
             SegmentPtr sg = view[edesc].segment;
             if (!sg) continue;
-            
+
             auto results = segment_get_closest_point(sg, test_p, cloud_name);
             if (results.first < min_dis) {
                 min_dis = results.first;
                 min_point = results.second;
             }
         }
-        
+
         // Get closest point in input segment to that minimum point
         auto results1 = segment_get_closest_point(seg, min_point, cloud_name);
         test_p = results1.second;
-        
+
         // Second iteration: find the closest distance from any shower segment to the new test point
-        for (auto edesc : shower.edges()) {
+        for (auto edesc : shower_ordered_edges(shower, view)) {
             SegmentPtr sg = view[edesc].segment;
             if (!sg) continue;
             
@@ -127,8 +137,10 @@ namespace WireCell::Clus::PR {
         // Get the view graph to access segments
         const auto& view = shower.view_graph();
 
-        // Loop through all segments in the shower
-        for (auto edesc : shower.edges()) {
+        // Loop through all segments in the shower.  Stable edge-index order:
+        // p_sum FP-accumulates continuous coordinates into a direction that
+        // feeds angle thresholds at many call sites.
+        for (auto edesc : shower_ordered_edges(shower, view)) {
             SegmentPtr seg = view[edesc].segment;
             if (!seg) continue;
 
@@ -173,6 +185,48 @@ namespace WireCell::Clus::PR {
         return dir;
     }
 
+    // doc sbnd_xin/docs/pr/92 -- see the header comment.
+    bool shower_start_is_track_continuation(Graph& graph, Shower& shower,
+                                            double max_kink_deg)
+    {
+        SegmentPtr seg = shower.start_segment();
+        if (!seg || seg->fits().empty()) return false;
 
+        // The shower's own segment membership: a collinear sibling INSIDE the
+        // shower is EM branching, not a track continuation.
+        IndexedVertexSet member_vtxs;
+        IndexedSegmentSet member_segs;
+        shower.fill_sets(member_vtxs, member_segs, /*flag_exclude_start_segment=*/false);
+
+        auto [va, vb] = find_vertices(graph, seg);
+        for (VertexPtr vtx : {va, vb}) {
+            if (!vtx || !vtx->descriptor_valid()) continue;
+            const WireCell::Point vtx_pt = vtx->fit().valid() ? vtx->fit().point
+                                                              : vtx->wcpt().point;
+            for (auto edesc : sorted_out_edges(vtx->get_descriptor(), graph)) {
+                SegmentPtr sib = graph[edesc].segment;
+                if (!sib || sib == seg || sib->fits().empty()) continue;
+                if (sib->cluster() != seg->cluster()) continue;
+                if (member_segs.count(sib)) continue;
+                const double kink = segment_pair_kink_deg(seg, sib, vtx_pt, 15 * units::cm);
+                if (kink < 0 || kink >= max_kink_deg) continue;   // -1 = unmeasurable: not collinear
+                if (segment_is_straight_long_track(sib)) return true;
+                // combined arm: two medium halves of one straight object
+                auto far_pt = [&vtx_pt](SegmentPtr s) {
+                    const auto& f = s->fits();
+                    return ((f.front().point - vtx_pt).magnitude() >
+                            (f.back().point - vtx_pt).magnitude()) ? f.front().point
+                                                                   : f.back().point;
+                };
+                const double len = segment_track_length(seg) + segment_track_length(sib);
+                const double direct = (far_pt(seg) - far_pt(sib)).magnitude();
+                if (len > 10 * units::cm &&
+                    (direct >= 34 * units::cm || direct > 0.93 * len)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
 } // namespace WireCell::Clus::PR

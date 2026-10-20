@@ -73,6 +73,7 @@ def options(opt):
     opt.load('rootsys')
     opt.load('libtorch')
     opt.load('cuda')
+    #opt.load("nvtx")
     opt.load('kokkos')
     #opt.load('protobuf')
 
@@ -80,6 +81,13 @@ def options(opt):
 
     opt.add_option('--build-debug', default='-O2 -ggdb3',
                    help="Build with debug symbols")
+
+    opt.add_option('--with-spng', type=str, default=None,
+                   help="Build the experimental WireCellSpng package.  Off by "
+                   "default: it requires a recent libtorch (where c10::optional "
+                   "is std::optional, ~torch 2.4+) and does not compile against "
+                   "older libtorch.  Use --with-spng=yes to enable.  See "
+                   "https://github.com/WireCell/wire-cell-toolkit/issues/496")
 
 
 def find_submodules(ctx):
@@ -116,6 +124,8 @@ def configure(cfg):
     if with_p('root'):
         cfg.load('rootsys')
 
+    #if with_p('nvtx'):
+    #    cfg.load('nvtx')
 
     # Check for stuff not found in the wcb-generic way
     #
@@ -131,7 +141,7 @@ def configure(cfg):
     # I would like to add "serialization" to assist in writing methods for graph
     # I/O.  The "math" lib could be useful.  But these additions will require
     # changes to wire-cell-spack and perhaps other build methods.
-    cfg.check_boost(lib='system filesystem graph thread program_options iostreams regex')
+    cfg.check_boost(lib='filesystem graph thread program_options iostreams regex')
     haveit('boost')
 
     cfg.check(header_name="dlfcn.h", uselib_store='DYNAMO', lib=['dl'], mandatory=True)
@@ -186,6 +196,13 @@ def configure(cfg):
                 info('Removing package "%s" due to lack of external dependency "%s"'%(pkg,have))
                 submodules.remove(pkg)
 
+    # spng is experimental and only builds against a recent libtorch (needs
+    # c10::optional == std::optional, ~torch 2.4+).  Keep it off by default and
+    # opt in explicitly with --with-spng=yes.  See issue #496.
+    if "spng" in submodules and not with_p("spng"):
+        info('Removing package "spng" (experimental; enable with --with-spng=yes)')
+        submodules.remove("spng")
+
     cfg.env.SUBDIRS = submodules
     info ('Configured for submodules: %s' % (', '.join(submodules), ))
     bch = 'WireCellUtil/BuildConfig.h' 
@@ -228,6 +245,10 @@ def build(bld):
     debug ('wcb: subdirs %s' % (', '.join(subdirs), ))
     bld.recurse(subdirs)
 
+    # Build a single "wcdoctest" program spanning all packages' doctests, in
+    # addition to the per-package "wcdoctest-<pkg>" programs.
+    bld.build_wcdoctest_all()
+
     if hasattr(bld, "smplpkg_graph"):
         # fixme: this writes directly.  Should make it a task, including
         # running graphviz to produce PNG/PDF
@@ -258,6 +279,11 @@ def build(bld):
         LLIBS = ' '.join([f'-l{n}' for n in link_libs]),
         REQUIRES = ' '.join(bld.env.REQUIRES),
         install_path = '${LIBDIR}/pkgconfig/')
+
+    # Produce CMake package-config files so downstream CMake projects can
+    # find_package(WireCellToolkit).  See waft/cmake.py and issue #484.
+    import cmake
+    cmake.write_cmake_config(bld)
 
 
     # Produce a libtool .la file.  This needs one for each lib.
@@ -319,3 +345,72 @@ def packrepo(bld):
 class PackrepoenvContext(BuildContext):
     cmd = 'packrepo'
     fun = 'packrepo'
+
+
+def compile_flags(bld):
+    '''
+    Produce a compile_flags.txt file that clangd can use eg to help eglot in emacs.
+
+    In addition, the user may want to run:
+
+    ./wcb clean
+    bear -- ./wcb
+
+    To produce the more rich compile_commands.json file.  Subsequent partial
+    builds may be done with:
+
+    bear --append -- ./wcb
+
+    The compile_flags.txt augments compile_commands.json so that clangd knows
+    how to find include paths when looking at headers, since they are not compiled.
+
+    Caution: configuring to build with GCC may lead to incompatibilities when
+    trying to use clangd.
+    '''
+    flags = getattr(bld.env, 'CXXFLAGS', [])
+    #flags = set()
+
+    # WCT includes, first BuildConfig.h location
+    bld_dir = bld.root.find_dir(bld.out_dir)
+    flags.append( '-I' + bld_dir.abspath() )
+
+    # Then all the configured subdir inc/'s.
+    for subdir in bld.env.SUBDIRS:
+        subnode = bld.path.find_dir(subdir)
+        if not subnode:
+            continue
+
+        incnode = subnode.find_dir('inc')
+        if not incnode:
+            continue
+
+        flags.append( '-I' + incnode.abspath())
+
+
+    for key in bld.env:
+        val = bld.env[key]
+
+        if key.startswith('INCLUDES'):
+            if isinstance(val, str):
+                val = val.split()
+            flags += [f'-I{path}' for path in val]
+            continue
+
+        if key.startswith('DEFINES') and key != "DEFINES_ST":
+            if isinstance(val, str):
+                val = val.split()
+            flags += [f'-D{path}' for path in val]
+
+    flags = [flag for flag in flags
+             if not flag.startswith(('-c', '-o', '-shared', '-fPIC'))] 
+
+
+    content = '\n'.join(flags) + '\n'
+
+    target_node = bld.path.make_node('compile_flags.txt')
+    
+    bld(rule=lambda task: task.outputs[0].write(content), target=target_node, name='compile_flags.txt')
+
+class CompileFlagsContext(BuildContext):
+    cmd = 'compile_flags'
+    fun = 'compile_flags'

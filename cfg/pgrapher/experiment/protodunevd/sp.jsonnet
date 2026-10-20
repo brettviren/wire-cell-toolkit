@@ -29,10 +29,64 @@ function(params, tools, override = {}) {
                l1sp_pd_planes=[0, 1],
                l1sp_pd_adj_enable=true,
                l1sp_pd_adj_max_hops=3,
+               // Prolonged-W-signal fix (mirrors pdhd/sp.jsonnet; see
+               // pdhd/docs/sp-w-collection-roi-break.md).  A strong
+               // track-along-drift signal occupying >~16% of the waveform
+               // inflates the legacy percentile-spread cal_RMS (~10x on
+               // PDHD run 027409 evts 40920/40924), pushing the tight-ROI
+               // threshold above the signal's own median and fragmenting
+               // the SP output.  Vertical-drift makes such tracks (near-
+               // vertical cosmics) especially common.
+               // Part 1: MAD-based cal_RMS (all planes; C++ default false;
+               // set false for bit-identical legacy thresholds).
+               roi_mad_rms=true,
+               // Part 2: disable BreakROI on the collection plane (slot 2,
+               // [U, V, W] order on every PDVD anode).  With part 1 the
+               // long multi-peak W ROI survives to refinement, where
+               // BreakROI would subtract a valley-to-valley linear
+               // "baseline" that is real track charge (collection decon has
+               // no LF filter, so its baseline needs no such fix).  Set
+               // false => key omitted => scalar r_break_roi_loop applies =>
+               // byte-identical.
+               w_col_break_roi_tune=true,
+               // Per-side collection-plane SP time offset (ctoffset).  The
+               // BDE (bottom, ident 0..3) and TDE (top, ident 4..7) crates
+               // have independent readout time bases; a per-crate value lets
+               // the reconstructed anode edge be centred separately.  Both
+               // default to the legacy 4 us => compiled config byte-identical
+               // when unchanged.  See pdvd/docs/qlmatch/
+               // pdvd-anode-time-consistency.md (anode-stop ensemble).
+               ctoffset_b=4*wc.microsecond,
+               ctoffset_t=4*wc.microsecond,
+               // One charge-scale constant for the TOP (TDE, ident 4..7)
+               // electronics, SP only (params.elecs is shared with sim and is
+               // not touched).  s = real / assumed top ADC-per-electron.  It
+               // sets the top OmnibusSigProc postgain (charge out ~ 1/s) and
+               // the top L1SPFilterPD gain_scale (kernels_scale and the three
+               // ADC thresholds; kernels are ADC/e, so charge out ~ 1/s as
+               // well).  Default 1.0 = the legacy literals (postgain 1.0, top
+               // gain_scale 1.0) => compiled config byte-identical.  Bottom
+               // anodes never read it.  See pdvd/docs/nf_sp_img_clus/
+               // 99_top-electronics-gain-in-sp.md (s = 0.889, doc pdhd/29 M2).
+               top_gain_scale=1.0,
+               // Collection-plane SP wire filter override, doc pdvd/117 study S4.
+               // X with sigma = X/sqrt(pi) (the sp-filters.jsonnet idiom; sigma is
+               // in the FREQUENCY domain, units of Nyquist -- a smaller X is a
+               // WIDER real-space kernel).  null (default) = the registered
+               // 'Wire_col_b'/'Wire_col_t' (X = 10) and no extra component =>
+               // compiled config byte-identical.  X = 3.0 is the DUNE-VD value the
+               // simulation-trained drift regressor saw (dune-vd/sp-filters.jsonnet:114).
+               wire_col_sigma_x=null,
                dump_rawdecon=false)::
     // Top (_t) vs bottom (_b) anode filter suffix.  Bottom = ident 0..3,
     // top = ident 4..7.  See sp-filters.jsonnet for the registered names.
     local sfx = if anode.data.ident < 4 then '_b' else '_t';
+    // doc pdvd/117 S4: registered only when the override is given.
+    local wire_colx = if std.type(wire_col_sigma_x) == 'null' then [] else [{
+      type: 'HfFilter',
+      name: 'Wire_colx' + sfx,
+      data: { max_freq: 1, power: 2, flag: false, sigma: wire_col_sigma_x / wc.sqrtpi },
+    }];
     local sp_node = g.pnode({
       type: 'OmnibusSigProc',
       name:
@@ -92,22 +146,29 @@ function(params, tools, override = {}) {
       // Default Wire_filters layout is [ind, ind, col]; preserve it.
       Wire_filters:         ['Wire_ind'       + sfx,
                              'Wire_ind'       + sfx,
-                             'Wire_col'       + sfx],
+                             (if std.type(wire_col_sigma_x) == 'null'
+                              then 'Wire_col' else 'Wire_colx') + sfx],
       ftoffset: 0.0, // default 0.0
       // ctoffset: 1.0*wc.microsecond, // default -8.0
-      ctoffset: 4*wc.microsecond, //consistent with FR: protodunevd_FR_imbalance3p_260501.json.bz2
+      ctoffset: if anode.data.ident < 4 then ctoffset_b else ctoffset_t, // per-side; both default 4us (byte-identical). consistent with FR: protodunevd_FR_imbalance3p_260501.json.bz2
       per_chan_resp: pc.name,
       fft_flag: 0,  // 1 is faster but higher memory, 0 is slightly slower but lower memory
-      postgain: 1.0,  // default 1.2
+      postgain: if anode.data.ident < 4 then 1.0 else top_gain_scale,  // default 1.2; top = top_gain_scale (legacy 1.0)
       ADC_mV: ADC_mV_ratio, // 4096 / (1400.0 * wc.mV), 
       troi_col_th_factor: 5.0,  // default 5
       troi_ind_th_factor: 3.0,  // default 3
+      // MAD-based cal_RMS (see roi_mad_rms arg above); C++ default false.
+      // Key omitted when off => byte-identical pre-fix config.
+      [if roi_mad_rms then 'roi_mad_rms']: true,
       lroi_rebin: 6, // default 6
       lroi_th_factor: 3.5, // default 3.5
       lroi_th_factor1: 0.7, // default 0.7
       lroi_jump_one_bin: 1, // default 0
 
       r_th_factor: 3.0,  // default 3
+      // Collection-plane BreakROI disable ([U, V, W] slot order); see
+      // w_col_break_roi_tune above.  U/V keep the scalar default (2).
+      [if w_col_break_roi_tune then 'r_break_roi_loop_planes']: [2, 2, 0],  // W: 2 -> 0
       r_fake_signal_low_th: 375,  // default 500
       r_fake_signal_high_th: 750,  // default 1000
       r_fake_signal_low_th_ind_factor: 1.0,  // default 1
@@ -142,7 +203,7 @@ function(params, tools, override = {}) {
       // process_planes: [0, 2],
 
       } + override,
-    }, nin=1, nout=1, uses=[anode, tools.dft, tools.field, tools.elec_resps[0], tools.elec_resps[1] ] + pc.uses + spfilt);
+    }, nin=1, nout=1, uses=[anode, tools.dft, tools.field, tools.elec_resps[0], tools.elec_resps[1] ] + pc.uses + spfilt + wire_colx);
 
     // L1SP process mode applies to both bottom (ident < 4) and top (ident >= 4).
     // Top kernels: pdvd_top_l1sp_kernels.json.bz2 (selected below).
@@ -164,7 +225,7 @@ function(params, tools, override = {}) {
       // are gain-invariant — same convention as chndb-base.
       local gain_scale = if anode.data.ident < 4
                          then params.elec.gain / (7.8 * wc.mV / wc.fC)
-                         else 1.0;
+                         else top_gain_scale;  // legacy 1.0; see make_sigproc arg
       // Per-region kernel JSON, generated offline via
       //   wirecell-sigproc gen-l1sp-kernels -d pdvd-bottom  pdvd_bottom_l1sp_kernels.json.bz2
       //   wirecell-sigproc gen-l1sp-kernels -d pdvd-top     pdvd_top_l1sp_kernels.json.bz2

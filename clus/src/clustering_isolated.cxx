@@ -15,11 +15,36 @@ using namespace WireCell::Clus;
 using namespace WireCell::Clus::Facade;
 using namespace WireCell::PointCloud::Tree;
 
+// Distance cuts of the merge passes (fdvd_sim doc 04).  The member defaults are
+// the literals the passes used before these became knobs, so an absent key is
+// byte-identical.  bbox_prefilter skips get_closest_points() for a pair whose
+// axis-aligned bounding-box distance already reaches the pass's cut: that call
+// returns the distance of an actual point pair, which can never be below the
+// bounding-box distance of the same kd3d points, so the skipped pair could not
+// have passed "dis < cut".  It is applied to the small->big and both small-small
+// passes only; the big-big pass is left as is.
+struct IsolatedCuts {
+    double small_big_dis_cut{80 * units::cm};
+    double small_chain_dis_cut{5 * units::cm};
+    double small_small_dis_cut{50 * units::cm};
+    double big_dis_cut{3 * units::cm};
+    double big_dis_range_cut{16 * units::cm};
+    bool bbox_prefilter{false};
+};
 
 static void clustering_isolated(
     Grouping& live_grouping,
     IDetectorVolumes::pointer dv,
-    const Tree::Scope& scope
+    const Tree::Scope& scope,
+    bool use_flash_t0 = false,
+    double flash_t0_window = 80*units::ns,
+    double length_cut = 20*units::cm,
+    int range_cut = 150,
+    bool save_assoc_id = false,
+    double cathode_guard_xcut = 0,
+    double cathode_x = 0,
+    double cathode_guard_dis_floor = 0,
+    const IsolatedCuts& cuts = IsolatedCuts{}
     );
 
 class ClusteringIsolated : public IConfigurable, public Clus::IEnsembleVisitor, private NeedDV, private NeedScope {
@@ -30,13 +55,89 @@ public:
     void configure(const WireCell::Configuration& config) {
         NeedDV::configure(config);
         NeedScope::configure(config);
+
+        use_flash_t0_ = get(config, "use_flash_t0", false);
+        flash_t0_window_ = get(config, "flash_t0_window", 80*units::ns);
+        // Small/big classification thresholds. Defaults reproduce the historical
+        // hardcoded values, so configs that omit these keys are unchanged.
+        length_cut_ = get(config, "length_cut", 20*units::cm);
+        range_cut_ = get(config, "range_cut", 150);
+        // Stage 1 of doc 52: also record the main + associated partition this
+        // pass creates into the DEDICATED, never-recycled per-blob pair
+        // "assoc_cluster_id" / "assoc_cluster_main" ("perblob"), so
+        // ClusteringUnmergeBundle can undo the grouping downstream and the STM
+        // / PR taggers see the main alone, as the prototype does
+        // (wire-cell-prod-stm.cxx:816-828 fits main_cluster only).
+        //
+        // The existing ("isolated","perblob") array cannot serve: it is the
+        // rolling connectivity partition that clustering_examine_bundles
+        // rewrites one pass later (defect D2) and that QLMatching's
+        // decompose_cluster_groups owns.  New names, so neither is disturbed.
+        //
+        // Default false => merge_clusters() is called exactly as before and no
+        // array is added, so the compiled config, the Bee dumps and the pctree
+        // tarball are all byte-identical.
+        save_assoc_id_ = get(config, "save_assoc_id", false);
+        // Cathode guard on the small->big absorb (sbnd_xin/docs/pr/19): a
+        // small cluster that reaches within cathode_guard_xcut of the cathode
+        // plane AND whose nearest big cluster is farther away than its own
+        // cathode distance is left unabsorbed -- it plausibly belongs to
+        // activity in the OTHER drift volume, which this per-APA pass cannot
+        // see (SBND run 18253 evt 444187: ~560 pts of near-cathode nueCC
+        // shower fragments absorbed by a cosmic 46-76 cm away while the true
+        // parent sat 1.9 cm across the cathode).  Default 0 => guard fully
+        // OFF => byte-identical to pre-knob builds.  cathode_x is the cathode
+        // plane position in this pass's (raw) frame; the SBND cathode is at
+        // x = +-0.45 cm, so the 0 default is correct there.
+        cathode_guard_xcut_ = get(config, "cathode_guard_xcut", cathode_guard_xcut_);
+        cathode_x_ = get(config, "cathode_x", cathode_x_);
+        // Floor on the big-cluster gap below which the guard never declines:
+        // a small cluster genuinely NEAR its big cluster (nu-vertex fragments,
+        // delta rays) keeps the legacy absorb; only the distant angle-less
+        // absorbs -- the 444187 pathology sat at 46-76 cm -- are declined.
+        // Default 0 = no floor (the pure comparative guard).
+        cathode_guard_dis_floor_ = get(config, "cathode_guard_dis_floor", cathode_guard_dis_floor_);
+        // Merge-pass distance cuts (fdvd_sim doc 04: FD-VD MeV events, where
+        // every cluster is "small" and the 50 cm small-small pass is the one
+        // that bundles).  Defaults = the former literals; see IsolatedCuts.
+        cuts_.small_big_dis_cut = get(config, "small_big_dis_cut", cuts_.small_big_dis_cut);
+        cuts_.small_chain_dis_cut = get(config, "small_chain_dis_cut", cuts_.small_chain_dis_cut);
+        cuts_.small_small_dis_cut = get(config, "small_small_dis_cut", cuts_.small_small_dis_cut);
+        cuts_.big_dis_cut = get(config, "big_dis_cut", cuts_.big_dis_cut);
+        cuts_.big_dis_range_cut = get(config, "big_dis_range_cut", cuts_.big_dis_range_cut);
+        cuts_.bbox_prefilter = get(config, "bbox_prefilter", cuts_.bbox_prefilter);
     }
-    
+
+    // Only the fdvd_sim doc 04 knobs are listed; the older keys keep their
+    // get() literal defaults in configure().
+    virtual Configuration default_configuration() const {
+        Configuration cfg;
+        cfg["small_big_dis_cut"] = cuts_.small_big_dis_cut;
+        cfg["small_chain_dis_cut"] = cuts_.small_chain_dis_cut;
+        cfg["small_small_dis_cut"] = cuts_.small_small_dis_cut;
+        cfg["big_dis_cut"] = cuts_.big_dis_cut;
+        cfg["big_dis_range_cut"] = cuts_.big_dis_range_cut;
+        cfg["bbox_prefilter"] = cuts_.bbox_prefilter;
+        return cfg;
+    }
+
     void visit(Ensemble& ensemble) const {
         auto& live = *ensemble.with_name("live").at(0);
-        return clustering_isolated(live, m_dv, m_scope);
+        return clustering_isolated(live, m_dv, m_scope, use_flash_t0_, flash_t0_window_,
+                                   length_cut_, range_cut_, save_assoc_id_,
+                                   cathode_guard_xcut_, cathode_x_, cathode_guard_dis_floor_, cuts_);
     }
-    
+
+private:
+    bool use_flash_t0_{false};
+    double flash_t0_window_{80*units::ns};
+    double length_cut_{20*units::cm};
+    int range_cut_{150};
+    bool save_assoc_id_{false};
+    double cathode_guard_xcut_{0};
+    double cathode_x_{0};
+    double cathode_guard_dis_floor_{0};
+    IsolatedCuts cuts_;
 };
 
 
@@ -59,7 +160,16 @@ public:
 static void clustering_isolated(
     Grouping& live_grouping,
     const IDetectorVolumes::pointer dv,
-    const Tree::Scope& scope
+    const Tree::Scope& scope,
+    bool use_flash_t0,
+    double flash_t0_window,
+    double length_cut,
+    int range_cut,
+    bool save_assoc_id,
+    double cathode_guard_xcut,
+    double cathode_x,
+    double cathode_guard_dis_floor,
+    const IsolatedCuts& cuts
 )
 {
     // Get all the wire plane IDs from the grouping
@@ -128,8 +238,8 @@ static void clustering_isolated(
     geo_point_t drift_dir_abs(1,0,0);
 
 
-    int range_cut = 150;
-    int length_cut = 20 * units::cm;
+    // range_cut / length_cut are now configurable (see configure()); the
+    // function-argument defaults (150 / 20 cm) reproduce the historical values.
 
     std::vector<Cluster*> big_clusters;
     std::vector<Cluster*> small_clusters;
@@ -224,9 +334,47 @@ static void clustering_isolated(
     };
     std::set<std::pair<Cluster *, Cluster *>, cluster_pair_less_t> to_be_merged_pairs;
 
+    // bbox_prefilter (see IsolatedCuts): per-cluster box of the kd3d points
+    // get_closest_points() reads, and a box-to-box distance with the same
+    // sqrt(pow + pow + pow) arithmetic, which is monotone, so box distance <=
+    // any returned point-pair distance holds in floating point too.
+    struct BBox { double lo[3]{1e300, 1e300, 1e300}; double hi[3]{-1e300, -1e300, -1e300}; };
+    auto bbox_of = [](const Cluster* c) {
+        BBox b;
+        const int n = c->npoints();
+        for (int k = 0; k != n; k++) {
+            const geo_point_t p = c->point3d(k);
+            const double v[3] = {p.x(), p.y(), p.z()};
+            for (int a = 0; a != 3; a++) {
+                if (v[a] < b.lo[a]) b.lo[a] = v[a];
+                if (v[a] > b.hi[a]) b.hi[a] = v[a];
+            }
+        }
+        return b;
+    };
+    auto bbox_dis = [](const BBox& a, const BBox& b) {
+        double d[3];
+        for (int k = 0; k != 3; k++) {
+            d[k] = 0;
+            if (a.lo[k] - b.hi[k] > d[k]) d[k] = a.lo[k] - b.hi[k];
+            if (b.lo[k] - a.hi[k] > d[k]) d[k] = b.lo[k] - a.hi[k];
+        }
+        return sqrt(pow(d[0], 2) + pow(d[1], 2) + pow(d[2], 2));
+    };
+    std::vector<BBox> small_bbox, big_bbox;
+    if (cuts.bbox_prefilter) {
+        for (const auto* c : small_clusters) small_bbox.push_back(bbox_of(c));
+        for (const auto* c : big_clusters) big_bbox.push_back(bbox_of(c));
+    }
+
     // clustering small with big ones ...
-    double small_big_dis_cut = 80 * units::cm;
+    double small_big_dis_cut = cuts.small_big_dis_cut;
     std::set<Cluster *, cluster_less_functor> used_small_clusters;
+    // Cathode guard (doc pr/19): smalls this pass declines to absorb.  They
+    // also may not be chained into an absorbed group by the 5 cm small-small
+    // pass below; they remain "remaining" smalls and may still merge among
+    // themselves (50 cm pass), staying separate from every big cluster.
+    std::set<Cluster *, cluster_less_functor> guarded_small_clusters;
     for (auto it = small_clusters.begin(); it != small_clusters.end(); it++) {
         Cluster *curr_cluster = (*it);
         // curr_cluster->Create_point_cloud();
@@ -236,6 +384,10 @@ static void clustering_isolated(
 
         for (auto it1 = big_clusters.begin(); it1 != big_clusters.end(); it1++) {
             Cluster *big_cluster = (*it1);
+            // A skipped big has dis >= cut: it can never be the absorbing
+            // min_dis cluster (the absorb needs min_dis < cut).
+            if (cuts.bbox_prefilter &&
+                bbox_dis(small_bbox[it - small_clusters.begin()], big_bbox[it1 - big_clusters.begin()]) >= small_big_dis_cut) continue;
             // big_cluster->Create_point_cloud();
             // ToyPointCloud *cloud2 = big_cluster->get_point_cloud();
             // std::tuple<int, int, double> results = cloud2->get_closest_points(cloud1);
@@ -248,7 +400,25 @@ static void clustering_isolated(
         }
         // std::cout << "SB: " << curr_cluster->get_length()/units::cm << " " << min_dis_cluster->get_length()/units::cm << " " << curr_cluster->get_pca().center) << " " << min_dis_cluster->get_pca().center) << " " << min_dis << " " << small_big_dis_cut << std::endl;
 
-        if (min_dis < small_big_dis_cut) {    
+        if (min_dis < small_big_dis_cut) {
+            if (cathode_guard_xcut > 0 && min_dis > cathode_guard_dis_floor) {
+                double dcath = 1e9;
+                const int N = curr_cluster->npoints();
+                for (int k = 0; k != N; k++) {
+                    double d = std::fabs(curr_cluster->point3d(k).x() - cathode_x);
+                    if (d < dcath) dcath = d;
+                }
+                if (dcath < cathode_guard_xcut && min_dis > dcath) {
+                    // Census marker (raw stdout, batch-log greppable like the
+                    // pr/15 separate() marker): one line per guarded small.
+                    std::cout << "[iso-cathode-guard] declined absorb: small "
+                              << curr_cluster->get_length()/units::cm << " cm / "
+                              << N << " pts, cathode " << dcath/units::cm
+                              << " cm < big " << min_dis/units::cm << " cm" << std::endl;
+                    guarded_small_clusters.insert(curr_cluster);
+                    continue;
+                }
+            }
 
             to_be_merged_pairs.insert(std::make_pair(min_dis_cluster, curr_cluster));
             used_small_clusters.insert(curr_cluster);
@@ -257,17 +427,24 @@ static void clustering_isolated(
     // LogDebug("to_be_merged_pairs.size() = " << to_be_merged_pairs.size());
 
     // small distance ...
-    double small_small_dis_cut = 5 * units::cm;
+    double small_small_dis_cut = cuts.small_chain_dis_cut;
     for (size_t i = 0; i != small_clusters.size(); i++) {
         Cluster *cluster1 = small_clusters.at(i);
         // ToyPointCloud *cloud1 = cluster1->get_point_cloud();
         for (size_t j = i + 1; j != small_clusters.size(); j++) {
             Cluster *cluster2 = small_clusters.at(j);
+            if (cuts.bbox_prefilter && bbox_dis(small_bbox[i], small_bbox[j]) >= small_small_dis_cut) continue;
             // ToyPointCloud *cloud2 = cluster2->get_point_cloud();
             // std::tuple<int, int, double> results = cloud2->get_closest_points(cloud1);
             std::tuple<int, int, double> results = cluster2->get_closest_points(*cluster1);
             double dis = std::get<2>(results);
             if (dis < small_small_dis_cut) {
+                // Cathode guard (doc pr/19): a guarded small may not be chained
+                // into an absorbed (used) group either -- that would re-attach
+                // it to the big cluster the guard just declined.  The set is
+                // empty when the guard is off, so this line is then inert.
+                if (guarded_small_clusters.find(cluster1) != guarded_small_clusters.end() ||
+                    guarded_small_clusters.find(cluster2) != guarded_small_clusters.end()) continue;
                 if (used_small_clusters.find(cluster1) != used_small_clusters.end() &&
                         used_small_clusters.find(cluster2) == used_small_clusters.end() ||
                     used_small_clusters.find(cluster2) != used_small_clusters.end() &&
@@ -282,19 +459,23 @@ static void clustering_isolated(
     }
 
     std::vector<Cluster *> remaining_small_clusters;
+    std::vector<BBox> remaining_bbox;
     for (auto it = small_clusters.begin(); it != small_clusters.end(); it++) {
         Cluster *curr_cluster = (*it);
-        if (used_small_clusters.find(curr_cluster) == used_small_clusters.end())
+        if (used_small_clusters.find(curr_cluster) == used_small_clusters.end()) {
             remaining_small_clusters.push_back(curr_cluster);
+            if (cuts.bbox_prefilter) remaining_bbox.push_back(small_bbox[it - small_clusters.begin()]);
+        }
     }
 
     // clustering small with small ones ...
-    small_small_dis_cut = 50 * units::cm;
+    small_small_dis_cut = cuts.small_small_dis_cut;
     for (size_t i = 0; i != remaining_small_clusters.size(); i++) {
         Cluster *cluster1 = remaining_small_clusters.at(i);
         // ToyPointCloud *cloud1 = cluster1->get_point_cloud();
         for (size_t j = i + 1; j != remaining_small_clusters.size(); j++) {
             Cluster *cluster2 = remaining_small_clusters.at(j);
+            if (cuts.bbox_prefilter && bbox_dis(remaining_bbox[i], remaining_bbox[j]) >= small_small_dis_cut) continue;
             // ToyPointCloud *cloud2 = cluster2->get_point_cloud();
             // std::tuple<int, int, double> results = cloud2->get_closest_points(cloud1);
             std::tuple<int, int, double> results = cluster2->get_closest_points(*cluster1);
@@ -311,8 +492,8 @@ static void clustering_isolated(
     // cloud1 is the longer one
     // used_big_clusters holds the shorter one
     std::set<Cluster *, cluster_less_functor> used_big_clusters;
-    double big_dis_cut = 3 * units::cm;
-    double big_dis_range_cut = 16 * units::cm;
+    double big_dis_cut = cuts.big_dis_cut;
+    double big_dis_range_cut = cuts.big_dis_range_cut;
     for (size_t i = 0; i != big_clusters.size(); i++) {
         // cluster1->Create_point_cloud();
         for (size_t j = i + 1; j != big_clusters.size(); j++) {
@@ -462,6 +643,13 @@ static void clustering_isolated(
         cluster_connectivity_graph_t g;
         // Use the deterministically-ordered children() vector for vertex indices.
         const auto live_all = live_grouping.children();
+        // When flash-aware, only merge clusters coincident in matched flash time.
+        // Edges here form a star per group (max_cluster -> each member), so a
+        // per-edge group guard suffices (no transitive bridging).
+        std::map<const Cluster*, int> flash_t0_group;
+        if (use_flash_t0) {
+            flash_t0_group = assign_flash_t0_groups(live_all, flash_t0_window);
+        }
         std::unordered_map<const Cluster*, int> map_cluster_index;
         map_cluster_index.reserve(live_all.size());
         for (size_t ilive = 0; ilive < live_all.size(); ++ilive) {
@@ -472,10 +660,29 @@ static void clustering_isolated(
             const Cluster* live = it->first;
             for (const auto& pair : it->second) {
                 const Cluster* live2 = pair.first;
+                if (use_flash_t0 && flash_t0_group.at(live) != flash_t0_group.at(live2)) continue;
                 add_edge(map_cluster_index[live], map_cluster_index[live2], g);
             }
         }
-        merge_clusters(g, live_grouping, "isolated");
+        if (save_assoc_id) {
+            // Doc 52 Stage 1.  merge_clusters() already implements exactly the
+            // semantics the prototype uses: "assoc_cluster_id" gets each blob's
+            // pre-merge cluster ident, and "assoc_cluster_main" marks the
+            // REPRESENTATIVE member's blobs (1) versus the rest (0).  Here the
+            // representative is the longest member -- no member carries a flash
+            // at this stage, so merge_clusters falls to best_any_ident
+            // (ClusteringFuncs.cxx:184-189) -- which is the same cluster this
+            // function itself picked as max_cluster above (:454-462), i.e. the
+            // prototype's max_cluster (ToyClustering_isolated.h:296-302).
+            // flags_from_longest stays FALSE: this pass must not change which
+            // member's flags the merged cluster reports.
+            merge_clusters(g, live_grouping, "isolated", "perblob",
+                           "assoc_cluster_id", /*flags_from_longest=*/false,
+                           "assoc_cluster_main");
+        }
+        else {
+            merge_clusters(g, live_grouping, "isolated");
+        }
     }
 
     // example separation ... 

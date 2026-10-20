@@ -3,8 +3,13 @@
 #include "WireCellClus/IPCTransform.h"
 #include "WireCellClus/Facade_Cluster.h"
 #include "WireCellClus/Facade_Grouping.h"
+#include "WireCellUtil/Logging.h"
 
 #include "connect_graphs.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <functional>
 
 using namespace WireCell;
 using namespace WireCell::Clus;
@@ -15,7 +20,8 @@ void Graphs::connect_graph_relaxed(
     const Facade::Cluster& cluster,
     IDetectorVolumes::pointer dv, 
     IPCTransformSet::pointer pcts,
-    Weighted::Graph& graph)    
+    Weighted::Graph& graph,
+    const RelaxedFastCfg* fast)
 {
     const bool use_ctpc = true;
     const auto* grouping = cluster.grouping();
@@ -59,14 +65,26 @@ void Graphs::connect_graph_relaxed(
     }
 
     // this drift direction is only used to calculate isochronous case, so this is OK ...
-    const geo_vector_t drift_dir_abs(1, 0, 0); 
+    const geo_vector_t drift_dir_abs(1, 0, 0);
 
 
     // Form connected components
     std::vector<int> component(num_vertices(graph));
     const size_t num = connected_components(graph, &component[0]);
-    
+
     if (num <= 1) return;
+
+    // doc pr/53 round 6 F0 (relaxed_edge_census): log-only diagnostic, default
+    // OFF.  Env WCT_RELAXED_EDGE_CENSUS unset => no log lines and no behavior
+    // change of any kind; the graph construction below is untouched either way.
+    static const bool oc53_census = std::getenv("WCT_RELAXED_EDGE_CENSUS") != nullptr;
+    static auto oc53_log = WireCell::Log::logger("clus");
+
+    // doc 78 round 2: lazy walk-on-demand for busy clusters, only under the
+    // "relaxed_fast" flavor (fast != nullptr) and only when this cluster's
+    // component count exceeds the busy threshold.  Census mode always takes
+    // the legacy order so the per-pair log stays complete.
+    const bool lazy_walk = fast && !oc53_census && num > fast->busy_num_threshold;
 
     // Allocate exactly num point clouds (one per component)
     std::vector<std::shared_ptr<Simple3DPointCloud>> pt_clouds(num);
@@ -80,6 +98,26 @@ void Graphs::connect_graph_relaxed(
         size_t c = component[i];
         pt_clouds[c]->add({points[0][i], points[1][i], points[2][i]});
         pt_clouds_global_indices[c].push_back(i);
+    }
+
+    if (oc53_census) {
+        oc53_log->debug("OC53CENSUS cluster nblobs={} npoints={} ncomp={}",
+                        cluster.nchildren(), cluster.npoints(), num);
+        for (size_t c = 0; c < num; ++c) {
+            double lo[3] = {1e12, 1e12, 1e12}, hi[3] = {-1e12, -1e12, -1e12};
+            const size_t np = pt_clouds[c]->get_num_points();
+            for (size_t i = 0; i < np; ++i) {
+                const auto p = pt_clouds[c]->point(i);
+                const double v[3] = {p.x(), p.y(), p.z()};
+                for (int d = 0; d < 3; ++d) {
+                    if (v[d] < lo[d]) lo[d] = v[d];
+                    if (v[d] > hi[d]) hi[d] = v[d];
+                }
+            }
+            oc53_log->debug("OC53CENSUS comp c={} npts={} bbox=({:.1f},{:.1f},{:.1f})-({:.1f},{:.1f},{:.1f})cm",
+                            c, np, lo[0]/units::cm, lo[1]/units::cm, lo[2]/units::cm,
+                            hi[0]/units::cm, hi[1]/units::cm, hi[2]/units::cm);
+        }
     }
 
     // Initialize distance metrics — all sentinels (-1,-1,1e9) mean "no valid connection".
@@ -96,6 +134,228 @@ void Graphs::connect_graph_relaxed(
     const bool needs_transform = (cluster.get_default_scope().hash() != cluster.get_raw_scope().hash());
     const auto ctpc_transform = needs_transform ? pcts->pc_transform(cluster.get_scope_transform()) : nullptr;
     const double cluster_t0 = needs_transform ? cluster.get_cluster_t0() : 0.0;
+
+    // doc 78 round 2: the per-pair closest-path walk + strong-check verdict
+    // (the former in-loop block), factored into a lambda so the lazy mode
+    // can evaluate it on demand.  Pure code motion -- the body is the
+    // round-1 text verbatim; both call orders are per-pair independent.
+    auto eval_pair_verdict = [&](size_t j, size_t k) {
+                geo_point_t p1 = pt_clouds.at(j)->point(std::get<0>(index_index_dis[j][k]));
+                auto wpid_p1 = cluster.wire_plane_id(pt_clouds_global_indices.at(j).at(std::get<0>(index_index_dis[j][k])));
+                geo_point_t p2 = pt_clouds.at(k)->point(std::get<1>(index_index_dis[j][k]));
+                auto wpid_p2 = cluster.wire_plane_id(pt_clouds_global_indices.at(k).at(std::get<1>(index_index_dis[j][k])));
+
+                double dis = sqrt(pow(p1.x() - p2.x(), 2) + pow(p1.y() - p2.y(), 2) + pow(p1.z() - p2.z(), 2));
+                double step_dis = 1.0 * units::cm;
+                int num_steps = dis/step_dis + 1;
+
+                
+
+                // Track different types of "bad" points
+                int num_bad[4] = {0,0,0,0};   // more than one of three are bad
+                int num_bad1[4] = {0,0,0,0};  // at least one of three are bad
+                int num_bad2[3] = {0,0,0};    // number of dead channels
+
+                // doc 78 round 1: once the (monotone) counters satisfy EVERY
+                // branch's kill predicate at once, the verdict below is "kill"
+                // no matter what the angles or the strong-check Hough decide,
+                // and the rest of the walk cannot change it.  Exact early exit;
+                // disabled in census mode so the logged counters stay full-walk.
+                bool forced_kill = false;
+
+                // Check points along path
+                for (int ii = 0; ii != num_steps; ii++) {
+                    geo_point_t test_p(
+                        p1.x() + (p2.x() - p1.x())/num_steps*(ii + 1),
+                        p1.y() + (p2.y() - p1.y())/num_steps*(ii + 1),
+                        p1.z() + (p2.z() - p1.z())/num_steps*(ii + 1)
+                    );
+
+                    // Test point quality using grouping parameters
+                    int scores[6] = {0,0,0,0,0,0};   // stack, not heap (see the [6] overload)
+                    if (use_ctpc) {
+                        auto test_wpid = get_wireplaneid(test_p, wpid_p1, wpid_p2, dv);
+                        if (test_wpid.apa()!=-1){
+                            geo_point_t test_p_raw = test_p;
+                            if (needs_transform) {
+                                test_p_raw = ctpc_transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
+                            }
+                            grouping->test_good_point(test_p_raw, test_wpid.apa(), test_wpid.face(), scores);
+
+                            // Check overall quality
+                            if (scores[0] + scores[3] + scores[1] + scores[4] + (scores[2]+scores[5])*2 < 3) {
+                                num_bad[0]++;
+                            }
+                            if (scores[0]+scores[3]==0) num_bad[1]++;
+                            if (scores[1]+scores[4]==0) num_bad[2]++;
+                            if (scores[2]+scores[5]==0) num_bad[3]++;
+
+                            if (scores[3]!=0) num_bad2[0]++;
+                            if (scores[4]!=0) num_bad2[1]++;
+                            if (scores[5]!=0) num_bad2[2]++;
+
+                            if (scores[0] + scores[3] + scores[1] + scores[4] + (scores[2]+scores[5]) < 3) {
+                                num_bad1[0]++;
+                            }
+                            if (scores[0]+scores[3]==0) num_bad1[1]++;
+                            if (scores[1]+scores[4]==0) num_bad1[2]++;
+                            if (scores[2]+scores[5]==0) num_bad1[3]++;
+                        } else if (grouping->in_dead_region(test_p)) {
+                            // doc icarus/04 sec 8: an off-face step inside a 3-D dead
+                            // region scores as test_good_point does there (all planes
+                            // dead): not bad, dead on every plane.  Null region -> never.
+                            num_bad2[0]++; num_bad2[1]++; num_bad2[2]++;
+                        } else {
+                            // Step is outside all APA volumes (between APAs).
+                            // Count as fully bad: no signal from any plane can validate this gap.
+                            num_bad[0]++;  num_bad[1]++;  num_bad[2]++;  num_bad[3]++;
+                            num_bad1[0]++; num_bad1[1]++; num_bad1[2]++; num_bad1[3]++;
+                        }
+                        // Sufficient for the kill verdict under the strong branch
+                        // (num_bad1[0] > 7) AND under every non-strong branch
+                        // (num_bad[0] > 7 covers parallel/default; the pair sums
+                        // > 9 cover the three single-wire-angle branches).  The
+                        // ratio and num_bad[3]>=3 alternatives only ADD kill
+                        // reasons, so they need not hold for sufficiency.
+                        if (!oc53_census &&
+                            num_bad1[0] > 7 && num_bad[0] > 7 &&
+                            num_bad[2] + num_bad[3] > 9 &&
+                            num_bad[1] + num_bad[3] > 9 &&
+                            num_bad[2] + num_bad[1] > 9) {
+                            forced_kill = true;
+                            break;
+                        }
+                    }
+                }
+
+                bool flag_strong_check = true;
+
+                if (forced_kill) {
+                    index_index_dis[j][k] = std::make_tuple(-1, -1, 1e9);
+                }
+                else {
+
+                auto test_wpid = get_wireplaneid(p1, wpid_p1, p2, wpid_p2, dv);
+
+                // Calculate angles between directions
+                geo_vector_t tempV1(0, p2.y() - p1.y(), p2.z() - p1.z());
+                geo_vector_t tempV5;
+
+                double angle1 = tempV1.angle(af_U_dir.at({test_wpid.apa(), test_wpid.face()})); 
+                tempV5.set(fabs(p2.x() - p1.x()),
+                        sqrt(pow(p2.y() - p1.y(), 2) + pow(p2.z() - p1.z(), 2)) * sin(angle1),
+                        0);
+                angle1 = tempV5.angle(drift_dir_abs);
+
+                double angle2 = tempV1.angle(af_V_dir.at({test_wpid.apa(), test_wpid.face()}));
+                tempV5.set(fabs(p2.x() - p1.x()),
+                        sqrt(pow(p2.y() - p1.y(), 2) + pow(p2.z() - p1.z(), 2)) * sin(angle2),
+                        0);
+                angle2 = tempV5.angle(drift_dir_abs);
+
+                double angle1p = tempV1.angle(af_W_dir.at({test_wpid.apa(), test_wpid.face()}));
+                tempV5.set(fabs(p2.x() - p1.x()),
+                        sqrt(pow(p2.y() - p1.y(), 2) + pow(p2.z() - p1.z(), 2)) * sin(angle1p),
+                        0); 
+                angle1p = tempV5.angle(drift_dir_abs);
+
+                tempV5.set(p2.x() - p1.x(), p2.y() - p1.y(), p2.z() - p1.z());
+                double angle3 = tempV5.angle(drift_dir_abs);
+
+                // Define constants for readability
+                constexpr double pi = 3.141592653589793;
+                constexpr double perp_angle_tol = 10.0/180.0*pi;
+                constexpr double wire_angle_tol = 12.5/180.0*pi;
+                constexpr double perp_angle = pi/2.0;
+                constexpr double invalid_dist = 1e9;
+
+                // Helper function to check if ratio exceeds threshold
+                auto exceeds_ratio = [](int val, int steps, double ratio = 0.75) {
+                    return val >= ratio * steps;
+                };
+
+                // doc 78 round 1: the flag_strong_check machinery only picks WHICH
+                // of two verdicts applies, so evaluate both verdicts first and call
+                // the two 15 cm whole-cluster Hough transforms only when they
+                // disagree -- when the verdicts agree the Houghs provably cannot
+                // change the outcome.  The predicate ladder below is a verbatim
+                // transcription of the pre-round-1 branches.
+
+                // Verdict if the strong check applies (flag_strong_check == true).
+                const bool kill_strong =
+                    num_bad1[0] > 7 || (num_bad1[0] > 2 && exceeds_ratio(num_bad1[0], num_steps));
+
+                // Verdict if the strong check does not apply.
+                bool kill_nonstrong;
+                {
+                    bool parallel_angles = (angle1 < wire_angle_tol && angle2 < wire_angle_tol) ||
+                                        (angle1p < wire_angle_tol && angle1 < wire_angle_tol) ||
+                                        (angle1p < wire_angle_tol && angle2 < wire_angle_tol);
+
+                    if (parallel_angles) {
+                        kill_nonstrong = num_bad[0] > 7 || (num_bad[0] > 2 && exceeds_ratio(num_bad[0], num_steps));
+                    }
+                    else if (angle1 < wire_angle_tol) {
+                        int sum_bad = num_bad[2] + num_bad[3];
+                        kill_nonstrong = sum_bad > 9 || (sum_bad > 2 && exceeds_ratio(sum_bad, num_steps)) || num_bad[3] >= 3;
+                    }
+                    else if (angle2 < wire_angle_tol) {
+                        int sum_bad = num_bad[1] + num_bad[3];
+                        kill_nonstrong = sum_bad > 9 || (sum_bad > 2 && exceeds_ratio(sum_bad, num_steps)) || num_bad[3] >= 3;
+                    }
+                    else if (angle1p < wire_angle_tol) {
+                        int sum_bad = num_bad[2] + num_bad[1];
+                        kill_nonstrong = sum_bad > 9 || (sum_bad > 2 && exceeds_ratio(sum_bad, num_steps));
+                    }
+                    else {
+                        kill_nonstrong = num_bad[0] > 7 || (num_bad[0] > 2 && exceeds_ratio(num_bad[0], num_steps));
+                    }
+                }
+
+                bool kill_now;
+                if (fabs(angle3 - perp_angle) < perp_angle_tol) {
+                    if (kill_strong == kill_nonstrong && !oc53_census) {
+                        // Houghs skipped: both verdicts agree, the flag is moot.
+                        // Census mode keeps the legacy path so the logged strong=
+                        // flag stays faithful.
+                        kill_now = kill_strong;
+                    }
+                    else {
+                        geo_vector_t tempV2 = cluster.vhough_transform(p1, 15*units::cm);
+                        geo_vector_t tempV3 = cluster.vhough_transform(p2, 15*units::cm);
+
+                        if (fabs(tempV2.angle(drift_dir_abs) - perp_angle) < perp_angle_tol &&
+                            fabs(tempV3.angle(drift_dir_abs) - perp_angle) < perp_angle_tol) {
+                            flag_strong_check = false;
+                        }
+                        kill_now = flag_strong_check ? kill_strong : kill_nonstrong;
+                    }
+                }
+                else if (angle1 < wire_angle_tol || angle2 < wire_angle_tol || angle1p < wire_angle_tol) {
+                    flag_strong_check = false;
+                    kill_now = kill_nonstrong;
+                }
+                else {
+                    kill_now = kill_strong;
+                }
+
+                if (kill_now) {
+                    index_index_dis[j][k] = std::make_tuple(-1, -1, invalid_dist);
+                }
+                }  // end !forced_kill
+
+                if (oc53_census) {
+                    const bool killed = std::get<0>(index_index_dis[j][k]) < 0;
+                    oc53_log->debug(
+                        "OC53CENSUS closest j={} k={} p1=({:.2f},{:.2f},{:.2f}) p2=({:.2f},{:.2f},{:.2f}) "
+                        "dis={:.2f}cm nsteps={} strong={} nb=[{},{},{},{}] nb1=[{},{},{},{}] killed={}",
+                        j, k, p1.x()/units::cm, p1.y()/units::cm, p1.z()/units::cm,
+                        p2.x()/units::cm, p2.y()/units::cm, p2.z()/units::cm,
+                        dis/units::cm, num_steps, flag_strong_check,
+                        num_bad[0], num_bad[1], num_bad[2], num_bad[3],
+                        num_bad1[0], num_bad1[1], num_bad1[2], num_bad1[3], killed);
+                }
+    };
 
     // Calculate distances between components
     for (size_t j = 0; j != num; j++) {
@@ -140,170 +400,13 @@ void Graphs::connect_graph_relaxed(
                                                                 result2.second);
                 }
             }
-            // Now check the path 
-
-            {
-                geo_point_t p1 = pt_clouds.at(j)->point(std::get<0>(index_index_dis[j][k]));
-                auto wpid_p1 = cluster.wire_plane_id(pt_clouds_global_indices.at(j).at(std::get<0>(index_index_dis[j][k])));
-                geo_point_t p2 = pt_clouds.at(k)->point(std::get<1>(index_index_dis[j][k]));
-                auto wpid_p2 = cluster.wire_plane_id(pt_clouds_global_indices.at(k).at(std::get<1>(index_index_dis[j][k])));
-
-                double dis = sqrt(pow(p1.x() - p2.x(), 2) + pow(p1.y() - p2.y(), 2) + pow(p1.z() - p2.z(), 2));
-                double step_dis = 1.0 * units::cm;
-                int num_steps = dis/step_dis + 1;
-
-                
-
-                // Track different types of "bad" points
-                int num_bad[4] = {0,0,0,0};   // more than one of three are bad
-                int num_bad1[4] = {0,0,0,0};  // at least one of three are bad
-                int num_bad2[3] = {0,0,0};    // number of dead channels
-
-                // Check points along path
-                for (int ii = 0; ii != num_steps; ii++) {
-                    geo_point_t test_p(
-                        p1.x() + (p2.x() - p1.x())/num_steps*(ii + 1),
-                        p1.y() + (p2.y() - p1.y())/num_steps*(ii + 1),
-                        p1.z() + (p2.z() - p1.z())/num_steps*(ii + 1)
-                    );
-
-                    // Test point quality using grouping parameters
-                    std::vector<int> scores;
-                    if (use_ctpc) {
-                        auto test_wpid = get_wireplaneid(test_p, wpid_p1, wpid_p2, dv);
-                        if (test_wpid.apa()!=-1){
-                            geo_point_t test_p_raw = test_p;
-                            if (needs_transform) {
-                                test_p_raw = ctpc_transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
-                            }
-                            scores = grouping->test_good_point(test_p_raw, test_wpid.apa(), test_wpid.face());
-
-                            // Check overall quality
-                            if (scores[0] + scores[3] + scores[1] + scores[4] + (scores[2]+scores[5])*2 < 3) {
-                                num_bad[0]++;
-                            }
-                            if (scores[0]+scores[3]==0) num_bad[1]++;
-                            if (scores[1]+scores[4]==0) num_bad[2]++;
-                            if (scores[2]+scores[5]==0) num_bad[3]++;
-
-                            if (scores[3]!=0) num_bad2[0]++;
-                            if (scores[4]!=0) num_bad2[1]++;
-                            if (scores[5]!=0) num_bad2[2]++;
-
-                            if (scores[0] + scores[3] + scores[1] + scores[4] + (scores[2]+scores[5]) < 3) {
-                                num_bad1[0]++;
-                            }
-                            if (scores[0]+scores[3]==0) num_bad1[1]++;
-                            if (scores[1]+scores[4]==0) num_bad1[2]++;
-                            if (scores[2]+scores[5]==0) num_bad1[3]++;
-                        } else {
-                            // Step is outside all APA volumes (between APAs).
-                            // Count as fully bad: no signal from any plane can validate this gap.
-                            num_bad[0]++;  num_bad[1]++;  num_bad[2]++;  num_bad[3]++;
-                            num_bad1[0]++; num_bad1[1]++; num_bad1[2]++; num_bad1[3]++;
-                        }
-                    }
-                }
-
-                auto test_wpid = get_wireplaneid(p1, wpid_p1, p2, wpid_p2, dv);
-
-                // Calculate angles between directions
-                geo_vector_t tempV1(0, p2.y() - p1.y(), p2.z() - p1.z());
-                geo_vector_t tempV5;
-
-                double angle1 = tempV1.angle(af_U_dir.at({test_wpid.apa(), test_wpid.face()})); 
-                tempV5.set(fabs(p2.x() - p1.x()),
-                        sqrt(pow(p2.y() - p1.y(), 2) + pow(p2.z() - p1.z(), 2)) * sin(angle1),
-                        0);
-                angle1 = tempV5.angle(drift_dir_abs);
-
-                double angle2 = tempV1.angle(af_V_dir.at({test_wpid.apa(), test_wpid.face()}));
-                tempV5.set(fabs(p2.x() - p1.x()),
-                        sqrt(pow(p2.y() - p1.y(), 2) + pow(p2.z() - p1.z(), 2)) * sin(angle2),
-                        0);
-                angle2 = tempV5.angle(drift_dir_abs);
-
-                double angle1p = tempV1.angle(af_W_dir.at({test_wpid.apa(), test_wpid.face()}));
-                tempV5.set(fabs(p2.x() - p1.x()),
-                        sqrt(pow(p2.y() - p1.y(), 2) + pow(p2.z() - p1.z(), 2)) * sin(angle1p),
-                        0); 
-                angle1p = tempV5.angle(drift_dir_abs);
-
-                tempV5.set(p2.x() - p1.x(), p2.y() - p1.y(), p2.z() - p1.z());
-                double angle3 = tempV5.angle(drift_dir_abs);
-
-                bool flag_strong_check = true;
-
-                // Define constants for readability
-                constexpr double pi = 3.141592653589793;
-                constexpr double perp_angle_tol = 10.0/180.0*pi;
-                constexpr double wire_angle_tol = 12.5/180.0*pi;
-                constexpr double perp_angle = pi/2.0;
-                constexpr double invalid_dist = 1e9;
-
-                if (fabs(angle3 - perp_angle) < perp_angle_tol) {
-                    geo_vector_t tempV2 = cluster.vhough_transform(p1, 15*units::cm);
-                    geo_vector_t tempV3 = cluster.vhough_transform(p2, 15*units::cm);
-                    
-                    if (fabs(tempV2.angle(drift_dir_abs) - perp_angle) < perp_angle_tol &&
-                        fabs(tempV3.angle(drift_dir_abs) - perp_angle) < perp_angle_tol) {
-                        flag_strong_check = false;
-                    }
-                }
-                else if (angle1 < wire_angle_tol || angle2 < wire_angle_tol || angle1p < wire_angle_tol) {
-                    flag_strong_check = false;
-                }
-
-                // Helper function to check if ratio exceeds threshold
-                auto exceeds_ratio = [](int val, int steps, double ratio = 0.75) {
-                    return val >= ratio * steps;
-                };
-
-                // Helper function to invalidate distance
-                auto invalidate_distance = [&]() {
-                    index_index_dis[j][k] = std::make_tuple(-1, -1, invalid_dist);
-                };
-
-                if (flag_strong_check) {
-                    if (num_bad1[0] > 7 || (num_bad1[0] > 2 && exceeds_ratio(num_bad1[0], num_steps))) {
-                        invalidate_distance();
-                    }
-                }
-                else {
-                    bool parallel_angles = (angle1 < wire_angle_tol && angle2 < wire_angle_tol) ||
-                                        (angle1p < wire_angle_tol && angle1 < wire_angle_tol) ||
-                                        (angle1p < wire_angle_tol && angle2 < wire_angle_tol);
-
-                    if (parallel_angles) {
-                        if (num_bad[0] > 7 || (num_bad[0] > 2 && exceeds_ratio(num_bad[0], num_steps))) {
-                            invalidate_distance();
-                        }
-                    }
-                    else if (angle1 < wire_angle_tol) {
-                        int sum_bad = num_bad[2] + num_bad[3];
-                        if (sum_bad > 9 || (sum_bad > 2 && exceeds_ratio(sum_bad, num_steps)) || num_bad[3] >= 3) {
-                            invalidate_distance();
-                        }
-                    }
-                    else if (angle2 < wire_angle_tol) {
-                        int sum_bad = num_bad[1] + num_bad[3];
-                        if (sum_bad > 9 || (sum_bad > 2 && exceeds_ratio(sum_bad, num_steps)) || num_bad[3] >= 3) {
-                            invalidate_distance();
-                        }
-                    }
-                    else if (angle1p < wire_angle_tol) {
-                        int sum_bad = num_bad[2] + num_bad[1];
-                        if (sum_bad > 9 || (sum_bad > 2 && exceeds_ratio(sum_bad, num_steps))) {
-                            invalidate_distance();
-                        }
-                    }
-                    else if (num_bad[0] > 7 || (num_bad[0] > 2 && exceeds_ratio(num_bad[0], num_steps))) {
-                        invalidate_distance();
-                    }
-                }
+            // Now check the path (legacy: every pair; lazy mode defers to the
+            // MST fixpoint below -- doc 78 round 2)
+            if (!lazy_walk) {
+                eval_pair_verdict(j, k);
             }
 
-            // Now check path again ... 
+            // Now check path again ...
             if (std::get<0>(index_index_dis_dir1[j][k]) >= 0) {
                 geo_point_t p1 = pt_clouds.at(j)->point(std::get<0>(index_index_dis_dir1[j][k])); 
                 auto wpid_p1 = cluster.wire_plane_id(pt_clouds_global_indices.at(j).at(std::get<0>(index_index_dis_dir1[j][k])));
@@ -317,6 +420,7 @@ void Graphs::connect_graph_relaxed(
                 int num_steps = dis/step_dis + 1;
                 int num_bad = 0;
                 int num_bad1 = 0;
+                bool forced_kill = false;
 
                 // Check intermediate points along path
                 for (int ii = 0; ii != num_steps; ii++) {
@@ -336,14 +440,29 @@ void Graphs::connect_graph_relaxed(
                             const bool good_point = grouping->is_good_point(test_p_raw, test_wpid.apa(), test_wpid.face());
                             if (!good_point) {
                                 num_bad++;
-                            }
-                            if (!grouping->is_good_point(test_p_raw, test_wpid.apa(), test_wpid.face(), 0.6*units::cm, 1, 0)) {
+                                // doc 78 round 1: is_good_point with allowed_bad=0 is
+                                // strictly tighter than with the default 1, so a point
+                                // failing the loose test cannot pass the tight one --
+                                // count it directly and skip the second kd descent.
                                 num_bad1++;
                             }
-                        } else {
+                            else if (!grouping->is_good_point(test_p_raw, test_wpid.apa(), test_wpid.face(), 0.6*units::cm, 1, 0)) {
+                                num_bad1++;
+                            }
+                        } else if (!grouping->in_dead_region(test_p)) {
                             // Step is outside all APA volumes — count as bad.
+                            // (doc icarus/04 sec 8: unless it is inside a 3-D dead
+                            // region, where it is dead, not bad.  Null region -> bad.)
                             num_bad++;
                             num_bad1++;
+                        }
+                        // doc 78 round 1: num_bad1 >= num_bad always (tighter test),
+                        // so num_bad > 7 satisfies BOTH branch predicates below --
+                        // the verdict is already "kill"; the rest of the walk cannot
+                        // change it.  Census mode keeps full-walk counters.
+                        if (!oc53_census && num_bad > 7) {
+                            forced_kill = true;
+                            break;
                         }
                     }
                 }
@@ -376,7 +495,11 @@ void Graphs::connect_graph_relaxed(
                 angle1p = tempV5.angle(drift_dir_abs);
 
                 const double pi = 3.141592653589793;
-                if (fabs(angle3 - pi/2) < 10.0/180.0*pi || 
+                if (forced_kill) {
+                    // doc 78 round 1: verdict already forced during the walk.
+                    index_index_dis_dir1[j][k] = std::make_tuple(-1, -1, 1e9);
+                }
+                else if (fabs(angle3 - pi/2) < 10.0/180.0*pi || 
                     angle1 < 12.5/180.0*pi ||
                     angle2 < 12.5/180.0*pi || 
                     angle1p < 7.5/180.0*pi) {
@@ -389,6 +512,12 @@ void Graphs::connect_graph_relaxed(
                     if (num_bad1 > 7 || (num_bad1 > 2 && num_bad1 >= 0.75*num_steps)) {
                         index_index_dis_dir1[j][k] = std::make_tuple(-1, -1, 1e9);
                     }
+                }
+
+                if (oc53_census) {
+                    const bool killed = std::get<0>(index_index_dis_dir1[j][k]) < 0;
+                    oc53_log->debug("OC53CENSUS dir1 j={} k={} dis={:.2f}cm nsteps={} nb={} nb1={} killed={}",
+                                    j, k, dis/units::cm, num_steps, num_bad, num_bad1, killed);
                 }
             }
 
@@ -407,6 +536,7 @@ void Graphs::connect_graph_relaxed(
                 int num_steps = dis/step_dis + 1;
                 int num_bad = 0;
                 int num_bad1 = 0;
+                bool forced_kill = false;
 
                 // Check points along path
                 for (int ii = 0; ii != num_steps; ii++) {
@@ -426,14 +556,29 @@ void Graphs::connect_graph_relaxed(
                             const bool good_point = grouping->is_good_point(test_p_raw, test_wpid.apa(), test_wpid.face());
                             if (!good_point) {
                                 num_bad++;
-                            }
-                            if (!grouping->is_good_point(test_p_raw, test_wpid.apa(), test_wpid.face(), 0.6*units::cm, 1, 0)) {
+                                // doc 78 round 1: is_good_point with allowed_bad=0 is
+                                // strictly tighter than with the default 1, so a point
+                                // failing the loose test cannot pass the tight one --
+                                // count it directly and skip the second kd descent.
                                 num_bad1++;
                             }
-                        } else {
+                            else if (!grouping->is_good_point(test_p_raw, test_wpid.apa(), test_wpid.face(), 0.6*units::cm, 1, 0)) {
+                                num_bad1++;
+                            }
+                        } else if (!grouping->in_dead_region(test_p)) {
                             // Step is outside all APA volumes — count as bad.
+                            // (doc icarus/04 sec 8: unless it is inside a 3-D dead
+                            // region, where it is dead, not bad.  Null region -> bad.)
                             num_bad++;
                             num_bad1++;
+                        }
+                        // doc 78 round 1: num_bad1 >= num_bad always (tighter test),
+                        // so num_bad > 7 satisfies BOTH branch predicates below --
+                        // the verdict is already "kill"; the rest of the walk cannot
+                        // change it.  Census mode keeps full-walk counters.
+                        if (!oc53_census && num_bad > 7) {
+                            forced_kill = true;
+                            break;
                         }
                     }
                 }
@@ -471,7 +616,11 @@ void Graphs::connect_graph_relaxed(
                                 angle2 < 12.5/180.0*pi || 
                                 angle1p < 7.5/180.0*pi;
 
-                if (is_parallel) {
+                if (forced_kill) {
+                    // doc 78 round 1: verdict already forced during the walk.
+                    index_index_dis_dir2[j][k] = std::make_tuple(-1, -1, 1e9);
+                }
+                else if (is_parallel) {
                     // Parallel or prolonged case
                     if (num_bad > 7 || (num_bad > 2 && num_bad >= 0.75*num_steps)) {
                         index_index_dis_dir2[j][k] = std::make_tuple(-1, -1, 1e9);
@@ -482,12 +631,86 @@ void Graphs::connect_graph_relaxed(
                         index_index_dis_dir2[j][k] = std::make_tuple(-1, -1, 1e9);
                     }
                 }
+
+                if (oc53_census) {
+                    const bool killed = std::get<0>(index_index_dis_dir2[j][k]) < 0;
+                    oc53_log->debug("OC53CENSUS dir2 j={} k={} dis={:.2f}cm nsteps={} nb={} nb1={} killed={}",
+                                    j, k, dis/units::cm, num_steps, num_bad, num_bad1, killed);
+                }
             }
         }
     }
 
     // deal with MST of first type
-    {
+    if (lazy_walk) {
+        // doc 78 round 2 (take 2 -- the kill-and-rebuild Prim fixpoint of the
+        // first attempt converged too slowly: killed bridges cluster, so each
+        // rebuild proposes more killable edges and the iteration cap then
+        // walked everything, costing MORE than eager).  Single-pass lazy
+        // Kruskal instead: consider pairs in ascending (distance, j, k)
+        // order and evaluate the walk verdict ONLY when a pair would bridge
+        // two union-find components.  Killed bridges are skipped; the
+        // accepted set IS the spanning forest of the walk-filtered graph
+        // (identical to the legacy per-component Prim except possibly on
+        // exact distance ties, which is inside this knob's validation).
+        // The < 3 cm direct-edge rule below needs every near pair's verdict
+        // regardless of the forest -- walk those eagerly (a few steps each).
+        std::vector<std::vector<char>> walked(num, std::vector<char>(num, 0));
+        for (size_t j = 0; j != num; j++) {
+            for (size_t k = j + 1; k != num; k++) {
+                if (std::get<0>(index_index_dis[j][k]) < 0) continue;
+                // Near pairs feed the < 3 cm direct-edge rule; pairs with a
+                // directional candidate feed MST #2's recording of the MAIN
+                // entry (process_mst_deterministically copies
+                // index_index_dis[e], and a killed main blocks the dir edges
+                // downstream) -- both need the main verdict eagerly.
+                if (std::get<2>(index_index_dis[j][k]) < 3 * units::cm ||
+                    std::get<0>(index_index_dis_dir1[j][k]) >= 0 ||
+                    std::get<0>(index_index_dis_dir2[j][k]) >= 0) {
+                    eval_pair_verdict(j, k);
+                    walked[j][k] = 1;
+                }
+            }
+        }
+
+        std::vector<std::tuple<double, size_t, size_t>> order;
+        order.reserve(num * (num - 1) / 2);
+        for (size_t j = 0; j != num; j++) {
+            for (size_t k = j + 1; k != num; k++) {
+                if (std::get<0>(index_index_dis[j][k]) >= 0) {
+                    order.emplace_back(std::get<2>(index_index_dis[j][k]), j, k);
+                }
+            }
+        }
+        std::sort(order.begin(), order.end());
+
+        std::vector<size_t> uf(num);
+        for (size_t i = 0; i != num; ++i) uf[i] = i;
+        std::function<size_t(size_t)> uf_find = [&](size_t x) {
+            while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; }
+            return x;
+        };
+
+        size_t n_walked = 0, n_accepted = 0;
+        for (const auto& [d, j, k] : order) {
+            const size_t rj = uf_find(j), rk = uf_find(k);
+            if (rj == rk) continue;
+            if (!walked[j][k]) {
+                eval_pair_verdict(j, k);
+                walked[j][k] = 1;
+                ++n_walked;
+            }
+            if (std::get<0>(index_index_dis[j][k]) < 0) continue;  // killed bridge
+            uf[rj] = rk;
+            index_index_dis_mst[j][k] = index_index_dis[j][k];
+            if (++n_accepted + 1 == num) break;  // spanning forest complete
+        }
+        SPDLOG_LOGGER_DEBUG(WireCell::Log::logger("clus"),
+            "connect_graph_relaxed lazy: num={} pairs={} walked={} accepted={}",
+            num, order.size(), n_walked, n_accepted);
+    }
+
+    if (!lazy_walk) {
         Weighted::Graph temp_graph(num);
         for (size_t j = 0; j != num; j++) {
             for (size_t k = j + 1; k != num; k++) {
@@ -528,6 +751,8 @@ void Graphs::connect_graph_relaxed(
         process_mst_deterministically(temp_graph, index_index_dis, index_index_dis_dir_mst);
 
     }
+
+    std::vector<std::pair<size_t, size_t>> oc53_pairs;  // emitted component pairs (census only)
 
     for (size_t j = 0; j != num; j++) {
         for (size_t k = j + 1; k != num; k++) {
@@ -577,9 +802,49 @@ void Graphs::connect_graph_relaxed(
                 }
             }
 
+            if (oc53_census) {
+                const bool e_mst = std::get<0>(index_index_dis_mst[j][k]) >= 0;
+                const bool e_dir = std::get<0>(index_index_dis_dir_mst[j][k]) >= 0 &&
+                                   (std::get<0>(index_index_dis_dir1[j][k]) >= 0 ||
+                                    std::get<0>(index_index_dis_dir2[j][k]) >= 0);
+                if (e_mst || e_dir) oc53_pairs.emplace_back(j, k);
+            }
+
         }  // k
     }  // j
-    
+
+    if (oc53_census) {
+        oc53_log->debug("OC53CENSUS summary ncomp={} nedges={}", num, oc53_pairs.size());
+        // Bridge status of each emitted component-pair edge: DFS reachability
+        // over the remaining emitted pairs.  A bridge=true edge is the sole
+        // link between its two components' sides.
+        for (size_t e = 0; e < oc53_pairs.size(); ++e) {
+            const size_t ja = oc53_pairs[e].first;
+            const size_t ka = oc53_pairs[e].second;
+            std::vector<std::vector<size_t>> adj(num);
+            for (size_t f = 0; f < oc53_pairs.size(); ++f) {
+                if (f == e) continue;
+                adj[oc53_pairs[f].first].push_back(oc53_pairs[f].second);
+                adj[oc53_pairs[f].second].push_back(oc53_pairs[f].first);
+            }
+            std::vector<char> seen(num, 0);
+            std::vector<size_t> stack{ja};
+            seen[ja] = 1;
+            while (!stack.empty()) {
+                const size_t v = stack.back();
+                stack.pop_back();
+                for (const size_t w : adj[v]) {
+                    if (!seen[w]) { seen[w] = 1; stack.push_back(w); }
+                }
+            }
+            const bool e_mst = std::get<0>(index_index_dis_mst[ja][ka]) >= 0;
+            const bool e_dir1 = std::get<0>(index_index_dis_dir1[ja][ka]) >= 0;
+            const bool e_dir2 = std::get<0>(index_index_dis_dir2[ja][ka]) >= 0;
+            oc53_log->debug("OC53CENSUS edge j={} k={} dis={:.2f}cm mst={} dir1={} dir2={} bridge={}",
+                            ja, ka, std::get<2>(index_index_dis[ja][ka])/units::cm,
+                            e_mst, e_dir1, e_dir2, !seen[ka]);
+        }
+    }
 }
 
  bool Graphs::check_connectivity(const Facade::Cluster& cluster,  IDetectorVolumes::pointer dv, IPCTransformSet::pointer pcts, std::tuple<int, int, double>& index_index_dis, std::shared_ptr<Facade::Simple3DPointCloud> pc1, std::vector<size_t> pc1_global_index, std::shared_ptr<Facade::Simple3DPointCloud> pc2, std::vector<size_t> pc2_global_index,
@@ -695,24 +960,25 @@ void Graphs::connect_graph_relaxed(
         }
         
         // Get detailed scores for this point
-        std::vector<int> scores = grouping->test_good_point(test_p_raw, test_wpid.apa(), test_wpid.face(), test_radius);
+        int scores[6];
+        grouping->test_good_point(test_p_raw, test_wpid.apa(), test_wpid.face(), scores, test_radius);
         
         int num_bad_details = 0;
         
         // Check U plane (indices 0=live, 3=dead)
-        if (scores.at(0) + scores.at(3) == 0) {
+        if (scores[0] + scores[3] == 0) {
             if (!flag_prolonged_u) num_bad[0]++;
             num_bad_details++;
         }
         
         // Check V plane (indices 1=live, 4=dead)
-        if (scores.at(1) + scores.at(4) == 0) {
+        if (scores[1] + scores[4] == 0) {
             if (!flag_prolonged_v) num_bad[1]++;
             num_bad_details++;
         }
         
         // Check W plane (collection, indices 2=live, 5=dead)
-        if (scores.at(2) + scores.at(5) == 0) {
+        if (scores[2] + scores[5] == 0) {
             if (!flag_prolonged_w) num_bad[2]++;
             num_bad_details++;
         }

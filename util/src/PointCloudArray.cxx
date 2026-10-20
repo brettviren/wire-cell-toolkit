@@ -2,9 +2,28 @@
 #include "WireCellUtil/Logging.h"
 #include "WireCellUtil/Dtype.h"
 
+#include <mutex>
+#include <set>
+
 using namespace WireCell::PointCloud;
 
 //// array
+
+// doc pdvd/28 round 2: dtype interning table.  Entries are never removed, so
+// the returned pointer is valid for the life of the process.
+const std::string* Array::intern_dtype(const std::string& dt)
+{
+    static std::mutex mtx;
+    static std::set<std::string> table;
+    std::lock_guard<std::mutex> lock(mtx);
+    return &*table.insert(dt).first;
+}
+
+const Array::metadata_t& Array::empty_metadata()
+{
+    static const metadata_t empty;
+    return empty;
+}
 
 Array::~Array()
 {
@@ -19,7 +38,7 @@ Array::Array(const Array& rhs)
     , m_ele_size(rhs.m_ele_size)
     , m_dtype(rhs.m_dtype)
     , m_store(rhs.m_store)
-    , m_metadata(rhs.m_metadata)
+    , m_metadata(rhs.m_metadata ? std::make_unique<metadata_t>(*rhs.m_metadata) : nullptr)
 {
     update_span();
 }
@@ -52,7 +71,7 @@ void Array::assign(std::byte* data, const std::string& dtype, const shape_t& sha
 {
     m_store.clear();
     m_shape = shape;
-    m_dtype = dtype;
+    m_dtype = intern_dtype(dtype);
     size_t nbytes = m_ele_size = dtype_size(dtype);
 
     for (const auto& n : shape) {
@@ -81,7 +100,7 @@ Array& Array::operator=(const Array& rhs)
         m_store = rhs.m_store;
         update_span();
     }
-    m_metadata = rhs.m_metadata;
+    m_metadata = rhs.m_metadata ? std::make_unique<metadata_t>(*rhs.m_metadata) : nullptr;
     return *this;
 }
 
@@ -91,6 +110,14 @@ Array& Array::operator=(Array&& rhs)
     std::swap(m_shape, rhs.m_shape);
     std::swap(m_ele_size, rhs.m_ele_size);
     std::swap(m_dtype, rhs.m_dtype);
+    // doc pdvd/46 sec 3.3: m_store must move together with m_bytes.  Without
+    // this swap the destination took the source's span while the bytes stayed
+    // behind in the source's store: the destination looked like a sharing
+    // array (m_store empty) and dangled the moment the source died, and the
+    // source was left owning a buffer it no longer viewed.  std::vector's swap
+    // preserves the buffer address, so the swapped span stays valid.  The move
+    // CONSTRUCTOR above never had the defect; only this assignment did.
+    std::swap(m_store, rhs.m_store);
     std::swap(m_bytes, rhs.m_bytes);
     std::swap(m_metadata, rhs.m_metadata);
     return *this;
@@ -116,7 +143,7 @@ Array Array::slice(size_t position, size_t count, bool share)
     const size_t start_bytes = jump_size() * position;
 
     // Build array on the slice 
-    return Array(m_store.data() + start_bytes, m_dtype, shape, share);
+    return Array(m_store.data() + start_bytes, dtype(), shape, share);
 }
 
 Array Array::slice(size_t position, size_t count) const
@@ -129,7 +156,7 @@ Array Array::slice(size_t position, size_t count) const
     const size_t start_bytes = jump_size() * position;
 
     // Build array on the slice 
-    return Array(m_store.data() + start_bytes, m_dtype, shape);
+    return Array(m_store.data() + start_bytes, dtype(), shape);
 }
 
 Array Array::slice(const std::vector<size_t>& indices) const
@@ -144,14 +171,14 @@ Array Array::slice(const std::vector<size_t>& indices) const
         const std::byte* ptr = my_data + ind*jump;
         dat.insert(dat.end(), ptr, ptr+jump);
     }
-    return Array(dat.data(), m_dtype, shape);
+    return Array(dat.data(), dtype(), shape);
 }
 
 
 Array Array::zeros_like(size_t nmaj) const
 {
     Array ret;
-    ret.m_metadata = m_metadata;
+    if (m_metadata) ret.m_metadata = std::make_unique<metadata_t>(*m_metadata);
     ret.m_dtype = m_dtype;
     ret.m_ele_size = m_ele_size;
     if (m_shape.empty()) {

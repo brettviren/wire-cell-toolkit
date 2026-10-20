@@ -1,0 +1,1496 @@
+// Fork-by-duplication of UbooneMagnifyTrackingVisitor for the SBND
+// neutrino-PR chain (see the header for the fork rationale and deltas).
+// Structure and tree schema deliberately track the uBooNE original; the
+// two-TPC channel scheme is copied from SbndMagnifyTrackingVisitor.
+
+#include "WireCellRoot/SbndPrMagnifyTrackingVisitor.h"
+#include "WireCellRoot/UbooneMagnifyTrackingVisitor.h"  // WCPointTree
+
+#include <cctype>
+#include <cmath>
+#include <set>
+#include <vector>
+
+#include "TFile.h"
+#include "WireCellUtil/Persist.h"
+#include "TTree.h"
+
+#include "WireCellUtil/NamedFactory.h"
+#include "WireCellUtil/String.h"
+#include "WireCellUtil/Units.h"
+#include "WireCellClus/TrackFitting.h"
+#include "WireCellClus/Facade_Grouping.h"
+#include "WireCellClus/ClusteringFuncs.h"
+#include "WireCellClus/PRGraph.h"
+#include "WireCellClus/PRVertex.h"
+#include "WireCellClus/PRSegment.h"
+#include "WireCellClus/PRShower.h"   // PR::ClusterPtrCmp / ClusterPtrSet
+#include "WireCellClus/NuBundleCensus.h"   // sbnd_xin/docs/109
+#include "WireCellUtil/BuildConfig.h"      // WIRECELL_VERSION (sbnd_xin/docs/109)
+
+#include <boost/graph/graph_traits.hpp>
+
+WIRECELL_FACTORY(SbndPrMagnifyTrackingVisitor, WireCell::Root::SbndPrMagnifyTrackingVisitor,
+                 WireCell::IConfigurable, WireCell::Clus::IEnsembleVisitor)
+
+using namespace WireCell;
+using namespace WireCell::Clus;
+
+// doc pr/94 Phase 4b: the per-bundle neutrino candidates, in row order, or the
+// single unnamed slot when the nu_per_bundle knob is off.  Never empty: the
+// legacy resolution is returned as a one-element vector (possibly holding
+// nullptr, which the callers already test for), so the knob-off path is
+// textually the same sequence of operations it was before.
+static std::vector<std::shared_ptr<Clus::TrackFitting>>
+collect_nu_fitters(Clus::Facade::Grouping& grouping)
+{
+    std::vector<std::shared_ptr<Clus::TrackFitting>> out;
+    for (int i = 0;; ++i) {
+        auto tfi = grouping.get_track_fitting("nu" + std::to_string(i));
+        if (!tfi) break;
+        out.push_back(tfi);
+    }
+    if (out.empty()) out.push_back(grouping.get_track_fitting());
+    return out;
+}
+
+
+namespace {
+    /// One file per event when the configured name carries a printf
+    /// conversion.  A process that streams many events would otherwise have
+    /// every event RECREATE (or UPDATE) the same path, leaving only the last.
+    /// No '%' in the name => the name is returned unchanged, so a
+    /// one-event-per-process job writes exactly the file it always wrote.
+    /// Same idiom as QLMatching's calib dump.
+    std::string event_filename(const std::string& tmpl, int ident)
+    {
+        if (tmpl.find('%') == std::string::npos) return tmpl;
+        return WireCell::String::format(tmpl, ident);
+    }
+}
+
+
+namespace {
+    /// The (run, subrun, event) to stamp into this event's output.  A group
+    /// job's MultiAlgBlobClustering publishes the resolved triplet on the
+    /// ensemble; a one-event-per-process job publishes nothing and the
+    /// component's own configured numbers are used, unchanged.
+    struct Rse { int run, subrun, event; };
+    Rse event_rse(const WireCell::Clus::Facade::Ensemble& ensemble,
+                  int run, int subrun, int event)
+    {
+        if (ensemble.rse_valid()) {
+            return {ensemble.runNo(), ensemble.subRunNo(), ensemble.eventNo()};
+        }
+        return {run, subrun, event};
+    }
+}
+
+Root::SbndPrMagnifyTrackingVisitor::SbndPrMagnifyTrackingVisitor()
+  : log(Log::logger("tracking"))
+{
+}
+
+Root::SbndPrMagnifyTrackingVisitor::~SbndPrMagnifyTrackingVisitor() {}
+
+void Root::SbndPrMagnifyTrackingVisitor::configure(const WireCell::Configuration& cfg)
+{
+    m_output_filename = get<std::string>(cfg, "output_filename", "tracking-pr.root");
+    m_grouping_name = get<std::string>(cfg, "grouping", "live");
+    m_runNo = get<int>(cfg, "runNo", 0);
+    m_subRunNo = get<int>(cfg, "subRunNo", 0);
+    m_eventNo = get<int>(cfg, "eventNo", 0);
+    m_dQdx_scale = get<double>(cfg, "dQdx_scale", 0.1);
+    m_dQdx_offset = get<double>(cfg, "dQdx_offset", -1000);
+    m_flag_skip_vertex = get<bool>(cfg, "flag_skip_vertex", false);
+    m_nticks = get<int>(cfg, "nticks", m_nticks);
+    // doc 87: DEFAULT FALSE keeps tracking-pr.root byte-identical.
+    m_save_in_scope = get<bool>(cfg, "save_in_scope", m_save_in_scope);
+    // doc 99: DEFAULT FALSE keeps the legacy (per-input row index) resolution.
+    m_flash_by_gid = get<bool>(cfg, "flash_by_gid", m_flash_by_gid);
+    // ai-helper issue 35: optional; only the T_dlvtx_call truth vertex uses it.
+    if (cfg.isMember("sce_field") && !cfg["sce_field"].asString().empty()) {
+        m_sce = Factory::find_tn<ISCEField>(cfg["sce_field"].asString());
+    }
+    m_dl_vtx_dump = get<bool>(cfg, "dl_vtx_dump", m_dl_vtx_dump);   // ai-helper issue 35
+    // sbnd_xin/docs/109: DEFAULT FALSE / empty keep tracking-pr.root byte-identical.
+    m_nu_provenance = get<bool>(cfg, "nu_provenance", m_nu_provenance);
+    m_fix_cluster_flags = get<bool>(cfg, "fix_cluster_flags", m_fix_cluster_flags);
+    // sbnd_xin/docs/109 rev 3: DEFAULT FALSE keeps T_rec_charge and the tree set byte-identical.
+    m_rec_charge_provenance = get<bool>(cfg, "rec_charge_provenance", m_rec_charge_provenance);
+    m_provenance.clear();
+    if (cfg["provenance"].isObject()) {
+        const auto& prov = cfg["provenance"];
+        for (const auto& key : prov.getMemberNames()) {
+            std::string val = prov[key].isString() ? prov[key].asString() : prov[key].toStyledString();
+            while (!val.empty() && (val.back() == '\n' || val.back() == ' ')) val.pop_back();
+            m_provenance[key] = val;
+        }
+    }
+
+    auto anode_tns = cfg["anodes"];
+    for (auto anode_tn : anode_tns) {
+        auto anode = Factory::find_tn<IAnodePlane>(anode_tn.asString());
+        m_anodes.push_back(anode);
+    }
+
+    m_dv = Factory::find_tn<IDetectorVolumes>(cfg["detector_volumes"].asString());
+}
+
+WireCell::Configuration Root::SbndPrMagnifyTrackingVisitor::default_configuration() const
+{
+    Configuration cfg;
+    cfg["output_filename"] = "tracking-pr.root";
+    cfg["grouping"] = "live";
+    cfg["save_in_scope"] = m_save_in_scope;
+    cfg["dl_vtx_dump"] = m_dl_vtx_dump;   // ai-helper issue 35: false = T_dlvtx_* only when a call was recorded
+    cfg["flash_by_gid"] = m_flash_by_gid;
+    cfg["nu_provenance"] = m_nu_provenance;          // sbnd_xin/docs/109; false = no T_bundle/T_flash, no Trun census branches
+    cfg["fix_cluster_flags"] = m_fix_cluster_flags;  // sbnd_xin/docs/109; false = legacy T_cluster flag columns
+    cfg["rec_charge_provenance"] = m_rec_charge_provenance;  // sbnd_xin/docs/109 rev 3; false = legacy T_rec_charge.cluster_id, no nu_index/point_cluster_id, T_proj_data omitted when empty
+    cfg["provenance"] = Json::objectValue;           // sbnd_xin/docs/109; empty = no Trun provenance strings
+    cfg["anodes"] = Json::arrayValue;
+    cfg["detector_volumes"] = "";
+    cfg["runNo"] = 0;
+    cfg["subRunNo"] = 0;
+    cfg["eventNo"] = 0;
+    cfg["dQdx_scale"] = 0.1;
+    cfg["dQdx_offset"] = -1000;
+    cfg["flag_skip_vertex"] = false;
+    cfg["nticks"] = 3427;
+    return cfg;
+}
+
+Root::SbndPrMagnifyTrackingVisitor::ChanScheme Root::SbndPrMagnifyTrackingVisitor::chan_scheme() const
+{
+    ChanScheme cs;
+    for (const auto& anode : m_anodes) {
+        for (const auto& face : anode->faces()) {
+            if (!face) continue;
+            auto planes = face->planes();
+            for (size_t p = 0; p < planes.size() && p < 3; ++p) {
+                const int n = static_cast<int>(planes[p]->channels().size());
+                if (n > cs.nch[p]) cs.nch[p] = n;
+            }
+        }
+    }
+    const int napa = static_cast<int>(m_anodes.size());
+    cs.base[0] = 0;
+    cs.base[1] = napa * cs.nch[0];
+    cs.base[2] = cs.base[1] + napa * cs.nch[1];
+    return cs;
+}
+
+void Root::SbndPrMagnifyTrackingVisitor::visit(Clus::Facade::Ensemble& ensemble) const
+{
+    // (Our scalar-PC RSE reads removed in the 09-05 merge: upstream now
+    // resolves the per-event triplet through event_rse() below, and its
+    // m_runNo/m_subRunNo/m_eventNo are no longer mutable, so assigning to
+    // them inside this const visit() would not compile.)
+
+    auto groupings = ensemble.with_name(m_grouping_name);
+    if (groupings.empty()) {
+        log->debug("SbndPrMagnifyTrackingVisitor: no grouping '{}'", m_grouping_name);
+        return;
+    }
+
+    auto& grouping = *groupings.at(0);
+
+    // Set anodes and detector volumes on the grouping
+    grouping.set_anodes(m_anodes);
+    grouping.set_detector_volumes(m_dv);
+
+    const auto cs = chan_scheme();
+    log->debug("SbndPrMagnifyTrackingVisitor: channel scheme nch=[{},{},{}] base=[{},{},{}]",
+               cs.nch[0], cs.nch[1], cs.nch[2], cs.base[0], cs.base[1], cs.base[2]);
+
+    // Resolve this event's RSE before anything writes it.
+    {
+        const auto rse = event_rse(ensemble, m_runNo, m_subRunNo, m_eventNo);
+        m_evt_runNo = rse.run; m_evt_subRunNo = rse.subrun; m_evt_eventNo = rse.event;
+    }
+
+    // Open ROOT file
+    const std::string outname = event_filename(m_output_filename, ensemble.ident());
+    // The per-event name may point into a directory (evt_subdir "pr_evt%1%/"); create it
+    // here rather than require the runner to (PR 535 review).
+    Persist::assuredir(outname);
+    TFile* output_tf = TFile::Open(outname.c_str(), "RECREATE");
+    if (!output_tf || output_tf->IsZombie()) {
+        log->error("SbndPrMagnifyTrackingVisitor: cannot open {}", outname);
+        return;
+    }
+
+    write_bad_channels(output_tf, grouping, cs);
+    write_trun(output_tf, grouping);
+    write_proj_data(output_tf, grouping, cs);
+    write_t_rec_data(output_tf, grouping, cs);
+    if (m_save_in_scope) {
+        write_cluster_summary(output_tf, grouping);
+    }
+    if (m_nu_provenance) {
+        write_nu_census(output_tf, grouping);
+    }
+    write_truth(output_tf, ensemble);
+    write_dlvtx(output_tf, grouping, ensemble);
+
+    // Empty T_proj tree kept for reader compatibility.
+    TTree* tree_proj = new TTree("T_proj", "T_proj");
+    tree_proj->SetDirectory(output_tf);
+    tree_proj->Fill();
+
+    output_tf->Write();
+    output_tf->Close();
+    delete output_tf;
+
+    log->debug("SbndPrMagnifyTrackingVisitor: wrote {}", outname);
+}
+
+namespace {
+    /// One truth table (a 2D double tensor, column names in its metadata
+    /// "columns") as a flat TTree: one entry per row, the event's run/subrun/
+    /// event, then one branch per column -- Int_t for the identifier columns,
+    /// Double_t for the rest.  Units are the table's (LArSoft: cm, ns, GeV).
+    void write_truth_table(TFile* output_tf, const char* tname, const WireCell::ITensor::pointer& ten,
+                           int runNo, int subRunNo, int eventNo, const Log::logptr_t& log)
+    {
+        const auto& md = ten->metadata();
+        const auto shape = ten->shape();
+        if (shape.size() != 2 || ten->element_type() != typeid(double)) {
+            log->warn("{}: truth table must be a 2D double tensor, skipping", tname);
+            return;
+        }
+        const size_t nrows = shape[0], ncols = shape[1];
+        std::vector<std::string> cols;
+        for (const auto& c : md["columns"]) cols.push_back(c.asString());
+        if (cols.size() != ncols) {
+            log->warn("{}: {} column names for {} columns, skipping", tname, cols.size(), ncols);
+            return;
+        }
+        static const std::set<std::string> int_cols = {
+            "nu_idx", "pdg", "ccnc", "mode", "int_type", "flavor",
+            "nu_row", "trackid", "parent_trackid", "mother_trackid", "process"};
+        TTree* tree = new TTree(tname, tname);
+        tree->SetDirectory(output_tf);
+        tree->Branch("runNo", &runNo, "runNo/I");
+        tree->Branch("subRunNo", &subRunNo, "subRunNo/I");
+        tree->Branch("eventNo", &eventNo, "eventNo/I");
+        std::vector<double> dval(ncols, 0);
+        std::vector<int> ival(ncols, 0);
+        for (size_t c = 0; c < ncols; ++c) {
+            if (int_cols.count(cols[c])) tree->Branch(cols[c].c_str(), &ival[c], (cols[c] + "/I").c_str());
+            else tree->Branch(cols[c].c_str(), &dval[c], (cols[c] + "/D").c_str());
+        }
+        const double* data = reinterpret_cast<const double*>(ten->data());
+        for (size_t r = 0; r < nrows; ++r) {
+            for (size_t c = 0; c < ncols; ++c) {
+                dval[c] = data[r * ncols + c];
+                ival[c] = static_cast<int>(std::lround(dval[c]));
+            }
+            tree->Fill();
+        }
+    }
+}
+
+void Root::SbndPrMagnifyTrackingVisitor::write_truth(TFile* output_tf, const Clus::Facade::Ensemble& ensemble) const
+{
+    const auto nu = ensemble.aux_tensor("truth_nu");
+    if (!nu) return;
+    write_truth_table(output_tf, "T_truth_nu", nu, m_evt_runNo, m_evt_subRunNo, m_evt_eventNo, log);
+    if (const auto pf = ensemble.aux_tensor("truth_pf")) {
+        write_truth_table(output_tf, "T_truth_pf", pf, m_evt_runNo, m_evt_subRunNo, m_evt_eventNo, log);
+    }
+    log->debug("SbndPrMagnifyTrackingVisitor: truth trees written");
+}
+
+// ai-helper issue 35: the DL-vertex network calls, exactly as recorded.
+//   T_dlvtx_call   one row per call: run/subrun/event, nu_index (candidate),
+//                  call_index, pass (0 production, 1 dual-chain OFF pass in snap
+//                  mode, 2 the OFF graph's own top-K call of the voxels/union
+//                  modes), status (0 ok, 1 the network threw: payload empty, 2
+//                  unexpected payload size), top_k, rerank, n_points,
+//                  n_vertex_rows, q_scale/q_offset, payload (this call's own raw
+//                  SCN return: [x,y,z] or [x,y,z,score]*K, cm), payload_from_off,
+//                  n_off_voxels (union mode: OFF voxels pooled after the record),
+//                  cloud_no_exclusion, the decision (trad_*, rerank_* = the call's
+//                  own pick before the dual-chain snap, accepted, dl_*,
+//                  dual_transferred, two_end_veto; *_row = index inside the cloud's
+//                  vertex block, -1 if none), the dual-chain hint vertex the
+//                  production call was given (hint_*), the candidate's final main
+//                  vertex (final_*), and on MC the truth: truth_* / truth_reco_*
+//                  = the max-edep interaction of truth_nu, raw and shifted into
+//                  the cloud's frame by the TrueFwd SCE map (truth_sce_applied
+//                  says whether an sce_field was configured; truth_valid needs
+//                  edep > 0), plus EVERY interaction of the event as vectors
+//                  (truth_n, truth_all_*: nu_idx, pdg, ccnc, E, edep, t, x/y/z raw
+//                  and reco) so the reader can pick the one that belongs to each
+//                  candidate.  cm, GeV.
+//   T_dlvtx_cloud  one row per network-input point: run/subrun/event, nu_index,
+//                  call_index, pass, ipoint, is_vertex (leading vertex block), x,y,z,q.
+// Re-running pyutil/python/SCN_Vertex.py on a call's cloud with its top_k must
+// reproduce its payload (status 0 rows).  With the dl_vtx_dump config key the
+// two trees are written for every event (empty when nothing was recorded);
+// without it only when a call was recorded.
+void Root::SbndPrMagnifyTrackingVisitor::write_dlvtx(TFile* output_tf, Clus::Facade::Grouping& grouping,
+                                                     const Clus::Facade::Ensemble& ensemble) const
+{
+    const auto fitters = collect_nu_fitters(grouping);
+    size_t ncalls = 0;
+    for (const auto& tf : fitters) if (tf) ncalls += tf->get_dlvtx_calls().size();
+    if (!ncalls && !m_dl_vtx_dump) return;
+
+    // MC truth: every interaction of truth_nu, and the one that deposits most.
+    bool has_truth = false; int truth_sce_applied = m_sce ? 1 : 0;
+    double tx = 0, ty = 0, tz = 0, trx = 0, try_ = 0, trz = 0;
+    int truth_n = 0;
+    std::vector<int> t_nu_idx, t_pdg, t_ccnc;
+    std::vector<double> t_E, t_edep, t_t, t_x, t_y, t_z, t_rx, t_ry, t_rz;
+    if (const auto nu = ensemble.aux_tensor("truth_nu")) {
+        const auto md = nu->metadata();
+        const auto shape = nu->shape();
+        std::map<std::string, size_t> col;
+        for (Json::ArrayIndex i = 0; i < md["columns"].size(); ++i) col[md["columns"][i].asString()] = i;
+        if (shape.size() == 2 && shape[0] > 0 && nu->element_type() == typeid(double)
+            && col.count("vtx_x") && col.count("vtx_y") && col.count("vtx_z") && col.count("edep")) {
+            const double* d = reinterpret_cast<const double*>(nu->data());
+            const size_t nc = shape[1];
+            auto get = [&](size_t r, const char* name, double dflt) { return col.count(name) ? d[r * nc + col[name]] : dflt; };
+            auto shift = [&](double x, double y, double z, double& rx, double& ry, double& rz) {
+                rx = x; ry = y; rz = z;
+                if (!m_sce) return;
+                // TrueFwd map: reco = true + displacement (internal units).  SBND:
+                // apa 0 = east (x < 0), apa 1 = west, the labeler's convention.
+                const double X = x * units::cm, Y = y * units::cm, Z = z * units::cm;
+                const int apa = X < 0 ? 0 : 1;
+                rx = (X + m_sce->displacement_x(apa, X, Y, Z)) / units::cm;
+                ry = (Y + m_sce->displacement_y(apa, X, Y, Z)) / units::cm;
+                rz = (Z + m_sce->displacement_z(apa, X, Y, Z)) / units::cm;
+            };
+            size_t best = 0;
+            for (size_t r = 0; r < shape[0]; ++r) {
+                if (get(r, "edep", 0) > get(best, "edep", 0)) best = r;
+                double rx, ry, rz; shift(get(r, "vtx_x", 0), get(r, "vtx_y", 0), get(r, "vtx_z", 0), rx, ry, rz);
+                t_nu_idx.push_back(static_cast<int>(get(r, "nu_idx", -1))); t_pdg.push_back(static_cast<int>(get(r, "pdg", 0)));
+                t_ccnc.push_back(static_cast<int>(get(r, "ccnc", -1))); t_E.push_back(get(r, "E", 0)); t_edep.push_back(get(r, "edep", 0));
+                t_t.push_back(get(r, "t", 0));
+                t_x.push_back(get(r, "vtx_x", 0)); t_y.push_back(get(r, "vtx_y", 0)); t_z.push_back(get(r, "vtx_z", 0));
+                t_rx.push_back(rx); t_ry.push_back(ry); t_rz.push_back(rz);
+            }
+            truth_n = static_cast<int>(shape[0]);
+            tx = t_x[best]; ty = t_y[best]; tz = t_z[best]; trx = t_rx[best]; try_ = t_ry[best]; trz = t_rz[best];
+            has_truth = t_edep[best] > 0;   // a max-edep interaction that deposited nothing is no label
+        }
+    }
+
+    int runNo = m_evt_runNo, subRunNo = m_evt_subRunNo, eventNo = m_evt_eventNo;
+    int nu_index = 0, call_index = 0, pass = 0, status = 0, top_k = 0, rerank = 0, n_points = 0, n_vertex_rows = 0;
+    int payload_from_off = 0, n_off_voxels = 0, cloud_no_exclusion = 0, trad_valid = 0, trad_row = -1;
+    int rerank_valid = 0, rerank_row = -1, accepted = 0, dl_row = -1, dual_transferred = 0, two_end_veto = 0, final_valid = 0, truth_valid = 0;
+    int hint_valid = 0; double hint_x = 0, hint_y = 0, hint_z = 0;
+    double q_scale = 0, q_offset = 0, trad_x = 0, trad_y = 0, trad_z = 0, rerank_x = 0, rerank_y = 0, rerank_z = 0, dl_x = 0, dl_y = 0, dl_z = 0;
+    double final_x = 0, final_y = 0, final_z = 0;
+    double truth_x = 0, truth_y = 0, truth_z = 0, truth_reco_x = 0, truth_reco_y = 0, truth_reco_z = 0;
+    std::vector<float> payload;
+    TTree* tc = new TTree("T_dlvtx_call", "T_dlvtx_call");
+    tc->SetDirectory(output_tf);
+    tc->Branch("runNo", &runNo, "runNo/I");
+    tc->Branch("subRunNo", &subRunNo, "subRunNo/I");
+    tc->Branch("eventNo", &eventNo, "eventNo/I");
+    tc->Branch("nu_index", &nu_index, "nu_index/I");
+    tc->Branch("call_index", &call_index, "call_index/I");
+    tc->Branch("pass", &pass, "pass/I");
+    tc->Branch("status", &status, "status/I");
+    tc->Branch("top_k", &top_k, "top_k/I");
+    tc->Branch("rerank", &rerank, "rerank/I");
+    tc->Branch("n_points", &n_points, "n_points/I");
+    tc->Branch("n_vertex_rows", &n_vertex_rows, "n_vertex_rows/I");
+    tc->Branch("q_scale", &q_scale, "q_scale/D");
+    tc->Branch("q_offset", &q_offset, "q_offset/D");
+    tc->Branch("payload", &payload);
+    tc->Branch("payload_from_off", &payload_from_off, "payload_from_off/I");
+    tc->Branch("n_off_voxels", &n_off_voxels, "n_off_voxels/I");
+    tc->Branch("cloud_no_exclusion", &cloud_no_exclusion, "cloud_no_exclusion/I");
+    tc->Branch("trad_valid", &trad_valid, "trad_valid/I");
+    tc->Branch("trad_x", &trad_x, "trad_x/D");
+    tc->Branch("trad_y", &trad_y, "trad_y/D");
+    tc->Branch("trad_z", &trad_z, "trad_z/D");
+    tc->Branch("trad_row", &trad_row, "trad_row/I");
+    tc->Branch("rerank_valid", &rerank_valid, "rerank_valid/I");
+    tc->Branch("rerank_x", &rerank_x, "rerank_x/D");
+    tc->Branch("rerank_y", &rerank_y, "rerank_y/D");
+    tc->Branch("rerank_z", &rerank_z, "rerank_z/D");
+    tc->Branch("rerank_row", &rerank_row, "rerank_row/I");
+    tc->Branch("accepted", &accepted, "accepted/I");
+    tc->Branch("dl_x", &dl_x, "dl_x/D");
+    tc->Branch("dl_y", &dl_y, "dl_y/D");
+    tc->Branch("dl_z", &dl_z, "dl_z/D");
+    tc->Branch("dl_row", &dl_row, "dl_row/I");
+    tc->Branch("dual_transferred", &dual_transferred, "dual_transferred/I");
+    tc->Branch("two_end_veto", &two_end_veto, "two_end_veto/I");
+    tc->Branch("hint_valid", &hint_valid, "hint_valid/I");
+    tc->Branch("hint_x", &hint_x, "hint_x/D");
+    tc->Branch("hint_y", &hint_y, "hint_y/D");
+    tc->Branch("hint_z", &hint_z, "hint_z/D");
+    tc->Branch("final_valid", &final_valid, "final_valid/I");
+    tc->Branch("final_x", &final_x, "final_x/D");
+    tc->Branch("final_y", &final_y, "final_y/D");
+    tc->Branch("final_z", &final_z, "final_z/D");
+    tc->Branch("truth_valid", &truth_valid, "truth_valid/I");
+    tc->Branch("truth_sce_applied", &truth_sce_applied, "truth_sce_applied/I");
+    tc->Branch("truth_x", &truth_x, "truth_x/D");
+    tc->Branch("truth_y", &truth_y, "truth_y/D");
+    tc->Branch("truth_z", &truth_z, "truth_z/D");
+    tc->Branch("truth_reco_x", &truth_reco_x, "truth_reco_x/D");
+    tc->Branch("truth_reco_y", &truth_reco_y, "truth_reco_y/D");
+    tc->Branch("truth_reco_z", &truth_reco_z, "truth_reco_z/D");
+    tc->Branch("truth_n", &truth_n, "truth_n/I");
+    tc->Branch("truth_all_nu_idx", &t_nu_idx);
+    tc->Branch("truth_all_pdg", &t_pdg);
+    tc->Branch("truth_all_ccnc", &t_ccnc);
+    tc->Branch("truth_all_E", &t_E);
+    tc->Branch("truth_all_edep", &t_edep);
+    tc->Branch("truth_all_t", &t_t);
+    tc->Branch("truth_all_x", &t_x);
+    tc->Branch("truth_all_y", &t_y);
+    tc->Branch("truth_all_z", &t_z);
+    tc->Branch("truth_all_reco_x", &t_rx);
+    tc->Branch("truth_all_reco_y", &t_ry);
+    tc->Branch("truth_all_reco_z", &t_rz);
+
+    int ipoint = 0, is_vertex = 0;
+    float px = 0, py = 0, pz = 0, pq = 0;
+    TTree* tp = new TTree("T_dlvtx_cloud", "T_dlvtx_cloud");
+    tp->SetDirectory(output_tf);
+    tp->Branch("runNo", &runNo, "runNo/I");
+    tp->Branch("subRunNo", &subRunNo, "subRunNo/I");
+    tp->Branch("eventNo", &eventNo, "eventNo/I");
+    tp->Branch("nu_index", &nu_index, "nu_index/I");
+    tp->Branch("call_index", &call_index, "call_index/I");
+    tp->Branch("pass", &pass, "pass/I");
+    tp->Branch("ipoint", &ipoint, "ipoint/I");
+    tp->Branch("is_vertex", &is_vertex, "is_vertex/I");
+    tp->Branch("x", &px, "x/F");
+    tp->Branch("y", &py, "y/F");
+    tp->Branch("z", &pz, "z/F");
+    tp->Branch("q", &pq, "q/F");
+
+    for (size_t ni = 0; ni < fitters.size(); ++ni) {
+        const auto& tf = fitters[ni];
+        if (!tf) continue;
+        nu_index = static_cast<int>(ni);
+        final_valid = 0; final_x = final_y = final_z = 0;
+        if (const auto mv = tf->get_main_vertex()) {
+            const auto pt = mv->fit().valid() ? mv->fit().point : mv->wcpt().point;
+            final_valid = 1;
+            final_x = pt.x() / units::cm; final_y = pt.y() / units::cm; final_z = pt.z() / units::cm;
+        }
+        const auto& calls = tf->get_dlvtx_calls();
+        for (size_t ci = 0; ci < calls.size(); ++ci) {
+            const auto& c = calls[ci];
+            call_index = static_cast<int>(ci);
+            pass = c.pass == "off" ? 1 : c.pass == "off-voxels" ? 2 : 0;
+            status = c.status;
+            top_k = c.top_k; rerank = c.rerank ? 1 : 0;
+            n_points = static_cast<int>(c.x.size()); n_vertex_rows = c.n_vertex_rows;
+            q_scale = c.q_scale; q_offset = c.q_offset;
+            payload = c.payload; payload_from_off = c.payload_from_off ? 1 : 0; n_off_voxels = c.n_off_voxels;
+            cloud_no_exclusion = c.cloud_no_exclusion ? 1 : 0;
+            hint_valid = c.hint_valid ? 1 : 0; hint_x = c.hint_x; hint_y = c.hint_y; hint_z = c.hint_z;
+            trad_valid = c.trad_valid ? 1 : 0; trad_x = c.trad_x; trad_y = c.trad_y; trad_z = c.trad_z; trad_row = c.trad_row;
+            rerank_valid = c.rerank_valid ? 1 : 0; rerank_x = c.rerank_x; rerank_y = c.rerank_y; rerank_z = c.rerank_z; rerank_row = c.rerank_row;
+            accepted = c.accepted ? 1 : 0; dl_x = c.dl_x; dl_y = c.dl_y; dl_z = c.dl_z; dl_row = c.dl_row;
+            dual_transferred = c.dual_transferred ? 1 : 0; two_end_veto = c.two_end_veto ? 1 : 0;
+            truth_valid = has_truth ? 1 : 0;
+            truth_x = tx; truth_y = ty; truth_z = tz;
+            truth_reco_x = trx; truth_reco_y = try_; truth_reco_z = trz;
+            tc->Fill();
+            for (size_t i = 0; i < c.x.size(); ++i) {
+                ipoint = static_cast<int>(i);
+                is_vertex = static_cast<int>(i) < c.n_vertex_rows ? 1 : 0;
+                px = c.x[i]; py = c.y[i]; pz = c.z[i]; pq = c.q[i];
+                tp->Fill();
+            }
+        }
+    }
+    log->debug("SbndPrMagnifyTrackingVisitor: T_dlvtx_call {} rows, T_dlvtx_cloud {} rows", tc->GetEntries(), tp->GetEntries());
+}
+
+void Root::SbndPrMagnifyTrackingVisitor::write_bad_channels(TFile* output_tf, Clus::Facade::Grouping& grouping,
+                                                            const ChanScheme& cs) const
+{
+    TTree* tree = new TTree("T_bad_ch", "T_bad_ch");
+    tree->SetDirectory(output_tf);
+
+    int chid = 0;
+    int plane = 0;
+    int start_time = 0;
+    int end_time = 0;
+    int runNo = m_evt_runNo;
+    int subRunNo = m_evt_subRunNo;
+    int eventNo = m_evt_eventNo;
+
+    tree->Branch("chid", &chid, "chid/I");
+    tree->Branch("plane", &plane, "plane/I");
+    tree->Branch("start_time", &start_time, "start_time/I");
+    tree->Branch("end_time", &end_time, "end_time/I");
+    tree->Branch("runNo", &runNo, "runNo/I");
+    tree->Branch("subRunNo", &subRunNo, "subRunNo/I");
+    tree->Branch("eventNo", &eventNo, "eventNo/I");
+
+    auto wpids = grouping.wpids();
+    std::set<std::pair<int, int>> apa_face_set;
+    for (const auto& wpid : wpids) {
+        apa_face_set.insert({wpid.apa(), wpid.face()});
+    }
+
+    for (const auto& [apa, face] : apa_face_set) {
+        for (int pind = 0; pind < 3; ++pind) {
+            try {
+                auto dead_chs = grouping.get_all_dead_chs(apa, face, pind);
+                plane = pind;
+                for (const auto& [ch, time_range] : dead_chs) {
+                    chid = cs.global(pind, apa, ch);
+                    // get_all_dead_chs converts an x range to ticks, so a dead
+                    // region with an unbounded x extent comes back as +-1e9.
+                    // The channel is dead for the whole readout either way, and
+                    // an unclamped range makes the Magnify projection pads
+                    // unreadable.
+                    start_time = std::max(0, std::min(m_nticks, time_range.first));
+                    end_time = std::max(0, std::min(m_nticks, time_range.second));
+                    if (end_time <= start_time) { start_time = 0; end_time = m_nticks; }
+                    tree->Fill();
+                }
+            }
+            catch (const std::exception& e) {
+                log->warn("SbndPrMagnifyTrackingVisitor: failed to get dead channels for APA={}, face={}, plane={}: {}",
+                          apa, face, pind, e.what());
+            }
+        }
+    }
+
+    log->debug("SbndPrMagnifyTrackingVisitor: wrote {} entries to T_bad_ch", tree->GetEntries());
+}
+
+void Root::SbndPrMagnifyTrackingVisitor::write_trun(TFile* output_tf, Clus::Facade::Grouping& grouping) const
+{
+    TTree* tree = new TTree("Trun", "Trun");
+    tree->SetDirectory(output_tf);
+
+    int eventNo = m_evt_eventNo;
+    int runNo = m_evt_runNo;
+    int subRunNo = m_evt_subRunNo;
+    double dQdx_scale = m_dQdx_scale;
+    double dQdx_offset = m_dQdx_offset;
+
+    tree->Branch("eventNo", &eventNo, "eventNo/I");
+    tree->Branch("runNo", &runNo, "runNo/I");
+    tree->Branch("subRunNo", &subRunNo, "subRunNo/I");
+    tree->Branch("dQdx_scale", &dQdx_scale, "dQdx_scale/D");
+    tree->Branch("dQdx_offset", &dQdx_offset, "dQdx_offset/D");
+
+    // sbnd_xin/docs/109 group 1: the selection census's event counters and
+    // the selection's own window / flash pairing, read from the census so no
+    // second copy of TaggerCheckNeutrino's configuration exists.  nu_census_filled
+    // = 0 means TaggerCheckNeutrino published no census on this event.
+    const auto census = grouping.get_nu_census();
+    int nu_census_filled = census ? 1 : 0;
+    int nu_beam_gate = census ? census->beam_gate : -1;
+    int nu_per_bundle = census ? census->per_bundle : -1;
+    double beam_window_low_us = census ? census->beam_window_low_us : 0;
+    double beam_window_high_us = census ? census->beam_window_high_us : 0;
+    double flash_pair_dt_us = census ? census->flash_pair_dt_us : 0;
+    int nu_n_main = census ? census->n_main : -1;
+    int nu_n_in_window_main = census ? census->n_in_window_main : -1;
+    int nu_n_in_window_demoted = census ? census->n_in_window_demoted : -1;
+    int nu_n_in_window_nogid = census ? census->n_in_window_nogid : -1;
+    int nu_n_bundles = census ? census->n_bundles : -1;
+    int nu_n_candidates = census ? census->n_candidates : -1;
+    int nu_n_flashes = census ? static_cast<int>(census->flashes.size()) : -1;
+    int nu_n_flashes_in_window = -1;
+    if (census) {
+        nu_n_flashes_in_window = 0;
+        for (const auto& f : census->flashes) nu_n_flashes_in_window += f.in_window;
+    }
+    if (m_nu_provenance) {
+        tree->Branch("nu_census_filled", &nu_census_filled, "nu_census_filled/I");
+        tree->Branch("nu_beam_gate", &nu_beam_gate, "nu_beam_gate/I");
+        tree->Branch("nu_per_bundle", &nu_per_bundle, "nu_per_bundle/I");
+        tree->Branch("beam_window_low_us", &beam_window_low_us, "beam_window_low_us/D");
+        tree->Branch("beam_window_high_us", &beam_window_high_us, "beam_window_high_us/D");
+        tree->Branch("flash_pair_dt_us", &flash_pair_dt_us, "flash_pair_dt_us/D");
+        tree->Branch("nu_n_main", &nu_n_main, "nu_n_main/I");
+        tree->Branch("nu_n_in_window_main", &nu_n_in_window_main, "nu_n_in_window_main/I");
+        tree->Branch("nu_n_in_window_demoted", &nu_n_in_window_demoted, "nu_n_in_window_demoted/I");
+        tree->Branch("nu_n_in_window_nogid", &nu_n_in_window_nogid, "nu_n_in_window_nogid/I");
+        tree->Branch("nu_n_bundles", &nu_n_bundles, "nu_n_bundles/I");
+        tree->Branch("nu_n_candidates", &nu_n_candidates, "nu_n_candidates/I");
+        tree->Branch("nu_n_flashes", &nu_n_flashes, "nu_n_flashes/I");
+        tree->Branch("nu_n_flashes_in_window", &nu_n_flashes_in_window, "nu_n_flashes_in_window/I");
+    }
+
+    // sbnd_xin/docs/109 group 4: self-describing file.  wct_version is the
+    // library's own build string; every other value is passed in through the
+    // configuration (the jsonnet that also configures the BDT scorers, and the
+    // runner's operating-point hash / git revisions).  One std::string branch
+    // per key, in sorted key order; none at all when the map is empty.
+    std::string wct_version = WIRECELL_VERSION;
+    std::vector<std::string> prov_keys, prov_vals;
+    for (const auto& kv : m_provenance) {
+        std::string key = kv.first;
+        for (auto& ch : key) {
+            if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_') ch = '_';
+        }
+        if (key == "wct_version" || tree->GetBranch(key.c_str())) {
+            log->warn("SbndPrMagnifyTrackingVisitor: provenance key '{}' collides with an existing Trun branch; skipped", kv.first);
+            continue;
+        }
+        prov_keys.push_back(key);
+        prov_vals.push_back(kv.second);
+    }
+    if (!m_provenance.empty()) {
+        tree->Branch("wct_version", &wct_version);
+        for (size_t i = 0; i < prov_keys.size(); ++i) {
+            tree->Branch(prov_keys[i].c_str(), &prov_vals[i]);
+        }
+    }
+
+    tree->Fill();
+
+    log->debug("SbndPrMagnifyTrackingVisitor: wrote Trun with dQdx_scale={}, dQdx_offset={}", dQdx_scale, dQdx_offset);
+}
+
+// doc 87: T_cluster -- one row per live cluster, carrying (a) the IN-SCOPE flag
+// and (b) the per-bundle summary that nusel_extract.py otherwise reconstructs
+// from mabc-pr.zip plus the pctree.  Written on EVERY event (unlike T_tagger /
+// T_kine, which UbooneTaggerOutputVisitor writes only when a neutrino candidate
+// is evaluated), so an arm run with the Bee zip and the pctree suppressed still
+// yields a complete nusel table.
+//
+// in_scope is the SAME predicate the Bee clustering layer is gated on --
+// Cluster::get_scope_filter(default_scope), stamped by switch_scope
+// (clustering_switch_scope.cxx:125) and consulted by every tagger's
+// require_in_scope.  MultiAlgBlobClustering.cxx:2906-2923 gates the Bee layer on
+// literally this call, so the set recorded here is the Bee set by construction.
+void Root::SbndPrMagnifyTrackingVisitor::write_cluster_summary(TFile* output_tf,
+                                                               Clus::Facade::Grouping& grouping) const
+{
+    namespace Facade = WireCell::Clus::Facade;
+
+    TTree* tree = new TTree("T_cluster", "T_cluster");
+    tree->SetDirectory(output_tf);
+
+    int cluster_id = 0, in_scope = 0, is_main = 0, is_associated = 0;
+    int tgm = 0, stm = 0, fc = 0, lm = 0, beam_flash = 0;
+    int flash_id = -1, npoints = 0;
+    double flash_time_us = 0, flash_pe = 0, length_cm = 0, cluster_t0_us = 0;
+
+    tree->Branch("cluster_id", &cluster_id, "cluster_id/I");
+    tree->Branch("in_scope", &in_scope, "in_scope/I");
+    tree->Branch("is_main", &is_main, "is_main/I");
+    tree->Branch("is_associated", &is_associated, "is_associated/I");
+    tree->Branch("tgm", &tgm, "tgm/I");
+    tree->Branch("stm", &stm, "stm/I");
+    tree->Branch("fc", &fc, "fc/I");
+    tree->Branch("lm", &lm, "lm/I");
+    tree->Branch("beam_flash", &beam_flash, "beam_flash/I");
+    tree->Branch("flash_id", &flash_id, "flash_id/I");
+    tree->Branch("flash_time_us", &flash_time_us, "flash_time_us/D");
+    tree->Branch("flash_pe", &flash_pe, "flash_pe/D");
+    tree->Branch("npoints", &npoints, "npoints/I");
+    tree->Branch("length_cm", &length_cm, "length_cm/D");
+    tree->Branch("cluster_t0_us", &cluster_t0_us, "cluster_t0_us/D");
+
+    // sbnd_xin/docs/109 group 2: the matched flash's gid and physical TPC.
+    int matched_flash_gid = -1, flash_tpc = -1;
+    std::map<int, int> gid_tpc;   // opflash "apa" column = the flash's drift side
+    const auto census = grouping.get_nu_census();
+    if (m_fix_cluster_flags) {
+        tree->Branch("matched_flash_gid", &matched_flash_gid, "matched_flash_gid/I");
+        tree->Branch("flash_tpc", &flash_tpc, "flash_tpc/I");
+        if (grouping.has_pc("opflash") && grouping.has_pcarray("gid", "opflash")
+            && grouping.has_pcarray("apa", "opflash")) {
+            const auto ogid = grouping.get_pcarray<int>("gid", "opflash");
+            const auto oapa = grouping.get_pcarray<int>("apa", "opflash");
+            for (size_t i = 0; i < ogid.size() && i < oapa.size(); ++i) {
+                gid_tpc.emplace(ogid[i], oapa[i]);
+            }
+        }
+    }
+
+    // Determinism: children() order is not guaranteed stable, so emit by
+    // ascending cluster id (CLAUDE.md -- never iterate pointer-keyed order).
+    std::vector<const Facade::Cluster*> clusters;
+    for (const auto* cl : grouping.children()) {
+        if (cl) clusters.push_back(cl);
+    }
+    std::sort(clusters.begin(), clusters.end(),
+              [](const Facade::Cluster* a, const Facade::Cluster* b) {
+                  return a->get_cluster_id() < b->get_cluster_id();
+              });
+
+    int n_in = 0;
+    for (const auto* cl : clusters) {
+        cluster_id = cl->get_cluster_id();
+        in_scope = cl->get_scope_filter(cl->get_default_scope()) ? 1 : 0;
+        n_in += in_scope;
+
+        is_main = cl->get_flag(Facade::Flags::main_cluster);
+        is_associated = cl->get_flag(Facade::Flags::associated_cluster);
+        if (m_fix_cluster_flags) {
+            // sbnd_xin/docs/109: the flags SBND's taggers actually set
+            // (TaggerCheckTGM/STM/FC set Flags::TGM/STM/FC), the lm_flag
+            // scalar Q/L matching sets (-1 = never set), and beam_flash with
+            // TaggerCheckNeutrino's own in-window test, in internal units.
+            tgm = cl->get_flag(Facade::Flags::TGM);
+            stm = cl->get_flag(Facade::Flags::STM);
+            fc = cl->get_flag(Facade::Flags::FC);
+            lm = cl->get_scalar<int>("lm_flag", -1);
+            matched_flash_gid = cl->get_scalar<int>("matched_flash_gid", -1);
+            auto git = gid_tpc.find(matched_flash_gid);
+            flash_tpc = git == gid_tpc.end() ? -1 : git->second;
+            if (census && census->beam_gate) {
+                const double t0 = cl->get_cluster_t0();
+                beam_flash = (matched_flash_gid >= 0 && t0 >= census->beam_window_low
+                              && t0 < census->beam_window_high) ? 1 : 0;
+            }
+            else {
+                beam_flash = -1;
+            }
+        }
+        else {
+            tgm = cl->get_flag(Facade::Flags::tgm);
+            stm = cl->get_flag(Facade::Flags::short_track_muon);
+            fc = cl->get_flag(Facade::Flags::fully_contained);
+            lm = cl->get_flag(Facade::Flags::light_mismatch);
+            beam_flash = cl->get_flag(Facade::Flags::beam_flash);
+        }
+
+        npoints = cl->npoints();
+        length_cm = cl->get_length() / units::cm;
+        cluster_t0_us = cl->get_cluster_t0() / units::us;
+
+        // doc 99.  Legacy (knob off) = get_flash(), the per-input "flash" row
+        // index, which the multi-input merge invalidates for every cluster not
+        // matched on the primary input -- 49.4% of SBND production rows name
+        // the wrong real flash.  Knob on = get_matched_flash(), resolving the
+        // globally-unique matched_flash_gid against the merge-safe "opflash" PC
+        // (measured 100% correct).  The self-contained check on this tree is
+        // flash_time_us == cluster_t0_us for every row with flash_id >= 0.
+        // NB flash_id then carries the GID, not the per-input row id.
+        const auto flash = m_flash_by_gid ? cl->get_matched_flash() : cl->get_flash();
+        if (flash) {
+            flash_id = flash.ident();
+            flash_time_us = flash.time() / units::us;
+            flash_pe = flash.value();
+        }
+        else {
+            flash_id = -1;
+            flash_time_us = 0;
+            flash_pe = 0;
+        }
+        tree->Fill();
+    }
+
+    log->debug("pr87 in_scope: wrote T_cluster with {} clusters, {} in scope",
+               clusters.size(), n_in);
+}
+
+// sbnd_xin/docs/109 group 1: TaggerCheckNeutrino's selection census as two
+// trees.  Both are written on every event (empty when no census was
+// published), so the schema does not depend on the event.
+//   T_bundle  one row per in-beam-window flash bundle the selection examined,
+//             with the reason it did (0, 1) or did not (2-5) yield a
+//             candidate; nu_index joins to T_tagger/T_kine.
+//   T_flash   one row per optical flash in the event (all inputs), with its
+//             physical TPC, whether it is in the beam window, its flash group
+//             and how many clusters matched it.
+void Root::SbndPrMagnifyTrackingVisitor::write_nu_census(TFile* output_tf,
+                                                         Clus::Facade::Grouping& grouping) const
+{
+    using Census = WireCell::Clus::PR::NuBundleCensus;
+    const auto census = grouping.get_nu_census();
+    int run = m_evt_runNo, subrun = m_evt_subRunNo, event = m_evt_eventNo;
+
+    Census::Bundle b;
+    TTree* tb = new TTree("T_bundle", "T_bundle");
+    tb->SetDirectory(output_tf);
+    tb->Branch("run", &run, "run/I");
+    tb->Branch("subrun", &subrun, "subrun/I");
+    tb->Branch("event", &event, "event/I");
+    tb->Branch("gid", &b.gid, "gid/I");
+    tb->Branch("flash_tpc", &b.flash_tpc, "flash_tpc/I");
+    tb->Branch("flash_time_us", &b.flash_time_us, "flash_time_us/F");
+    tb->Branch("flash_pe", &b.flash_pe, "flash_pe/F");
+    tb->Branch("flash_group", &b.flash_group, "flash_group/I");
+    tb->Branch("n_main", &b.n_main, "n_main/I");
+    tb->Branch("n_demoted", &b.n_demoted, "n_demoted/I");
+    tb->Branch("n_companion", &b.n_companion, "n_companion/I");
+    tb->Branch("n_companion_dropped", &b.n_companion_dropped, "n_companion_dropped/I");
+    tb->Branch("n_rej_cosmic", &b.n_rej_cosmic, "n_rej_cosmic/I");
+    tb->Branch("n_rej_stm_only", &b.n_rej_stm_only, "n_rej_stm_only/I");
+    tb->Branch("n_rej_floor", &b.n_rej_floor, "n_rej_floor/I");
+    tb->Branch("reason", &b.reason, "reason/I");
+    tb->Branch("nu_index", &b.nu_index, "nu_index/I");
+    tb->Branch("sel_cluster_id", &b.sel_cluster_id, "sel_cluster_id/I");
+    tb->Branch("final_cluster_id", &b.final_cluster_id, "final_cluster_id/I");
+    tb->Branch("sel_length_cm", &b.sel_length_cm, "sel_length_cm/F");
+    if (census) {
+        for (const auto& row : census->bundles) {
+            b = row;   // copies into the object the branches point at
+            tb->Fill();
+        }
+    }
+
+    Census::Flash f;
+    TTree* tfl = new TTree("T_flash", "T_flash");
+    tfl->SetDirectory(output_tf);
+    tfl->Branch("run", &run, "run/I");
+    tfl->Branch("subrun", &subrun, "subrun/I");
+    tfl->Branch("event", &event, "event/I");
+    tfl->Branch("gid", &f.gid, "gid/I");
+    tfl->Branch("tpc", &f.tpc, "tpc/I");
+    tfl->Branch("time_us", &f.time_us, "time_us/F");
+    tfl->Branch("pe", &f.pe, "pe/F");
+    tfl->Branch("in_window", &f.in_window, "in_window/I");
+    tfl->Branch("flash_group", &f.flash_group, "flash_group/I");
+    tfl->Branch("n_matched_clusters", &f.n_matched_clusters, "n_matched_clusters/I");
+    tfl->Branch("n_matched_main", &f.n_matched_main, "n_matched_main/I");
+    tfl->Branch("nu_index", &f.nu_index, "nu_index/I");
+    if (census) {
+        for (const auto& row : census->flashes) {
+            f = row;
+            tfl->Fill();
+        }
+    }
+
+    log->debug("SbndPrMagnifyTrackingVisitor: wrote T_bundle ({} rows) and T_flash ({} rows){}",
+               tb->GetEntries(), tfl->GetEntries(), census ? "" : " -- no census published");
+}
+
+// sbnd_xin/docs/109 rev 3: T_proj_data with the schema but no clusters.  The
+// tree is one row of vector-of-vector branches per event, so "no projection
+// this event" is that row with every vector empty -- not a missing tree.  1675
+// of the 3067 sbnd_xin events used to omit it (no candidate, or an empty
+// fitted_charge_2d), which is why a reader's tree count varied 7 vs 8 from one
+// event to the next.  Same idiom as the empty T_proj kept in visit().
+static void write_empty_proj_data(TFile* output_tf)
+{
+    std::vector<int> v_cluster_id;
+    std::vector<std::vector<int>> v_channel, v_time_slice;
+    std::vector<std::vector<double>> v_charge, v_charge_err, v_charge_pred;
+    TTree* tree = new TTree("T_proj_data", "T_proj_data");
+    tree->SetDirectory(output_tf);
+    tree->Branch("cluster_id", &v_cluster_id);
+    tree->Branch("channel", &v_channel);
+    tree->Branch("time_slice", &v_time_slice);
+    tree->Branch("charge", &v_charge);
+    tree->Branch("charge_err", &v_charge_err);
+    tree->Branch("charge_pred", &v_charge_pred);
+    tree->Fill();
+}
+
+void Root::SbndPrMagnifyTrackingVisitor::write_proj_data(TFile* output_tf, Clus::Facade::Grouping& grouping,
+                                                         const ChanScheme& cs) const
+{
+    // doc pr/94 Phase 4b: accumulate over every per-bundle candidate.  T_proj_data
+    // is ONE row of vector-of-vector branches keyed by cluster_id, so the merge
+    // has to happen in these maps BEFORE the single Fill() -- calling this
+    // function per candidate would instead leave ROOT cycles T_proj_data;1, ;2,
+    // ... that uproot silently resolves to the last of.
+    auto nu_fitters = collect_nu_fitters(grouping);
+    if (!nu_fitters.front()) {
+        log->warn("SbndPrMagnifyTrackingVisitor: no TrackFitting in grouping");
+        if (m_rec_charge_provenance) write_empty_proj_data(output_tf);
+        return;
+    }
+    // Empty only if EVERY candidate is empty: bailing on candidate 0 alone
+    // would drop the whole tree and with it a later candidate's projection.
+    // One element when the knob is off, so this is the legacy test verbatim.
+    bool any_fitted = false;
+    for (const auto& t : nu_fitters) {
+        // doc pr/109 §8: the rows come from the per-cluster snapshots now, so
+        // either store being non-empty means there is something to write.
+        if (t && (!t->get_fitted_charge_2d().empty() || !t->get_cluster_fitted_charge_2d().empty())) {
+            any_fitted = true;
+            break;
+        }
+    }
+    if (!any_fitted) {
+        log->warn("SbndPrMagnifyTrackingVisitor: fitted_charge_2d is empty");
+        if (m_rec_charge_provenance) write_empty_proj_data(output_tf);
+        return;
+    }
+
+    // Get ticks-per-slice map for time_slice conversion
+    auto nticks_map = grouping.get_nticks_per_slice();
+
+    // Reorganize fitted charge data by cluster_id.
+    // doc pr/109 §8: accumulate into an ORDERED per-cell map, not straight into
+    // the vectors.  A cluster's snapshot is keyed by (wire, TICK) and
+    // prepare_data's dead-region filler writes one entry per tick
+    // (TrackFitting.cxx:896), so a slice of nticks_per_slice ticks yields that
+    // many entries which all divide down to the same time_slice.  Emitting them
+    // raw would put duplicate (channel, time_slice) keys in one row and break
+    // the tree's one-row-per-2-D-cell contract (§0 structural precondition).
+    // Charge adds (the filler split the blob charge across those ticks), errors
+    // add in quadrature, predictions add -- all three are identities for a live
+    // cell, which occurs exactly once per slice.
+    // Live entries and dead-region fillers are kept apart: a slice can hold a
+    // real readout at one tick and fillers at the others (prepare_data inserts
+    // a filler only where no key exists, TrackFitting.cxx:904), and adding the
+    // filler's spread charge onto a measured cell would inflate the measured
+    // charge the tree reports.  Fillers are used only when the slice has no
+    // live entry at all -- which is the case that carries the dead-blob charge.
+    struct Cell {
+        double live_charge{0}, live_err2{0};
+        double dead_charge{0}, dead_err2{0};
+        double pred{0};
+        int nlive{0};
+        double charge() const { return nlive ? live_charge : dead_charge; }
+        double charge_err() const { return std::sqrt(nlive ? live_err2 : dead_err2); }
+    };
+    std::map<int, std::map<std::pair<int, int>, Cell>> cluster_cells;
+
+    // doc pr/109 §8: emit one row per FITTED cluster, from that cluster's own
+    // snapshot -- the prototype's semantics (wire-cell-prod-nue-port.cxx:3272,
+    // one row straight out of each cluster's proj_data_*_map).  The old code
+    // read the MERGED map (get_fitted_charge_2d(), last-writer-wins across
+    // clusters) and tagged each cell by BLOB OWNERSHIP (fc.clusters), so a row
+    // labelled with cluster A could carry cluster B's prediction -- and near
+    // the vertex, where satellite clusters (higher ident, hence later in the
+    // merge) hold the main cluster's cells in their padded bounding box and
+    // predict 0 there, it usually did.  Measured on SBND 46363 before the fix:
+    // main cluster ident 19 kept 44% of its own predicted charge; uBooNE
+    // 5384-6528 kept 0%.
+    using CellMap = std::map<std::pair<int, int>, Cell>;
+
+    // Within ONE snapshot the tick entries of a slice are added up (above).
+    auto accumulate = [&](CellMap& local, int apa, int face, int plane_idx,
+                          const Clus::TrackFitting::WireTime& wt,
+                          const Clus::TrackFitting::FittedCharge2D& fc) {
+        // Per-(apa,face) ticks-per-slice with a safe default (the uBooNE
+        // original's .at() lookup would throw on an unmapped pair).
+        int nticks_per_slice = 1;
+        auto ait = nticks_map.find(apa);
+        if (ait != nticks_map.end()) {
+            auto fit_ = ait->second.find(face);
+            if (fit_ != ait->second.end()) nticks_per_slice = fit_->second;
+        }
+        auto& cell = local[{cs.global(plane_idx, apa, wt.first), wt.second / nticks_per_slice}];
+        if (fc.flag != 0) {
+            cell.live_charge += fc.charge;
+            cell.live_err2 += fc.charge_err * fc.charge_err;
+            ++cell.nlive;
+        }
+        else {
+            cell.dead_charge += fc.charge;
+            cell.dead_err2 += fc.charge_err * fc.charge_err;
+        }
+        cell.pred += fc.pred_charge;
+    };
+
+    // ACROSS snapshots that land in the same row (two live clusters sharing an
+    // ident, or two candidates), charge and charge_err are properties of the
+    // READOUT and must be taken once, not summed -- only the predictions add.
+    auto flush = [&](int cid, const CellMap& local) {
+        auto& dst = cluster_cells[cid];
+        for (const auto& [key, cell] : local) {
+            auto it = dst.find(key);
+            if (it == dst.end()) dst.emplace(key, cell);
+            else it->second.pred += cell.pred;   // readout fields taken once
+        }
+    };
+
+    for (const auto& tf : nu_fitters) {
+        if (!tf) continue;
+        const auto& per_cluster = tf->get_cluster_fitted_charge_2d();
+        if (!per_cluster.empty()) {
+            for (const auto& snap : per_cluster) {
+                CellMap local;
+                for (const auto& [afp, wt_map] : snap.cells)
+                    for (const auto& [wt, fc] : wt_map)
+                        accumulate(local, std::get<0>(afp), std::get<1>(afp), std::get<2>(afp), wt, fc);
+                flush(snap.ident, local);
+            }
+            continue;
+        }
+        // Fallback: a fitter that never ran with a cluster filter has no
+        // snapshots (e.g. the "stm" holder fed by merge_fitted_charge_2d).
+        // Emit the merged map under its blob-ownership tags rather than
+        // dropping the tree.
+        std::map<int, CellMap> fallback;
+        for (const auto& [afp, wt_map] : tf->get_fitted_charge_2d())
+            for (const auto& [wt, fc] : wt_map)
+                for (auto* cl : fc.clusters)
+                    accumulate(fallback[cl->get_cluster_id()],
+                               std::get<0>(afp), std::get<1>(afp), std::get<2>(afp), wt, fc);
+        for (const auto& [cid, local] : fallback) flush(cid, local);
+    }  // per-candidate
+
+    // Build vectors in cluster_id order
+    std::vector<int> v_cluster_id;
+    std::vector<std::vector<int>> v_channel;
+    std::vector<std::vector<int>> v_time_slice;
+    std::vector<std::vector<int>> v_charge;
+    std::vector<std::vector<int>> v_charge_err;
+    std::vector<std::vector<int>> v_charge_pred;
+
+    for (const auto& [cid, cells] : cluster_cells) {
+        v_cluster_id.push_back(cid);
+        std::vector<int> ch, ts, q, qe, qp;
+        ch.reserve(cells.size()); ts.reserve(cells.size()); q.reserve(cells.size());
+        qe.reserve(cells.size()); qp.reserve(cells.size());
+        for (const auto& [key, cell] : cells) {           // std::map -> ordered
+            ch.push_back(key.first);
+            ts.push_back(key.second);
+            q.push_back(static_cast<int>(cell.charge()));
+            qe.push_back(static_cast<int>(cell.charge_err()));
+            qp.push_back(static_cast<int>(cell.pred));
+        }
+        v_channel.push_back(std::move(ch));
+        v_time_slice.push_back(std::move(ts));
+        v_charge.push_back(std::move(q));
+        v_charge_err.push_back(std::move(qe));
+        v_charge_pred.push_back(std::move(qp));
+    }
+
+    TTree* tree = new TTree("T_proj_data", "T_proj_data");
+    tree->SetDirectory(output_tf);
+    tree->Branch("cluster_id", &v_cluster_id);
+    tree->Branch("channel", &v_channel);
+    tree->Branch("time_slice", &v_time_slice);
+    tree->Branch("charge", &v_charge);
+    tree->Branch("charge_err", &v_charge_err);
+    tree->Branch("charge_pred", &v_charge_pred);
+    tree->Fill();
+
+    log->debug("SbndPrMagnifyTrackingVisitor: wrote T_proj_data with {} clusters from {} candidate(s)",
+               v_cluster_id.size(), nu_fitters.size());
+}
+
+// sbnd_xin/docs/109 rev 3: T_rec_charge with its branches and zero rows, for
+// the events whose write_t_rec_data() bails before creating the tree (no
+// TrackFitting, or a TrackFitting with no Graph -- 1632 of the 3067 sbnd_xin
+// events, all of them events with no neutrino candidate).  A zero-row
+// T_rec_charge is already a shape the file takes today (an event whose only
+// candidate produced no fit points writes one), so this only makes the tree
+// unconditional.  The branch list MUST track the canonical one in
+// write_t_rec_data below; it is duplicated rather than factored out so the
+// knob-off path there stays byte-for-byte what it was.
+static void write_empty_rec_charge(TFile* output_tf)
+{
+    WireCell::Root::WCPointTree pt;
+    int nu_index = 0, point_cluster_id = -1;
+    TTree* t = new TTree("T_rec_charge", "T_rec_charge");
+    t->SetDirectory(output_tf);
+    t->Branch("x", &pt.reco_x, "x/D");
+    t->Branch("y", &pt.reco_y, "y/D");
+    t->Branch("z", &pt.reco_z, "z/D");
+    t->Branch("q", &pt.reco_dQ, "q/D");
+    t->Branch("nq", &pt.reco_dx, "nq/D");
+    t->Branch("chi2", &pt.reco_chi2, "chi2/D");
+    t->Branch("ndf", &pt.reco_ndf, "ndf/D");
+    t->Branch("pu", &pt.reco_pu, "pu/D");
+    t->Branch("pv", &pt.reco_pv, "pv/D");
+    t->Branch("pw", &pt.reco_pw, "pw/D");
+    t->Branch("pt", &pt.reco_pt, "pt/D");
+    t->Branch("reduced_chi2", &pt.reco_reduced_chi2, "reduced_chi2/D");
+    t->Branch("flag_vertex", &pt.reco_flag_vertex, "flag_vertex/I");
+    t->Branch("flag_shower", &pt.reco_flag_track_shower, "flag_shower/I");
+    t->Branch("rr", &pt.reco_rr, "rr/D");
+    t->Branch("cluster_id", &pt.reco_mother_cluster_id, "cluster_id/I");
+    t->Branch("real_cluster_id", &pt.reco_proto_cluster_id, "real_cluster_id/I");
+    t->Branch("sub_cluster_id", &pt.reco_proto_cluster_id, "sub_cluster_id/I");
+    t->Branch("particle_id", &pt.reco_particle_id, "particle_id/I");
+    t->Branch("nu_index", &nu_index, "nu_index/I");
+    t->Branch("point_cluster_id", &point_cluster_id, "point_cluster_id/I");
+    // No Fill(): the tree is written with its schema and zero entries.
+}
+
+void Root::SbndPrMagnifyTrackingVisitor::write_t_rec_data(TFile* output_tf, Clus::Facade::Grouping& grouping,
+                                                          const ChanScheme& cs) const
+{
+    using namespace WireCell::Clus;
+
+    // doc pr/94 Phase 4b: T_rec_charge covers EVERY per-bundle candidate, not
+    // just the one in the unnamed slot.  The tree is already multi-row and
+    // already joins back through cluster_id, so this needs no schema change --
+    // the rows simply continue across candidates.  The loop is INSIDE this
+    // function on purpose: calling the function per candidate would call
+    // `new TTree("T_rec_charge")` per candidate and leave ROOT cycles
+    // T_rec_charge;1, ;2, ... which uproot and every gate here silently
+    // resolve to the last of, hiding the duplication (same hazard as
+    // UbooneTaggerOutputVisitor's Write() without kOverwrite).
+    auto nu_fitters = collect_nu_fitters(grouping);
+    auto tf = nu_fitters.front();
+    if (!tf) {
+        log->warn("SbndPrMagnifyTrackingVisitor: no TrackFitting in grouping");
+        if (m_rec_charge_provenance) write_empty_rec_charge(output_tf);   // sbnd_xin/docs/109 rev 3
+        return;
+    }
+
+    auto graph = tf->get_graph();
+    if (!graph) {
+        log->warn("SbndPrMagnifyTrackingVisitor: no Graph in TrackFitting");
+        if (m_rec_charge_provenance) write_empty_rec_charge(output_tf);   // sbnd_xin/docs/109 rev 3
+        return;
+    }
+
+    // Per-(apa,face) ticks-per-slice with a safe default; resolved per point
+    // from PR::Fit::paf below (the uBooNE original picks the single first
+    // entry, correct only for one APA).
+    auto nticks_map = grouping.get_nticks_per_slice();
+    auto nticks_for = [&nticks_map](const std::pair<int, int>& paf) -> int {
+        auto ait = nticks_map.find(paf.first);
+        if (ait != nticks_map.end()) {
+            auto fit_ = ait->second.find(paf.second);
+            if (fit_ != ait->second.end()) return fit_->second;
+        }
+        return 1;
+    };
+
+    // Per-point channel/tick projection from the fit's own (apa,face); a fit
+    // with no recorded paf (-1,-1) falls back to APA 0.
+    // PR::Fit pu/pv/pw are FRACTIONAL wire coordinates (double) -- keep the
+    // fraction, do not truncate through ChanScheme::global (int wire), or the
+    // drawn track sits a systematic half-channel below the measured charge in
+    // every view (evt 172230 seg 5030: median -0.5 ch, rms 0.27 = floor() of a
+    // uniform fraction).  Same convention as UbooneMagnifyTrackingVisitor,
+    // which writes fit.pu + kPlaneChOffset keeping the fraction.
+    // The (apa,face) fallback has to be used for the TICK divisor too: an
+    // unrecorded paf (-1,-1) misses nticks_map, nticks_for returns 1, and the
+    // point lands at its raw tick instead of its time slice -- a factor
+    // nticks_per_slice (4 on SBND) off the charge it was fitted to, while the
+    // channel silently falls back to APA 0.  Counted below; 0 occurrences on
+    // evt 172230/444187, so this is a guard, not a change of what is written.
+    int n_paf_fallback = 0;
+    WCPointTree point_tree;
+    // sbnd_xin/docs/109 rev 3.  Function-scope so the lambda below can set them
+    // and the Branch() addresses stay valid for every Fill().
+    //   nu_index         -- which T_tagger/T_kine row these points belong to.
+    //   point_cluster_id -- the row's OWN cluster, as opposed to the candidate's
+    //                       main cluster in cluster_id.  It is what `ndf` has
+    //                       been carrying (see the reco_ndf writes below);
+    //                       `ndf` is left exactly as it is because
+    //                       wire-cell-sbnd-magnify-tracking-convert blocks
+    //                       tracks on std::round(ndf).
+    int rec_nu_index = 0;
+    int rec_point_cluster_id = -1;
+    auto project_fit = [&](const PR::Fit& fit) {
+        const bool have_paf = fit.paf.first >= 0;
+        if (!have_paf) ++n_paf_fallback;
+        const std::pair<int, int> paf = have_paf ? fit.paf : std::make_pair(0, 0);
+        const int apa = paf.first;
+        point_tree.reco_pu = cs.base[0] + apa * cs.nch[0] + fit.pu;
+        point_tree.reco_pv = cs.base[1] + apa * cs.nch[1] + fit.pv;
+        point_tree.reco_pw = cs.base[2] + apa * cs.nch[2] + fit.pw;
+        point_tree.reco_pt = fit.pt / nticks_for(paf);
+    };
+
+    // Create TTree with branches
+    TTree* t_rec_charge = new TTree("T_rec_charge", "T_rec_charge");
+    t_rec_charge->SetDirectory(output_tf);
+    t_rec_charge->Branch("x", &point_tree.reco_x, "x/D");
+    t_rec_charge->Branch("y", &point_tree.reco_y, "y/D");
+    t_rec_charge->Branch("z", &point_tree.reco_z, "z/D");
+    t_rec_charge->Branch("q", &point_tree.reco_dQ, "q/D");
+    t_rec_charge->Branch("nq", &point_tree.reco_dx, "nq/D");
+    t_rec_charge->Branch("chi2", &point_tree.reco_chi2, "chi2/D");
+    t_rec_charge->Branch("ndf", &point_tree.reco_ndf, "ndf/D");
+    t_rec_charge->Branch("pu", &point_tree.reco_pu, "pu/D");
+    t_rec_charge->Branch("pv", &point_tree.reco_pv, "pv/D");
+    t_rec_charge->Branch("pw", &point_tree.reco_pw, "pw/D");
+    t_rec_charge->Branch("pt", &point_tree.reco_pt, "pt/D");
+    t_rec_charge->Branch("reduced_chi2", &point_tree.reco_reduced_chi2, "reduced_chi2/D");
+    t_rec_charge->Branch("flag_vertex", &point_tree.reco_flag_vertex, "flag_vertex/I");
+    t_rec_charge->Branch("flag_shower", &point_tree.reco_flag_track_shower, "flag_shower/I");
+    t_rec_charge->Branch("rr", &point_tree.reco_rr, "rr/D");
+    t_rec_charge->Branch("cluster_id", &point_tree.reco_mother_cluster_id, "cluster_id/I");
+    // Keep compatibility with legacy format where real/sub cluster ids
+    // both carry the per-segment encoded proto id.
+    t_rec_charge->Branch("real_cluster_id", &point_tree.reco_proto_cluster_id, "real_cluster_id/I");
+    t_rec_charge->Branch("sub_cluster_id", &point_tree.reco_proto_cluster_id, "sub_cluster_id/I");
+    t_rec_charge->Branch("particle_id", &point_tree.reco_particle_id, "particle_id/I");
+    if (m_rec_charge_provenance) {   // sbnd_xin/docs/109 rev 3
+        t_rec_charge->Branch("nu_index", &rec_nu_index, "nu_index/I");
+        t_rec_charge->Branch("point_cluster_id", &rec_point_cluster_id, "point_cluster_id/I");
+    }
+
+    // Use calibration parameters from configuration
+    const double dQdx_scale = m_dQdx_scale;
+    const double dQdx_offset = m_dQdx_offset;
+    const bool flag_skip_vertex = m_flag_skip_vertex;
+
+    // Set default values
+    point_tree.reco_chi2 = 1;
+
+    using edge_desc = typename boost::graph_traits<PR::Graph>::edge_descriptor;
+    using vertex_desc = typename boost::graph_traits<PR::Graph>::vertex_descriptor;
+
+    // Which candidate each cluster id came from, so an id claimed by two
+    // candidates is reported rather than silently merged: cluster_id is the
+    // join key the convert app and the GUI use, and a collision would make one
+    // candidate's fit points appear inside the other's track block.  Activity
+    // ids are disjoint across bundles by construction (a cluster belongs to one
+    // flash bundle), so this is a guard, not an expected path.
+    std::map<int, size_t> cid_owner;
+
+    // One candidate's worth of rows.  Body is verbatim the pre-pr/94 code with
+    // `graph` rebound to this candidate's own graph.
+    auto fill_one = [&](const std::shared_ptr<PR::Graph>& graph, size_t cand) {
+    // Build per-cluster edge/vertex maps in a single pass (O(E+V) instead of O(C*(E+V)))
+    // Cluster-id ordered, NOT pointer ordered (CLAUDE.md determinism rule): these
+    // maps and the set below decide the order of the T_rec_charge rows, which is
+    // the order the convert app turns into track blocks and the GUI indexes as
+    // "cluster index".  With std::less<Cluster*> that index moved from run to run
+    // for the same cluster id (evt 172230 cluster 5 came out at block 1 in one run
+    // and block 5 in the next), even under `setarch -R`.  Row CONTENT is unchanged:
+    // the multiset of rows hashes the same before and after.
+    std::map<Facade::Cluster*, std::vector<edge_desc>, PR::ClusterPtrCmp> cluster_edges;
+    std::map<Facade::Cluster*, std::vector<vertex_desc>, PR::ClusterPtrCmp> cluster_vertices;
+
+    auto edge_range = boost::edges(*graph);
+    for (auto eit = edge_range.first; eit != edge_range.second; ++eit) {
+        auto seg = (*graph)[*eit].segment;
+        if (seg && seg->cluster()) {
+            cluster_edges[seg->cluster()].push_back(*eit);
+        }
+    }
+
+    auto vertex_range = boost::vertices(*graph);
+    for (auto vit = vertex_range.first; vit != vertex_range.second; ++vit) {
+        auto vtx = (*graph)[*vit].vertex;
+        if (vtx && vtx->cluster()) {
+            cluster_vertices[vtx->cluster()].push_back(*vit);
+        }
+    }
+
+    // Order the rows of each cluster by CONTENT, not by graph descriptor.  The PR
+    // graph's vertex descriptors are not reproducible run to run (evt 172230: the
+    // 87 vertex rows come out in a different order every run, even under
+    // `setarch -R`, while their multiset is identical), and that order is what the
+    // convert app turns into blocks and the GUI shows as "cluster index".
+    // Segments are keyed on their encoded proto id first so the id stays ascending.
+    auto point_key = [](const PR::Fit& f) {
+        return std::make_tuple(f.point.x(), f.point.y(), f.point.z());
+    };
+    for (auto& [cluster, vds] : cluster_vertices) {
+        (void)cluster;
+        std::sort(vds.begin(), vds.end(), [&](vertex_desc a, vertex_desc b) {
+            auto va = (*graph)[a].vertex, vb = (*graph)[b].vertex;
+            if (!va || !vb) return va < vb;
+            return point_key(va->fit()) < point_key(vb->fit());
+        });
+    }
+    for (auto& [cluster, eds] : cluster_edges) {
+        (void)cluster;
+        std::sort(eds.begin(), eds.end(), [&](edge_desc a, edge_desc b) {
+            auto sa = (*graph)[a].segment, sb = (*graph)[b].segment;
+            if (!sa || !sb) return sa < sb;
+            const auto ia = sa->get_graph_index(), ib = sb->get_graph_index();
+            if (ia != ib) return ia < ib;
+            if (sa->fits().empty() || sb->fits().empty()) return sa->fits().size() < sb->fits().size();
+            return point_key(sa->fits().front()) < point_key(sb->fits().front());
+        });
+    }
+
+    // Find the main cluster ID
+    int mother_cluster_id = -1;
+    rec_nu_index = static_cast<int>(cand);
+    // sbnd_xin/docs/109 rev 3: prefer the candidate's OWN main-cluster id --
+    // TaggerInfo::cluster_id, set from the main_cluster POINTER at
+    // TaggerCheckNeutrino.cxx `tagger_info.cluster_id = main_cluster->get_cluster_id()`,
+    // which is exactly what T_tagger/T_kine's cluster_id carries.  The flag scan
+    // below cannot reproduce it in two measured situations:
+    //   - the selected activity is a demoted main.  ClusteringUnmergeBundle
+    //     clears Flags::main_cluster on every split-off part and deliberately
+    //     never restores it, and TaggerCheckNeutrino's own restore guards have
+    //     destructed by the time this writer runs -- so no cluster in the
+    //     candidate's graph carries the flag and every row got cluster_id = -1
+    //     (T_bundle.reason 1; 57 of the 3067 sbnd_xin events).
+    //   - the overall-vertex search moved the main onto a companion
+    //     (vertex_moved_cluster = 1).  The flag stayed on the PRE-swap cluster,
+    //     so the rows got an id that is not the row's T_tagger cluster_id
+    //     (122 of 1460 candidate rows).
+    // Falling back to the scan keeps every other case, and an unset TaggerInfo
+    // (cluster_id defaults to -1) behaves exactly as before.
+    if (m_rec_charge_provenance && cand < nu_fitters.size() && nu_fitters[cand]) {
+        mother_cluster_id = nu_fitters[cand]->get_tagger_info().cluster_id;
+    }
+    if (mother_cluster_id < 0) {
+        for (const auto& [cluster, _] : cluster_edges) {
+            if (cluster && cluster->get_flag(Facade::Flags::main_cluster)) {
+                mother_cluster_id = cluster->get_cluster_id();
+                break;
+            }
+        }
+    }
+    if (mother_cluster_id < 0) {
+        for (const auto& [cluster, _] : cluster_vertices) {
+            if (cluster && cluster->get_flag(Facade::Flags::main_cluster)) {
+                mother_cluster_id = cluster->get_cluster_id();
+                break;
+            }
+        }
+    }
+
+    // Collect unique clusters
+    PR::ClusterPtrSet all_clusters;
+    for (const auto& [c, _] : cluster_edges) all_clusters.insert(c);
+    for (const auto& [c, _] : cluster_vertices) all_clusters.insert(c);
+
+    // Process each cluster
+    for (auto* cluster : all_clusters) {
+        if (!cluster) continue;
+
+        {
+            auto [it, fresh] = cid_owner.emplace(cluster->get_cluster_id(), cand);
+            if (!fresh && it->second != cand) {
+                log->warn("SbndPrMagnifyTrackingVisitor: cluster {} appears in both candidate {} and {}"
+                          " -- T_rec_charge rows for it are no longer separable by cluster_id",
+                          cluster->get_cluster_id(), it->second, cand);
+            }
+        }
+
+        point_tree.reco_mother_cluster_id = mother_cluster_id;
+
+        // Process vertices in this cluster
+        if (!flag_skip_vertex) {
+            for (auto vd : cluster_vertices[cluster]) {
+                auto vtx = (*graph)[vd].vertex;
+                if (!vtx) continue;
+
+                // Fill vertex information
+                point_tree.reco_cluster_id = cluster->get_cluster_id();
+                point_tree.reco_proto_cluster_id = -1;
+                point_tree.reco_particle_id = -1;
+                point_tree.reco_ndf = cluster->get_cluster_id();
+                rec_point_cluster_id = cluster->get_cluster_id();   // sbnd_xin/docs/109 rev 3
+                point_tree.reco_flag_vertex = 1;
+                point_tree.reco_flag_track_shower = 0;
+
+                // Position from fit
+                const auto& fit_pt = vtx->fit().point;
+                point_tree.reco_x = fit_pt.x() / units::cm;
+                point_tree.reco_y = fit_pt.y() / units::cm;
+                point_tree.reco_z = fit_pt.z() / units::cm;
+
+                // Charge and step size from fit
+                point_tree.reco_dQ = vtx->fit().dQ * dQdx_scale + dQdx_offset;
+                point_tree.reco_dx = vtx->fit().dx / units::cm;
+
+                // Projection coordinates (global channel IDs, per-point APA)
+                project_fit(vtx->fit());
+
+                point_tree.reco_reduced_chi2 = vtx->fit().reduced_chi2;
+                point_tree.reco_rr = -1; // no residual range for vertices
+
+                t_rec_charge->Fill();
+            }
+        }
+
+        // Process segments in this cluster
+        for (auto ed : cluster_edges[cluster]) {
+            auto seg = (*graph)[ed].segment;
+            if (!seg) continue;
+
+            const auto& fits = seg->fits();
+            const auto& wcpts = seg->wcpts();
+
+            if (fits.empty() || wcpts.empty()) continue;
+
+            point_tree.reco_cluster_id = cluster->get_cluster_id();   // cluster id ...
+            point_tree.reco_ndf = cluster->get_cluster_id();
+            rec_point_cluster_id = cluster->get_cluster_id();   // sbnd_xin/docs/109 rev 3
+            point_tree.reco_proto_cluster_id = seg->cluster()->get_cluster_id() * 1000 + static_cast<int>(seg->get_graph_index());
+            point_tree.reco_flag_vertex = 0;
+
+            // Determine track/shower flag
+            bool is_shower = seg->flags_any(PR::SegmentFlags::kShowerTrajectory) ||
+                           seg->flags_any(PR::SegmentFlags::kShowerTopology);
+            point_tree.reco_flag_track_shower = is_shower ? 1 : 0;
+
+            // Prefer per-segment particle hypothesis when available.
+            point_tree.reco_particle_id = seg->has_particle_info() ? seg->particle_info()->pdg()
+                                                                    : (is_shower ? 1 : 4);
+
+            // Calculate residual range vector
+            std::vector<double> rr_vec(fits.size(), 0);
+            {
+                std::vector<double> L(fits.size(), 0);
+                double acc_length = 0;
+
+                for (size_t i = 0; i + 1 < fits.size(); i++) {
+                    const auto& p1 = fits[i].point;
+                    const auto& p2 = fits[i+1].point;
+                    double step = std::sqrt(std::pow(p2.x() - p1.x(), 2) +
+                                          std::pow(p2.y() - p1.y(), 2) +
+                                          std::pow(p2.z() - p1.z(), 2));
+                    acc_length += step;
+                    L[i+1] = acc_length;
+                }
+
+                // Direction sign determines order
+                int dirsign = seg->dirsign();
+                if (dirsign == 1) { // forward direction
+                    for (size_t i = 0; i < fits.size(); i++) {
+                        rr_vec[fits.size() - 1 - i] = L.back() - L[fits.size() - 1 - i];
+                    }
+                } else if (dirsign == -1) { // reverse direction
+                    rr_vec = L;
+                } else { // unknown direction
+                    rr_vec = L;
+                }
+
+                // Find vertices connected to this segment
+                auto [start_vtx, end_vtx] = PR::find_vertices(*graph, seg);
+
+                // Check if vertices have multiple connections
+                if (start_vtx) {
+                    auto start_degree = boost::out_degree(start_vtx->get_descriptor(), *graph);
+                    if (start_degree > 1) rr_vec.front() = -1;
+                }
+                if (end_vtx) {
+                    auto end_degree = boost::out_degree(end_vtx->get_descriptor(), *graph);
+                    if (end_degree > 1) rr_vec.back() = -1;
+                }
+            }
+
+            // Fill tree for each point in the segment
+            for (size_t i = 0; i < fits.size(); i++) {
+                const auto& fit = fits[i];
+
+                point_tree.reco_x = fit.point.x() / units::cm;
+                point_tree.reco_y = fit.point.y() / units::cm;
+                point_tree.reco_z = fit.point.z() / units::cm;
+                point_tree.reco_dQ = fit.dQ * dQdx_scale + dQdx_offset;
+                point_tree.reco_dx = fit.dx / units::cm;
+                project_fit(fit);
+                point_tree.reco_reduced_chi2 = fit.reduced_chi2;
+                point_tree.reco_rr = rr_vec[i] / units::cm;
+
+                t_rec_charge->Fill();
+            }
+        }
+    }
+    };  // fill_one
+
+    fill_one(graph, 0);
+    for (size_t ci = 1; ci < nu_fitters.size(); ++ci) {
+        auto g = nu_fitters[ci] ? nu_fitters[ci]->get_graph() : nullptr;
+        if (!g) {
+            log->warn("SbndPrMagnifyTrackingVisitor: candidate {} has no Graph; no T_rec_charge rows for it", ci);
+            continue;
+        }
+        fill_one(g, ci);
+    }
+
+    log->debug("SbndPrMagnifyTrackingVisitor: wrote {} entries to T_rec_charge from {} candidate(s)"
+               " ({} with no recorded (apa,face))",
+               t_rec_charge->GetEntries(), nu_fitters.size(), n_paf_fallback);
+}
+
+// Local Variables:
+// mode: c++
+// c-basic-offset: 4
+// End:

@@ -64,6 +64,43 @@ namespace WireCell::Clus {
             std::vector<std::string> extra = {};
             std::vector<std::regex> extra_re = {};
 
+            /** Config: "wrapped_channel_charge".  Resolve a sampled point's
+                per-plane charge by channel IDENT against the slice activity
+                when the point's wire is a wrapped strip's continuation.
+
+                Gen::AnodePlane builds IWirePlane::channels() by skipping every
+                wire with segment() > 0 (AnodePlane.cxx:244-247), so a plane
+                does not list the channels of wrapped wires whose segment-0 half
+                lives in the sibling face.  The legacy lookup here is
+                `p_chi2i[ident]` -- unordered_map::operator[], which inserts 0 on
+                a miss -- so those points silently take channels[0]'s activity
+                (normally absent, hence charge 0 AND uncertainty 0, which
+                Cluster::calc_charge_wcp reads as "this plane saw nothing").
+
+                Affects only detectors with wrapped channels: PDVD 1568 wires
+                (11.3%), PDHD 6400 (28.8%).  SBND and uBooNE have none and
+                cannot move.
+
+                C++ DEFAULT TRUE since 2026-09-06 (doc pdhd/04 sec 9, owner
+                decision: "we need these fixes default on, since they are fixing
+                bugs").  This is a BUG FIX, not a tuning knob, so the default is
+                the fixed path and the legacy positional lookup survives only for
+                a config that asks for `false` explicitly.  Any config that never
+                mentions the key now gets the fix -- which is the point: the same
+                defect reached production twice through two different bindings of
+                this one call site (PDVD's clustering job, then PDHD's).
+
+                Byte-identity for the unwrapped detectors is STRUCTURAL, not a
+                gate result: SBND and uBooNE have zero segment>0 wires, so
+                p_chi2i.find() never misses and the resolved-by-ident branch is
+                unreachable.  Pinned by the "unwrapped detectors have no orphans
+                at all" doctest, which is now load-bearing for that claim.
+
+                See wcp-porting-img/pdvd/docs/nf_sp_img_clus/31_*.md and
+                wcp-porting-img/pdhd/docs/04_stm-tagger-scan.md sec 8-9.
+            */
+            bool wrapped_channel_charge{true};
+
         };
         CommonConfig m_cc;
 

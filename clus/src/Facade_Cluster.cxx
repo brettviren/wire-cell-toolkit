@@ -77,6 +77,10 @@ void Cluster::set_default_scope(const Tree::Scope& scope)
 
     m_default_scope = scope;
 
+    // The memoized default-scope view follows the scope.
+    m_sv3d_memo = nullptr;
+    m_sv3d_valid = nullptr;
+
     // Clear caches that depend on the scope
     clear_cache(); // Why is this here???  It does not do what the comment says.
                    // It clears all cache.  This side-effect is needed even if
@@ -222,7 +226,11 @@ std::vector<int> Cluster::add_corrected_points(
                                              blob->wpid().face(), blob->wpid().apa());
 
         // Persist only the arrays that actually changed (per the transform).
+        // erase first: on a tree reloaded from disk the corrected arrays may
+        // already exist (they persist through the tensor round trip) and
+        // add() throws on duplicates.
         for (const auto& name : store_names) {
+            lpc_3d.erase(name);
             lpc_3d.add(name, *corrected_points.get(name));
         }
 
@@ -825,7 +833,16 @@ std::pair<geo_point_t, double> Cluster::get_closest_point_along_vec(geo_point_t&
 }
 
 const Cluster::sv3d_t& Cluster::sv3d() const {
-    return sv(); //  m_node->value.scoped_view(m_default_scope);
+    // Memoized: see m_sv3d_memo in the header.  When the validity flag has
+    // dropped (node insert), scoped_view() re-syncs the same view object and
+    // restores the flag; node removal resets the memo via on_remove().
+    if (m_sv3d_memo && m_sv3d_valid && *m_sv3d_valid) {
+        return *m_sv3d_memo;
+    }
+    const auto& view = sv();  //  m_node->value.scoped_view(m_default_scope);
+    m_sv3d_memo = &view;
+    m_sv3d_valid = m_node->value.scoped_indices_valid(m_default_scope);
+    return view;
 }
 const Cluster::kd3d_t& Cluster::kd3d() const { return sv3d().kd(); }
 const Cluster::kd3d_t& Cluster::kd() const { return kd3d(); }
@@ -1251,7 +1268,7 @@ std::vector<const Blob*> Cluster::blobs_with_points(const kd_results_t& res) con
     return ret;
 }
 
-std::map<const Blob*, geo_point_t> Cluster::get_closest_blob(const geo_point_t& point, double radius) const
+Cluster::const_blob_point_map_t Cluster::get_closest_blob(const geo_point_t& point, double radius) const
 {
     struct Best {
         size_t point_index;
@@ -1273,14 +1290,14 @@ std::map<const Blob*, geo_point_t> Cluster::get_closest_blob(const geo_point_t& 
             it->second.metric = metric;
         }
     }
-    std::map<const Blob*, geo_point_t> ret;
+    const_blob_point_map_t ret;
     for (const auto& [mi, bb] : best_blob_point) {
         ret[blob_with_point(bb.point_index)] = point3d(bb.point_index);
     }
     return ret;
 }
 
-std::map<const Blob*, geo_point_t> Cluster::get_closest_blob(const geo_point_t& point, int N) const 
+Cluster::const_blob_point_map_t Cluster::get_closest_blob(const geo_point_t& point, int N) const
 {
     struct Best {
         size_t point_index;
@@ -1303,7 +1320,7 @@ std::map<const Blob*, geo_point_t> Cluster::get_closest_blob(const geo_point_t& 
         }
     }
 
-    std::map<const Blob*, geo_point_t> ret;
+    const_blob_point_map_t ret;
     for (const auto& [mi, bb] : best_blob_point) {
         ret[blob_with_point(bb.point_index)] = point3d(bb.point_index);
     }
@@ -1312,46 +1329,46 @@ std::map<const Blob*, geo_point_t> Cluster::get_closest_blob(const geo_point_t& 
 
 std::pair<geo_point_t, const Blob*> Cluster::get_closest_point_blob(const geo_point_t& point) const
 {
-    auto results = kd_knn(1, point);
-    if (results.size() == 0) {
+    // Hot path (Find_Closest_Points convergence loops): resolve the scoped
+    // view once and use the allocation-free single-NN query.
+    const auto& skd = kd3d();
+    size_t point_index = 0;
+    double metric = 0;
+    if (!skd.knn1(point, point_index, metric)) {
         return std::make_pair(geo_point_t(), nullptr);
     }
-
-    const auto& [point_index, _] = results[0];
-    return std::make_pair(point3d(point_index), blob_with_point(point_index));
+    return std::make_pair(skd.point3d(point_index), blob_with_point(point_index));
 }
 
 std::pair<size_t, geo_point_t> Cluster::get_closest_wcpoint(const geo_point_t& point) const
 {
-    auto results = kd_knn(1, point);
-    if (results.size() == 0) {
+    const auto& skd = kd3d();
+    size_t point_index = 0;
+    double metric = 0;
+    if (!skd.knn1(point, point_index, metric)) {
         return std::make_pair(-1, nullptr);
     }
-
-    const auto& [point_index, _] = results[0];
-    return std::make_pair(point_index, point3d(point_index));
+    return std::make_pair(point_index, skd.point3d(point_index));
 }
 
 size_t Cluster::get_closest_point_index(const geo_point_t& point) const
 {
-    auto results = kd_knn(1, point);
-    if (results.size() == 0) {
+    size_t point_index = 0;
+    double metric = 0;
+    if (!kd3d().knn1(point, point_index, metric)) {
         raise<ValueError>("no points in cluster");
     }
-
-    const auto& [point_index, _] = results[0];
     return point_index;
 }
 
 double Cluster::get_closest_dis(const geo_point_t& point) const
 {
-    auto results = kd_knn(1, point);
-    if (results.size() == 0) {
+    size_t point_index = 0;
+    double metric = 0;
+    if (!kd3d().knn1(point, point_index, metric)) {
         raise<ValueError>("no points in cluster");
     }
-
-    const auto& [_, dis] = results[0];
-    return sqrt(dis);
+    return sqrt(metric);
 }
 
 std::tuple<int, int, double> Cluster::get_closest_points(const Cluster& other) const{
@@ -1611,28 +1628,6 @@ std::pair<double, double> Cluster::hough_transform(const geo_point_t& origin, co
                                                    std::shared_ptr<const Simple3DPointCloud> s3dpc,
                                                    const std::vector<size_t>& global_indices) const
 {
-    std::vector<geo_point_t> pts;
-    std::vector<const Blob*> blobs;
-
-    if (s3dpc == nullptr) {
-        auto results = kd_radius(dis, origin);
-        if (results.size() == 0) {
-            return {0, 0};
-        }
-        blobs = blobs_with_points(results);
-        pts = kd_points(results);
-    } else {
-        if (s3dpc->get_num_points() != global_indices.size()) {
-            raise<ValueError>("global indices size mismatch");
-        }
-        auto results = s3dpc->kd().radius(dis * dis, origin);
-        for (const auto& [point_index, _] : results) {
-            pts.push_back(s3dpc->point(point_index));
-            size_t global_index = global_indices[point_index];
-            blobs.push_back(blob_with_point(global_index));
-        }
-    }
-
     constexpr double pi = 3.141592653589793;
 
     using direction_parameter_function_f = std::function<double(const Vector& dir)>;
@@ -1654,29 +1649,107 @@ std::pair<double, double> Cluster::hough_transform(const geo_point_t& origin, co
     const double max2 = +pi;
     direction_parameter_function_f phi_param = phi_angle;
 
-    auto hist = bh::make_histogram(bh::axis::regular<>(nbins1, min1, max1), bh::axis::regular<>(nbins2, min2, max2));
+    // The Hough histogram is nbins1*nbins2 (= 64 800) bins but SPARSE: only the few
+    // in-radius points are ever filled.  Building a dense grid cost a 64 800-double
+    // zero-fill on construction plus an O(64 800) std::max_element scan per call (the top
+    // clustering hotspot once the kd2d format cost was removed; see
+    // clustering-timing-profile.md §3).  Instead, accumulate the weights sparsely keyed
+    // by the inner-bin linear index and take the peak over only the touched bins.
+    //
+    // Bit-identical to the previous `boost::histogram + bh::indexed + std::max_element`:
+    //  - bin assignment uses the same `axis::regular::index()` boost uses internally;
+    //  - points landing in under/overflow are skipped, matching bh::indexed's default
+    //    coverage::inner (which the old max_element scanned over);
+    //  - weights accumulate in the same fill order, so per-bin sums are identical;
+    //  - the peak tie-break (max value, then first in iteration order) is reproduced as
+    //    "smallest linear index" with lin = i + j*nbins1, because bh::indexed advances the
+    //    first axis fastest (axis-0 innermost);
+    //  - an empty/all-zero grid yields bin (0,0), as max_element over all-equal bins does.
+    const bh::axis::regular<> ax1(nbins1, min1, max1);
+    const bh::axis::regular<> ax2(nbins2, min2, max2);
 
-    for (size_t ind = 0; ind < blobs.size(); ++ind) {
-        const auto* blob = blobs[ind];
+    // Sparse accumulation, but into a generation-stamped dense scratch grid
+    // instead of an unordered_map: a bin is "live" when its stamp matches the
+    // current call's generation, so there is no per-call zero-fill of the
+    // 64 800-bin grid and no per-fill hashing/allocation.  Per-bin sums see
+    // the same values added in the same order as the map version, and the
+    // peak criterion (max value, then smallest linear index) is a total
+    // order, so the result is bit-identical regardless of how touched bins
+    // are visited.
+    constexpr long ngrid = (long)180 * 360;  // nbins1 * nbins2
+    static thread_local std::vector<double> s_val;
+    static thread_local std::vector<uint32_t> s_gen;
+    static thread_local std::vector<long> s_touched;
+    static thread_local uint32_t s_cur = 0;
+    if (s_val.empty()) {
+        s_val.assign(ngrid, 0.0);
+        s_gen.assign(ngrid, 0u);
+    }
+    if (++s_cur == 0) {  // generation counter wrapped: reset all stamps
+        std::fill(s_gen.begin(), s_gen.end(), 0u);
+        s_cur = 1;
+    }
+    s_touched.clear();
+
+    // Identical per-point work and fill order to the previous version; the
+    // intermediate pts/blobs vectors are gone (iterate the kd results
+    // directly).
+    auto fill = [&](const Blob* blob, const geo_point_t& pt) {
         auto charge = blob->charge();
         // protection against the charge=0 case ...
         if (charge == 0) charge = 1;
-        if (charge <= 0) continue;
+        if (charge <= 0) return;
 
         const auto npoints = blob->npoints();
-        const auto& pt = pts[ind];
-
         const Vector dir = (pt - origin).norm();
 
         const double p1 = theta_param(dir);
         const double p2 = phi_param(dir);
-        hist(p1, p2, bh::weight(charge / npoints));
+        const int i = ax1.index(p1);
+        const int j = ax2.index(p2);
+        if (i < 0 || i >= nbins1 || j < 0 || j >= nbins2) return;  // inner bins only
+        const long lin = i + (long)j * nbins1;  // axis-0 fastest
+        if (s_gen[lin] != s_cur) {
+            s_gen[lin] = s_cur;
+            s_val[lin] = 0.0;
+            s_touched.push_back(lin);
+        }
+        s_val[lin] += charge / npoints;
+    };
+
+    if (s3dpc == nullptr) {
+        auto results = kd_radius(dis, origin);
+        if (results.size() == 0) {
+            return {0, 0};
+        }
+        const auto& points = this->points();
+        for (const auto& [point_index, _] : results) {
+            const geo_point_t pt(points[0][point_index], points[1][point_index],
+                                 points[2][point_index]);
+            fill(blob_with_point(point_index), pt);
+        }
+    } else {
+        if (s3dpc->get_num_points() != global_indices.size()) {
+            raise<ValueError>("global indices size mismatch");
+        }
+        auto results = s3dpc->kd().radius(dis * dis, origin);
+        for (const auto& [point_index, _] : results) {
+            fill(blob_with_point(global_indices[point_index]), s3dpc->point(point_index));
+        }
     }
 
-    auto indexed = bh::indexed(hist);
-    auto it = std::max_element(indexed.begin(), indexed.end());
-    const auto& cell = *it;
-    return {cell.bin(0).center(), cell.bin(1).center()};
+    long best_lin = 0;       // default bin (0,0) for the empty/all-zero case
+    double best_val = 0.0;
+    for (const long lin : s_touched) {
+        const double val = s_val[lin];
+        if (val > best_val || (val == best_val && lin < best_lin)) {
+            best_val = val;
+            best_lin = lin;
+        }
+    }
+    const int best_i = (int)(best_lin % nbins1);
+    const int best_j = (int)(best_lin / nbins1);
+    return {ax1.bin(best_i).center(), ax2.bin(best_j).center()};
 }
 
 geo_point_t Cluster::vhough_transform(const geo_point_t& origin, const double dis, HoughParamSpace param_space,
@@ -1955,6 +2028,27 @@ std::pair<geo_point_t, geo_point_t> Cluster::get_main_axis_points() const
         }
     }
 
+    if (!initialized && npoints() > 0) {
+        // Every point excluded is a legal state, not a programmer error:
+        // connect_graph.cxx marks should_exclude for any point >= 1 cm from
+        // its reference cluster and nothing guarantees a non-empty
+        // complement.  Fall back to the unfiltered extremes (real points of
+        // this cluster) instead of aborting the job -- the throw below now
+        // fires only for a truly point-less cluster.
+        SPDLOG_LOGGER_WARN(s_log, "get_main_axis_points: all {} points excluded; falling back to unfiltered extremes (cluster {})", npoints(), get_cluster_id());
+        for (int i = 0; i < npoints(); i++) {
+            geo_point_t current = point3d(i);
+            double value = current.dot(main_axis);
+            if (!initialized) {
+                highest_point = lowest_point = current;
+                high_value = low_value = value;
+                initialized = true;
+                continue;
+            }
+            if (value > high_value) { highest_point = current; high_value = value; }
+            if (value < low_value)  { lowest_point = current;  low_value = value; }
+        }
+    }
     if (!initialized) {
         throw std::runtime_error("No valid points available for get_main_axis_points");
     }
@@ -1993,7 +2087,26 @@ std::pair<geo_point_t,geo_point_t> Cluster::get_two_extreme_points() const
         if (current.z() < extreme_wcp[5].z()) extreme_wcp[5] = current;
     }
 
-     if (!initialized) {
+    if (!initialized && npoints() > 0) {
+        // Same all-points-excluded fallback (and reason) as
+        // get_main_axis_points above.
+        SPDLOG_LOGGER_WARN(s_log, "get_two_extreme_points: all {} points excluded; falling back to unfiltered extremes (cluster {})", npoints(), get_cluster_id());
+        for (int i = 0; i < npoints(); i++) {
+            geo_point_t current = point3d(i);
+            if (!initialized) {
+                for (int j = 0; j < 6; j++) extreme_wcp[j] = current;
+                initialized = true;
+                continue;
+            }
+            if (current.y() > extreme_wcp[0].y()) extreme_wcp[0] = current;
+            if (current.y() < extreme_wcp[1].y()) extreme_wcp[1] = current;
+            if (current.x() > extreme_wcp[2].x()) extreme_wcp[2] = current;
+            if (current.x() < extreme_wcp[3].x()) extreme_wcp[3] = current;
+            if (current.z() > extreme_wcp[4].z()) extreme_wcp[4] = current;
+            if (current.z() < extreme_wcp[5].z()) extreme_wcp[5] = current;
+        }
+    }
+    if (!initialized) {
         throw std::runtime_error("No valid points available for get_two_extreme_points");
     }
 
@@ -2233,7 +2346,7 @@ std::vector<geo_point_t> Cluster::indices_to_points(const std::vector<size_t>& p
 // }
 
 
-std::vector<geo_point_t> Cluster::get_hull() const 
+std::vector<geo_point_t> Cluster::get_hull(int max_points) const
 {
     auto& hull_points = cache().hull_points;
 
@@ -2241,8 +2354,11 @@ std::vector<geo_point_t> Cluster::get_hull() const
         return hull_points;
     }
 
-    if (npoints() > WireCell::Clus::Facade::Constants::MaxHullPoints) {
-        SPDLOG_LOGGER_WARN(s_log,"Cluster::get_hull number of points is too large: {} return cached points", npoints());
+    const int cap = (max_points < 0)
+                        ? (int)WireCell::Clus::Facade::Constants::MaxHullPoints
+                        : max_points;
+    if (npoints() > cap) {
+        SPDLOG_LOGGER_WARN(s_log,"Cluster::get_hull number of points is too large: {} (cap {}) return cached points", npoints(), cap);
         return hull_points;
     }
 
@@ -2620,56 +2736,31 @@ void Facade::sort_clusters(std::vector<Cluster*>& clusters)
 
 Facade::Cluster::Flash Facade::Cluster::get_flash() const
 {
-    Flash flash;                // starts invalid
-
+    // The flashlight-join walk lives in Grouping::flash_at() (shared with
+    // Grouping::flashes()); here we only resolve this cluster's matched flash
+    // index (the per-cluster "flash" scalar) and delegate.
     const auto* p = this->node()->parent;
-    if (!p)  return flash;
+    if (!p)  return Flash{};
     const auto* g = p->value.facade<Grouping>();
-    if (!g)  return flash;
+    if (!g)  return Flash{};
 
     const int flash_index = this->get_scalar("flash", -1);
+    return g->flash_at(flash_index);
+}
 
-    //std::cout << "Test3 " << flash_index << std::endl;
-    
-    if (flash_index < 0) {
-        return flash;
-    }
-    if (! g->has_pc("flash")) {
-        return flash;
-    }
-    flash.m_valid = true;
-        
-    // These are kind of inefficient as we get the "flash" PC each time.
-    flash.m_time = g->get_element<double>("flash", "time", flash_index, 0);
-    flash.m_value = g->get_element<double>("flash", "value", flash_index, 0);
-    flash.m_ident = g->get_element<int>("flash", "ident", flash_index, -1);
-    flash.m_type = g->get_element<int>("flash", "type", flash_index, -1);
 
-    // std::cout << "Test3: " << g->has_pc("flash") << " " << g->has_pc("light") << " " << g->has_pc("flashlight") << " " << flash_index << " " << flash.m_time << std::endl;
+Facade::Cluster::Flash Facade::Cluster::get_matched_flash() const
+{
+    // Same delegation shape as get_flash(), but keyed on the globally-unique
+    // "matched_flash_gid" QLMatching stamps alongside the per-input "flash" row
+    // index -- the one of the two that survives the multi-input merge.
+    const auto* p = this->node()->parent;
+    if (!p)  return Flash{};
+    const auto* g = p->value.facade<Grouping>();
+    if (!g)  return Flash{};
 
-    if (!(g->has_pc("light") && g->has_pc("flashlight"))) {
-        return flash;           // valid, but no vector info.
-    }
-    
-    // These are spans.  We walk the fl to look up in the l.
-    const auto fl_flash = g->get_pcarray<int>("flash", "flashlight");
-    const auto fl_light = g->get_pcarray<int>("light", "flashlight");
-    const auto l_times = g->get_pcarray<double>("time", "light");
-    const auto l_values = g->get_pcarray<double>("value", "light");
-    const auto l_errors = g->get_pcarray<double>("error", "light");
-
-    // std::cout << "Test3: " << fl_flash.size() << " " << fl_light.size() << std::endl;
-
-    const size_t nfl = fl_light.size();
-    for (size_t ifl = 0; ifl < nfl; ++ifl) {
-        if (fl_flash[ifl] != flash_index) continue;
-        const int light_index = fl_light[ifl];
-        
-        flash.m_times.push_back(l_times[light_index]);
-        flash.m_values.push_back(l_values[light_index]);
-        flash.m_errors.push_back(l_errors[light_index]);
-    }
-    return flash;
+    const int gid = this->get_scalar("matched_flash_gid", -1);
+    return g->flash_by_gid(gid);
 }
 
 
@@ -2745,8 +2836,46 @@ Facade::Cluster::graph_type& Facade::Cluster::find_graph(
     if (flavor == "relaxed") {
         return this->give_graph(flavor, make_graph_relaxed(*this, dv, pcts));
     }
+    if (flavor == "relaxed_fast") {
+        // doc 78 round 2: busy-cluster lazy-walk variant (make_graphs.h).
+        return this->give_graph(flavor, make_graph_relaxed_fast(*this, dv, pcts));
+    }
+    if (flavor == "ctpc_fast") {
+        // doc 79 round 2: busy-cluster lazy-walk variant of ctpc (make_graphs.h).
+        return this->give_graph(flavor, make_graph_ctpc_fast(*this, dv, pcts));
+    }
     if (flavor == "relaxed_pid") {
         return this->give_graph(flavor, make_graph_relaxed_pid(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict") {
+        return this->give_graph(flavor, make_graph_relaxed_strict(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d_wfloor") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_wfloor(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long2") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long2(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long_wtrack") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long_wtrack(*this, dv, pcts));
+    }
+    // doc clus/connect-graph-strict-perf round 2: same connector, busy-gated
+    // lazy walk (RelaxedFastCfg defaults).  Distinct name => a job that does
+    // not select it is byte-identical by construction.
+    if (flavor == "relaxed_strict_img_2d_rescue_long_wtrack_fast") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long_wtrack_fast(*this, dv, pcts));
     }
 
     // Do a hail mary, maybe user made a mistake by passing dv/pcts and really
@@ -2784,8 +2913,46 @@ Facade::Cluster::graph_type& Facade::Cluster::find_graph(
     if (flavor == "relaxed") {
         return this->give_graph(flavor, make_graph_relaxed(*this, dv, pcts));
     }
+    if (flavor == "relaxed_fast") {
+        // doc 78 round 2: busy-cluster lazy-walk variant (make_graphs.h).
+        return this->give_graph(flavor, make_graph_relaxed_fast(*this, dv, pcts));
+    }
+    if (flavor == "ctpc_fast") {
+        // doc 79 round 2: busy-cluster lazy-walk variant of ctpc (make_graphs.h).
+        return this->give_graph(flavor, make_graph_ctpc_fast(*this, dv, pcts));
+    }
     if (flavor == "relaxed_pid") {
         return this->give_graph(flavor, make_graph_relaxed_pid(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict") {
+        return this->give_graph(flavor, make_graph_relaxed_strict(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d_wfloor") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_wfloor(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long2") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long2(*this, dv, pcts));
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long_wtrack") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long_wtrack(*this, dv, pcts));
+    }
+    // doc clus/connect-graph-strict-perf round 2: same connector, busy-gated
+    // lazy walk (RelaxedFastCfg defaults).  Distinct name => a job that does
+    // not select it is byte-identical by construction.
+    if (flavor == "relaxed_strict_img_2d_rescue_long_wtrack_fast") {
+        return this->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long_wtrack_fast(*this, dv, pcts));
     }
 
     // Do a hail mary, maybe user made a mistake by passing dv/pcts and really
@@ -2890,8 +3057,70 @@ const GraphAlgorithms& Facade::Cluster::graph_algorithms(const std::string& flav
         return got.first->second;
     }
 
+    if (flavor == "relaxed_fast") {
+        // doc 78 round 2: busy-cluster lazy-walk variant (make_graphs.h).
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_fast(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+
+    if (flavor == "ctpc_fast") {
+        // doc 79 round 2: busy-cluster lazy-walk variant of ctpc (make_graphs.h).
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_ctpc_fast(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+
     if (flavor == "relaxed_pid") {
         auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_pid(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+
+    if (flavor == "relaxed_strict") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+
+    if (flavor == "relaxed_strict_img") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d_wfloor") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_wfloor(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long2") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long2(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long_wtrack") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long_wtrack(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    // doc clus/connect-graph-strict-perf round 2 (see above).
+    if (flavor == "relaxed_strict_img_2d_rescue_long_wtrack_fast") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long_wtrack_fast(*this, dv, pcts));
         auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
         return got.first->second;
     }
@@ -2931,8 +3160,70 @@ const GraphAlgorithms& Facade::Cluster::graph_algorithms(const std::string& flav
         return got.first->second;
     }
 
+    if (flavor == "relaxed_fast") {
+        // doc 78 round 2: busy-cluster lazy-walk variant (make_graphs.h).
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_fast(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+
+    if (flavor == "ctpc_fast") {
+        // doc 79 round 2: busy-cluster lazy-walk variant of ctpc (make_graphs.h).
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_ctpc_fast(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+
     if (flavor == "relaxed_pid") {
         auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_pid(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+
+    if (flavor == "relaxed_strict") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+
+    if (flavor == "relaxed_strict_img") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d_wfloor") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_wfloor(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long2") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long2(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    if (flavor == "relaxed_strict_img_2d_rescue_long_wtrack") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long_wtrack(*this, dv, pcts));
+        auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
+        return got.first->second;
+    }
+    // doc clus/connect-graph-strict-perf round 2 (see above).
+    if (flavor == "relaxed_strict_img_2d_rescue_long_wtrack_fast") {
+        auto& gr = const_cast<Cluster*>(this)->give_graph(flavor, make_graph_relaxed_strict_img_2d_rescue_long_wtrack_fast(*this, dv, pcts));
         auto got = m_galgs.emplace(flavor, GraphAlgorithms(gr));
         return got.first->second;
     }
@@ -3165,9 +3456,11 @@ std::vector<std::vector<geo_point_t>> Cluster::get_extreme_wcps(const Cluster* r
 }
 // Updated is_point_spatially_related_to_time_blobs to match prototype exactly
 bool Cluster::is_point_spatially_related_to_time_blobs(
-    size_t point_index, 
+    size_t point_index,
     const time_blob_map_t& ref_time_blob_map,
-    bool flag_nearby_timeslice
+    bool flag_nearby_timeslice,
+    int wire_tol,
+    int slice_stride
 ) const {
     
     // Get current point's time slice information
@@ -3212,23 +3505,31 @@ bool Cluster::is_point_spatially_related_to_time_blobs(
            
 
 
-            if (check_wire_ranges_match(point_index, ref_blob)) {
+            if (check_wire_ranges_match(point_index, ref_blob, wire_tol)) {
                 return true;  // Equivalent to flag_add = true; break;
             }
         }
     }
 
     if (flag_nearby_timeslice) {
-        // Check adjacent time slices (±1) if flag_nearby_timeslice is true
+        // Check adjacent time slices if flag_nearby_timeslice is true.
         // Equivalent to: if (old_time_mcells_map->find(time_slice-1)!=old_time_mcells_map->end())
         // and old_time_mcells_map->find(time_slice+1)!=old_time_mcells_map->end()
-        
-        for (int offset : {-1, 1}) {
+        //
+        // The prototype's map is keyed by SLICE NUMBER, so its +-1 is the
+        // neighbouring slice.  This map is keyed by blob->slice_index_min(),
+        // which is in TICKS (Facade_Blob.h "unit: tick"), and slice starts are
+        // one nticks-per-slice apart.  So slice_stride must be that tick span
+        // for this branch to resolve at all; the default of 1 reproduces the
+        // historical behaviour, in which it never does.  See doc pr/29 D12 and
+        // the caller in SteinerGrapher::filter_by_reference_cluster.
+        const int stride = slice_stride > 0 ? slice_stride : 1;
+        for (int offset : {-stride, stride}) {
             int adjacent_time_slice = current_time_slice + offset;
             auto time_it_adj = face_it->second.find(adjacent_time_slice);
             if (time_it_adj != face_it->second.end()) {
                 for (const Blob* ref_blob : time_it_adj->second) {
-                    if (check_wire_ranges_match(point_index, ref_blob)) {
+                    if (check_wire_ranges_match(point_index, ref_blob, wire_tol)) {
                         return true;  // Equivalent to flag_add = true; break;
                     }
                 }
@@ -3243,8 +3544,9 @@ bool Cluster::is_point_spatially_related_to_time_blobs(
     return false;  // Equivalent to flag_add remains false
 }
 
-// Updated check_wire_ranges_match to match prototype exactly  
-bool Cluster::check_wire_ranges_match(size_t point_index, const Blob* ref_blob) const
+// Updated check_wire_ranges_match to match prototype exactly
+bool Cluster::check_wire_ranges_match(size_t point_index, const Blob* ref_blob,
+                                      int wire_tol) const
 {
     try {
         // Get current point's wire indices (equivalent to cloud.pts[i].index_u, index_v, index_w)
@@ -3265,11 +3567,27 @@ bool Cluster::check_wire_ranges_match(size_t point_index, const Blob* ref_blob) 
         
 
 
-        // NO tolerance added - use exact wire ranges like prototype
-        // Removed: u_min = u_min - 1; u_max = u_max + 1; etc.
-        
+        // Apply the caller's slack.  wire_tol == 0 (the default, and what
+        // get_extreme_wcps wants) leaves the bounds untouched, so that path is
+        // bit-for-bit what it was before this parameter existed.
+        //
+        // THE CONVENTION TRAP, spelled out because it is invisible in a diff.
+        // Blob ranges here are half-open [min, max); the prototype's are
+        // inclusive [low, high] with high == max - 1.  The prototype's slack of
+        // one wire is
+        //     index <= high + 1   and   index >= low - 1
+        // which, substituting high = max - 1 and low = min, is
+        //     index <  max + 1    and   index >= min - 1
+        // i.e. the HIGH bound gains exactly wire_tol, the same as the low bound
+        // loses.  Writing `<= max + wire_tol` instead would be one wire too
+        // loose on the high side only -- an asymmetric band, and the mistake
+        // this comment exists to prevent.  See CLAUDE.md M7 and doc pr/29 D1.
+        u_min -= wire_tol;  u_max += wire_tol;
+        v_min -= wire_tol;  v_max += wire_tol;
+        w_min -= wire_tol;  w_max += wire_tol;
+
         // Check if current point's wire indices fall within ALL THREE ranges
-        // This is the exact prototype condition:
+        // This is the exact prototype condition (with wire_tol == 0):
         // if (cloud.pts[i].index_u <= u1_high_index && cloud.pts[i].index_u >= u1_low_index &&
         //     cloud.pts[i].index_v <= v1_high_index && cloud.pts[i].index_v >= v1_low_index &&
         //     cloud.pts[i].index_w <= w1_high_index && cloud.pts[i].index_w >= w1_low_index)
@@ -3278,7 +3596,7 @@ bool Cluster::check_wire_ranges_match(size_t point_index, const Blob* ref_blob) 
             current_wire_w >= w_min && current_wire_w < w_max) {
             return true;  // Equivalent to flag_add = true; break;
         }
-        
+
     } catch (...) {
         // If wire information is not available, continue
     }
@@ -3293,10 +3611,21 @@ std::pair<int, int> Cluster::get_two_boundary_steiner_graph_idx(const std::strin
     }
     auto& steiner_pc = get_pc(steiner_pc_name);
     const auto& coords = get_default_scope().coords;
-    const auto& x_coords = steiner_pc.get(coords.at(0))->elements<double>();
-    const auto& y_coords = steiner_pc.get(coords.at(1))->elements<double>();
-    const auto& z_coords = steiner_pc.get(coords.at(2))->elements<double>();
-    const auto& flag_terminal = steiner_pc.get("flag_steiner_terminal")->elements<int>();
+    // An EMPTY steiner point cloud carries no arrays at all (Dataset::get
+    // returns null) -- report it as the empty-cloud error below instead of
+    // dereferencing null (segfault seen on SBND MC evt 11, whose main cluster
+    // yields zero steiner points).
+    const auto xa = steiner_pc.get(coords.at(0));
+    const auto ya = steiner_pc.get(coords.at(1));
+    const auto za = steiner_pc.get(coords.at(2));
+    const auto fa = steiner_pc.get("flag_steiner_terminal");
+    if (!xa || !ya || !za || !fa) {
+        throw std::runtime_error("Empty Steiner point cloud");
+    }
+    const auto& x_coords = xa->elements<double>();
+    const auto& y_coords = ya->elements<double>();
+    const auto& z_coords = za->elements<double>();
+    const auto& flag_terminal = fa->elements<int>();
 
     const size_t npts = x_coords.size();
     if (npts == 0) {
@@ -3355,6 +3684,13 @@ std::pair<int, int> Cluster::get_two_boundary_steiner_graph_idx(const std::strin
 
 std::pair<geo_point_t, geo_point_t> Cluster::get_two_boundary_wcps(bool flag_cosmic) const 
 {
+    // Early exit for an EMPTY cluster (doc pdvd/25 M3): a retile can yield a
+    // cluster with no points (PDVD run 039252 evt 4, a protect_bundle
+    // fragment); point3d(0) on it threw std::out_of_range and aborted the
+    // job.  A defined, degenerate answer lets the caller decide.
+    if (npoints() == 0) {
+        return std::make_pair(geo_point_t(0, 0, 0), geo_point_t(0, 0, 0));
+    }
     // Early exit for single point
     if (npoints() <= 1) {
         geo_point_t single_point = point3d(0);
@@ -3399,14 +3735,26 @@ std::pair<geo_point_t, geo_point_t> Cluster::get_two_boundary_wcps(bool flag_cos
 
 
     
+    // Memoize the per-blob charge estimate: estimate_total_charge() is a pure
+    // function of the blob and the grouping's static CTPC data, but it walks
+    // every wire of the blob through hash lookups.  Recomputing it for every
+    // POINT of the blob dominated this function (doc 54 round 2).  Keyed
+    // lookups only -- the map is never iterated, so pointer keys are
+    // determinism-safe.
+    std::unordered_map<const Blob*, double> blob_total_charge;
+
     // Find extreme points
     for (int i = 0; i < npoints(); i++) {
          // Skip excluded points
          if (is_point_excluded(i)) continue;
-        
+
         // Get blob and check charge threshold
         const Blob* blob = blob_with_point(i);
-        if (blob->estimate_total_charge() < 1500) continue;
+        auto bc_it = blob_total_charge.find(blob);
+        if (bc_it == blob_total_charge.end()) {
+            bc_it = blob_total_charge.emplace(blob, blob->estimate_total_charge()).first;
+        }
+        if (bc_it->second < 1500) continue;
         auto wpid = blob->wpid();
         auto apa = wpid.apa();
         auto face = wpid.face();
@@ -3595,9 +3943,16 @@ std::pair<geo_point_t, geo_point_t> Cluster::get_two_boundary_wcps(bool flag_cos
 
     }
 
-    // Collect all points, avoiding duplicates
+    // Collect all points, avoiding duplicates.  Skip (apa,face) keys that
+    // never saw a qualifying point (no blob above the charge cut): their
+    // extreme points are still default-constructed (0,0,0), and letting the
+    // origin into the farthest-pair scan below fabricates a boundary point
+    // outside the detector (SBND evt285999 main 18: the origin beat both real
+    // track endpoints and, snapped to a steiner terminal, became an interior
+    // "exit" that failed cluster_fc_check).
     std::vector<geo_point_t> all_points;
     for (const auto& entry : boundary_points_map) {
+        if (!initialized_map[entry.first]) continue;
         all_points.push_back(entry.second.first);
         all_points.push_back(entry.second.second);
     }

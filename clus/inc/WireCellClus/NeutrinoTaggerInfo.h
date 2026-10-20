@@ -38,6 +38,32 @@ namespace WireCell::Clus::PR {
         std::vector<int>   kine_particle_type;     // PDG code
         std::vector<int>   kine_energy_included;   // 1 = included in Enu sum
 
+        // ---- doc 85 sec 9: the energy kine_reco_Enu does NOT carry ----- //
+        // Owner request 2026-08-30.  kine_reco_Enu is a sum over the objects
+        // the main-vertex walk reached; these say how much reconstructed
+        // kinetic energy the same PR graph holds that the sum never saw.
+        // Read-only: computed at the very end of fill_kine_tree, appending
+        // nothing to the vectors above and moving no existing field, so the
+        // whole block is inert with respect to kine_reco_Enu by construction.
+        //
+        // "Excluded" = a PR-graph segment whose energy entered NEITHER a
+        // push_segment_kine row NOR (as a member) a push_shower_kine row.
+        // The split follows the doc pr/131 census: `main` is the same cluster
+        // as the main vertex -- material the candidate arguably owns --
+        // and `other` is a different cluster, the cross-cluster population
+        // that pr/128 could not put a denominator under.  MeV.
+        float kine_energy_excluded{0};        // main + other
+        float kine_energy_excluded_main{0};   // same cluster as the main vertex
+        float kine_energy_excluded_other{0};  // a different cluster
+        int   kine_n_excluded{0};             // segments behind the sums
+        // NOT the above: the rows kine_energy_included flags as != 1.  Those
+        // ARE inside kine_reco_Enu -- both the toolkit (NeutrinoKinematics.cxx
+        // "Total reconstructed neutrino energy") and the prototype
+        // (NeutrinoID_kine.h:249-256) sum kine_energy_particle
+        // unconditionally, despite the flag's name.  Reported separately so
+        // the distinction is visible instead of assumed.
+        float kine_energy_flagged{0};         // sum of rows with included != 1
+
         // pi0 kinematics (filled by id_pi0_with/without_vertex)
         float kine_pio_mass{0};
         int   kine_pio_flag{0};    // 0=not found, 1=with vertex, 2=without vertex
@@ -54,6 +80,67 @@ namespace WireCell::Clus::PR {
         float kine_pio_dis_2{0};
 
         float kine_pio_angle{0};
+
+        // ---- doc pr/94 Phase 2: per-bundle identity ------------------- //
+        // The same three identity fields TaggerInfo carries, so that
+        // T_kine[i] can be *verified* to refer to the same bundle as
+        // T_tagger[i] rather than merely assumed to by position (doc pr/94
+        // §10.1's sync check would otherwise be vacuous).  Booked as T_kine
+        // branches only when UbooneTaggerOutputVisitor's nu_per_bundle knob
+        // is on.  -1 = not populated (single-candidate legacy path).
+        int cluster_id{-1};
+        int matched_flash_gid{-1};
+        int nu_index{-1};
+
+        // ---- sbnd_xin/docs/109: was a neutrino vertex found ------------ //
+        // kine_nu_*_corr stay (0,0,0) when there is no vertex, and (0,0,0)
+        // is a real point on SBND's cathode plane.  1 = vertex found, 0 =
+        // none, -1 = not filled (TaggerCheckNeutrino nu_provenance off).
+        int has_vertex{-1};
+
+        // ---- doc 80: MCS muon momentum (one muon per bundle) ---------- //
+        // Scalars plus a join key, NOT parallel arrays: the kine_* vectors
+        // above carry no per-row segment provenance, so a row could never be
+        // matched back to the measured muon (doc 80 sec 8.1).  Filled by
+        // mcs_fill_kine (MuonMCSDriver.cxx) behind TaggerCheckNeutrino's
+        // mcs_enable knob; booked as T_kine branches only behind
+        // UbooneTaggerOutputVisitor's mcs_output knob.  -1 = not computed.
+        // kine_mcs_range_energy is MCS's OWN CSDA-table range KE over the
+        // TRIMMED path -- deliberately not named like (and never to be
+        // confused with) cal_kine_range's estimate (doc 80 sec 8.3).
+        float kine_mcs_energy{-1};        // MCS KE [MeV]
+        float kine_mcs_ambiguity{-1};     // 1 = most ambiguous
+        float kine_mcs_tracklen{-1};      // MCS trimmed path length [cm]
+        float kine_mcs_range_energy{-1};  // MCS's own CSDA range KE [MeV]
+        int kine_mcs_segment_id{-1};      // cluster_id*1000 + graph_index join key
+
+        // ---- sbnd_xin/docs/128-129: per-row identity (P1) --------------- //
+        // Parallel to kine_energy_particle: which particle each row is.
+        // Filled unconditionally by fill_kine_tree (in-memory only); booked
+        // as T_kine branches only behind UbooneTaggerOutputVisitor's
+        // nu_particle_links knob, so an off config writes nothing new.
+        // Id encoding = the Bee PF node / calib-dump segment id,
+        // cluster_id*1000 + graph_index (a shower row uses its start segment).
+        std::vector<int> kine_particle_id;
+        std::vector<int> kine_particle_is_shower;  // 1 = shower row
+        std::vector<int> kine_particle_cluster_id; // cluster of the (start) segment
+        std::vector<int> kine_particle_nseg;       // 1 for a track, member count for a shower
+        // Which fill_kine_tree pass pushed the row: 0 main-vertex edge, 1 BFS,
+        // 2 leftover shower, 3 orphan track, 4 guard-freed track,
+        // 5 near cross-cluster track.
+        std::vector<int> kine_particle_pool;
+        int kine_main_vertex_id{-1};               // cluster_id*1000 + graph_index
+
+        // ---- sbnd_xin/docs/128-129: segment -> row links (P2 input) ------ //
+        // One entry per segment whose energy is inside kine_reco_Enu (the
+        // census's counted_segs), sorted by graph_index.  NEVER booked on
+        // T_kine: UbooneTaggerOutputVisitor reads them to fill T_segment.
+        // kine_index = the row the segment fed (a shower row if any, see
+        // build_kine_segment_links); n_rows > 1 = fed more than one row.
+        // All three are empty when the fill self-check fails.
+        std::vector<int> link_seg_graph_index;
+        std::vector<int> link_seg_kine_index;
+        std::vector<int> link_seg_n_rows;
     };
 
 
@@ -1350,6 +1437,16 @@ namespace WireCell::Clus::PR {
         // ---- fiducial-volume flag (placeholder: filled by TaggerCheckNeutrino) //
         float match_isFC{0};
 
+        // ---- per-tagger verdict bitmask (doc pr/36 §10.8, F7 = P4) ------ //
+        // prototype NeutrinoID.h:1976, init 0 (NeutrinoID.cxx:58).  Live
+        // writers: cosmic_tagger.h:861 (bit 1), numu_tagger.h:252/:254
+        // (bit 2 numu / bit 3 nc), nue_tagger.h:259 (bit 5).  The
+        // singlephoton write (singlephoton_tagger.h:536-539) is commented
+        // out in the prototype and is not reproduced.  Filled only when
+        // PatternAlgorithms::m_neutrino_type_bitmask is on; stays 0 (and the
+        // T_tagger branch is not booked) when off.
+        int neutrino_type{0};
+
         // ---- numu BDT scores ------------------------------------------- //
         float cosmict_2_4_score{0};
         float cosmict_3_5_score{0};
@@ -1397,6 +1494,73 @@ namespace WireCell::Clus::PR {
         float nue_score{0};
 
         float photon_flag{0};
+
+        // ---- doc pr/94: per-bundle identity + per-activity cosmic block -- //
+        // Plumbing only (Phase 1): these fields are declared here and booked
+        // as T_tagger/T_kine branches by UbooneTaggerOutputVisitor when its
+        // nu_per_bundle knob is on, but nothing populates them yet --
+        // TaggerCheckNeutrino still fills exactly one TaggerInfo per event,
+        // so every field below carries its default (-1 / empty) until a
+        // later phase's TaggerCheckNeutrino change writes real values.
+        //
+        // Identity: which bundle/candidate this TaggerInfo belongs to, once
+        // T_tagger becomes multi-entry (one row per in-beam-window bundle).
+        // -1 = not populated (single-candidate legacy path).
+        int cluster_id{-1};
+        int matched_flash_gid{-1};
+        int nu_index{-1};
+
+        // Per-activity cosmic block: one element per main activity
+        // (flag_main_cluster or demoted_main) evaluated inside this bundle,
+        // so a cut on any of these can no longer discard a sibling activity
+        // just because it shares a bundle with a cosmic-tagged one (SBND
+        // 18255/395148).  act_evaluated distinguishes "evaluated and
+        // exonerated" (1, flag 0) from "never evaluated" (0) -- see
+        // Facade::normalize_cluster_flags, which back-fills every missing
+        // flag_* with 0 and would otherwise make the two indistinguishable.
+        std::vector<int>   act_cluster_id;
+        std::vector<float> act_length_cm;
+        std::vector<int>   act_is_selected;
+        std::vector<int>   act_is_demoted;
+        std::vector<int>   act_tgm;
+        std::vector<int>   act_stm;
+        std::vector<int>   act_fc;
+        std::vector<int>   act_lm;
+        std::vector<int>   act_evaluated;
+
+        // ---- sbnd_xin/docs/109: what the selection did ----------------- //
+        // Filled only when TaggerCheckNeutrino's nu_provenance knob is on
+        // (and nu_per_bundle, which builds the act_* roster); -1 / empty
+        // otherwise.
+        //
+        // sel_cluster_id: the activity the selection chose.  cluster_id above
+        // is the main cluster the row was WRITTEN with, which the overall
+        // neutrino-vertex search may have moved onto a companion of the same
+        // bundle; vertex_moved_cluster = 1 when the two differ.
+        int sel_cluster_id{-1};
+        int vertex_moved_cluster{-1};
+        // 1 = a neutrino vertex was found (nu_x/y/z are meaningful).
+        int has_vertex{-1};
+        // The row's matched flash (the bundle's gid): time, PE, physical TPC
+        // and the flash group shared with the other TPC's view of the same
+        // light (NuBundleCensus::flash_group).
+        float flash_time_us{0};
+        float flash_pe{0};
+        int flash_tpc{-1};
+        int flash_group{-1};
+        // With nu_provenance on the roster also lists the bundle's
+        // companions, each cluster ONCE.  act_role: 0 main, 1 demoted main
+        // (both evaluated by the cosmic taggers, as before), 2 companion not
+        // already listed, 3 companion dropped as cosmic
+        // (skip_cosmic_companions) not already listed.  Entries with role 0/1
+        // come first, in the same order as without the knob.
+        // act_in_pr: 1 = the cluster took part in this candidate's PR pass
+        // (the selected activity or a kept companion -- a demoted main can be
+        // both role 1 and a companion).  act_is_final: 1 on the entry whose
+        // cluster the row was written with.
+        std::vector<int>   act_role;
+        std::vector<int>   act_in_pr;
+        std::vector<int>   act_is_final;
     };
 
 } // namespace WireCell::Clus::PR

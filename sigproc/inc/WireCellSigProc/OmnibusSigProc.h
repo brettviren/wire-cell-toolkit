@@ -134,6 +134,11 @@ namespace WireCell {
             // some parameters for ROI creating
             float m_th_factor_ind{3};
             float m_th_factor_col{5};
+            // MAD-based cal_RMS in ROI_formation (robust against strong
+            // signals occupying >~16% of the waveform, which inflate the
+            // legacy percentile-spread RMS and so the ROI thresholds).
+            // Default false = bit-identical legacy behaviour.
+            bool m_roi_mad_rms{false};
             int m_pad{5};
             float m_asy{0.1};
             int m_rebin{6};
@@ -151,6 +156,19 @@ namespace WireCell {
             double m_r_fake_signal_high_th_ind_factor{1.0};
             int m_r_pad{5};
             int m_r_break_roi_loop{2};
+            // Optional per-plane (size 3, indexed by plane/slot) overrides for the
+            // three refinement knobs above.  Empty (default) => the scalar value
+            // is used for every plane (bit-identical legacy behaviour).  Used to
+            // confine a tune to a single plane (e.g. PDHD APA0 W = slot 1).
+            std::vector<float> m_r_th_factor_planes;
+            std::vector<int> m_r_pad_planes;
+            std::vector<int> m_r_break_roi_loop_planes;
+            // Erase a deleted loose ROI's contained_rois entry in
+            // CleanUpInductionROIs (ROI_refinement::set_erase_stale_contained).
+            // Default true (owner flip 2026-09-29, wcp-porting-img
+            // sbnd_xin/docs/127); false restores the legacy stale key, whose
+            // address reuse makes V-plane gauss/wiener heap-dependent.
+            bool m_r_erase_stale_contained{true};
             double m_r_th_peak{3.0};
             double m_r_sep_peak{6.0};
             double m_r_low_peak_sep_threshold_pre{1200};
@@ -260,9 +278,32 @@ namespace WireCell {
             double m_mp_th2{500.};
             int m_mp_tick_resolution{4};
 
-	    //Rebase waveforms for each channel of spesific wire-plane. 
-	    std::vector<int> m_rebase_planes{0,1,2}; 
+	    //Rebase waveforms for each channel of spesific wire-plane.
+	    std::vector<int> m_rebase_planes{0,1,2};
             int m_rebase_nbins=200;
+
+            // How the front/back baseline anchors of rebase_waveform are
+            // estimated ("rebase_method" config).  The historical plain-mean
+            // anchor was removed: any signal pulse inside a window biased it
+            // and tilted the whole channel.
+            //   RB_MEDIAN - median of the window (safe while signal occupies
+            //               < 50% of the window)
+            //   RB_SIGMASK- mean of window samples after masking
+            //               |x - median| > rebase_nsigma * sigma outliers,
+            //               with sigma = min(p84-p50, p50-p16), the cleaner
+            //               half-spread (16/50/84 percentiles); the window
+            //               widens inward if too few clean samples survive.
+            //               One-sided signal inflates only its own half-
+            //               spread, so the smaller one stays a noise-only
+            //               scale and the mask stays tight under a long bright
+            //               pulse in a window (e.g. a prolonged collection
+            //               track at readout start).  A symmetric RMS of the
+            //               two half-spreads is inflated there and lets the
+            //               signal bias the anchor.  (Does NOT help symmetric/
+            //               bipolar high-occupancy: both half-spreads inflate.)
+            enum RebaseMethod { RB_MEDIAN, RB_SIGMASK };
+            RebaseMethod m_rebase_method{RB_SIGMASK};
+            double m_rebase_nsigma{4.0};
 
             bool m_isWrapped{false};
 
@@ -281,6 +322,18 @@ namespace WireCell {
             int m_verbose{0};
 
             IDFT::pointer m_dft;
+
+            // If true, route the real<->complex time-axis FFTs
+            // through the native r2c/c2r transforms (about half the
+            // flops of the widened complex path).  Results agree with
+            // the legacy path only up to round-off, so default false
+            // = bit-identical.
+            bool m_use_real_dft{false};
+
+            // Dispatch on m_use_real_dft.
+            Array::array_xxc dft_fwd_r2c(const Array::array_xxf& arr, int axis) const;
+            Array::array_xxf dft_inv_c2r(const Array::array_xxc& spec, int axis) const;
+            Waveform::compseq_t dft_fwd_r2c(const Waveform::realseq_t& wave) const;
 
             //------Padding members
             //Needed when physically separate planes are concatenated together

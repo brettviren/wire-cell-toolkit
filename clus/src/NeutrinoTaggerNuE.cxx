@@ -35,7 +35,7 @@
 //   sg->get_direct_length(n1, n2)        → segment_track_direct_length(sg, n1, n2)
 //   sg->get_flag_avoid_muon_check()       → sg->flags_any(SegmentFlags::kAvoidMuonCheck)
 //   sg->get_flag_shower()                 → seg_is_shower(sg)
-//   sg->is_dir_weak()                     → sg->dir_weak()
+//   sg->is_dir_weak()                     → seg_dir_weak(sg)
 //   sg->get_particle_type()               → sg->particle_info()->pdg()
 //   sg->get_medium_dQ_dx()               → segment_median_dQ_dx(sg)
 //   shower->get_total_length(cluster_id) → shower->get_total_length(sg->cluster())
@@ -79,6 +79,32 @@ static inline bool seg_is_shower(SegmentPtr seg) {
            (seg->has_particle_info() && std::abs(seg->particle_info()->pdg()) == 11);
 }
 
+// doc 75 -- consistent-FV containment for the nue tagger (angular_cut,
+// shower_to_wall, bad_reconstruction_2), same shape as
+// NeutrinoTaggerCosmic.cxx's contained_tol (doc 74 G1).  Deliberate
+// duplication of FiducialUtils::inside_fiducial_volume (M10); negative
+// tolerance = required inset, size 6/3/1 accepted.  Only called when the
+// configured fiducial (PatternAlgorithms::m_nue_fiducial) is non-null.
+static bool contained_tol_nue(const IFiducial::pointer& fid, const Point& p,
+                               const std::vector<double>& tol) {
+    if (tol.empty()) return fid->contained(p);
+    double txl, txh, tyl, tyh, tzl, tzh;
+    if (tol.size() >= 6) {
+        txl = tol[0]; txh = tol[1]; tyl = tol[2]; tyh = tol[3]; tzl = tol[4]; tzh = tol[5];
+    } else if (tol.size() >= 3) {
+        txl = txh = tol[0]; tyl = tyh = tol[1]; tzl = tzh = tol[2];
+    } else {
+        txl = txh = tyl = tyh = tzl = tzh = tol[0];
+    }
+    if (!fid->contained(Point(p.x() - txl, p.y(), p.z()))) return false;
+    if (!fid->contained(Point(p.x() + txh, p.y(), p.z()))) return false;
+    if (!fid->contained(Point(p.x(), p.y() - tyl, p.z()))) return false;
+    if (!fid->contained(Point(p.x(), p.y() + tyh, p.z()))) return false;
+    if (!fid->contained(Point(p.x(), p.y(), p.z() - tzl))) return false;
+    if (!fid->contained(Point(p.x(), p.y(), p.z() + tzh))) return false;
+    return true;
+}
+
 // Determine which end of seg is nearest to a given point.
 // Returns the endpoint (fit point) that is geometrically closest to ref_pt.
 // Used to replace prototype's wcpt-index comparison for front/back of segment.
@@ -88,6 +114,64 @@ static Point seg_endpoint_near(SegmentPtr seg, const Point& ref_pt) {
     Point back  = fits.back().point;
     return (ray_length(Ray{ref_pt, front}) <= ray_length(Ray{ref_pt, back}))
            ? front : back;
+}
+
+// doc pr/36 §10.6 (F5 = P6).  The prototype picks the stem fit endpoint by
+// wcpt INDEX identity with the vertex:
+//     // prototype (NeutrinoID_nue_tagger.h lines 71-75)
+//     if (main_vertex->get_wcpt().index == sg->get_wcpt_vec().front().index)
+//         test_p = sg->get_point_vec().front();
+//     else
+//         test_p = sg->get_point_vec().back();
+// WCPoint::index is not ported (PRCommon.h:99), so the knob-on rule compares
+// wcpt POSITIONS with EXACT equality: both are copies of the same skeleton
+// node, and any tolerance would re-create the proximity rule this replaces
+// (doc pr/36 §10.15b).  Both rules are computed unconditionally; per-call-site
+// disagreement and the neither-endpoint-matches premise check are counted in
+// g_pr36_audit (site = the stable index of the call site, 0-12 in this file).
+static Point seg_endpoint_near_vtx(const PatternAlgorithms& pa, int site,
+                                   SegmentPtr seg, VertexPtr vtx) {
+    const Point legacy = seg_endpoint_near(seg, vtx_fit_pt(vtx));
+    // Null vertex: the legacy path compared against Point{} (vtx_fit_pt's
+    // fallback); the prototype rule has no wcpt to compare.  Keep legacy.
+    if (!vtx) return legacy;
+    auto& audit = PR::g_pr36_audit;
+    audit.f5_calls[site].fetch_add(1, std::memory_order_relaxed);
+    const auto& fits  = seg->fits();
+    const auto& wcpts = seg->wcpts();
+    const bool front_match = !wcpts.empty() && wcpts.front().point == vtx->wcpt().point;
+    const bool back_match  = !wcpts.empty() && wcpts.back().point  == vtx->wcpt().point;
+    if (!front_match && !back_match) {
+        audit.f5_neither[site].fetch_add(1, std::memory_order_relaxed);
+        // Premise classification (doc pr/36 §10.15b): ~zero distances would
+        // mean arithmetic drift broke an identity the prototype's integer
+        // index test would keep (redesign needed); large distances mean the
+        // vertex is genuinely a different skeleton node, where the prototype
+        // rule ALSO picks back -- faithful.
+        SPDLOG_LOGGER_INFO(s_log,
+            "PR36AUDIT f5 site {} neither-match: d_front={:.6g} cm d_back={:.6g} cm",
+            site, ray_length(Ray{vtx->wcpt().point, wcpts.front().point}) / units::cm,
+            ray_length(Ray{vtx->wcpt().point, wcpts.back().point}) / units::cm);
+    }
+    // Prototype rule: front on an exact front match, otherwise back.
+    const Point proto = front_match ? fits.front().point : fits.back().point;
+    if (proto != legacy)
+        audit.f5_disagree[site].fetch_add(1, std::memory_order_relaxed);
+    return pa.m_stem_endpoint_wcpt_parity ? proto : legacy;
+}
+
+// doc pr/36 §10.3 (F2 = P12).  The prototype's get_particle_type() COERCES a
+// shower-flagged segment to PDG 11 on read -- and latches it
+// (ProtoSegment.cxx:10-15: "shower are all treated as electron") -- so a
+// shower-flagged segment with no explicit ParticleInfo is processed as an
+// electron there while the toolkit's has_particle_info() gates skip it.
+// Count such skips per gate (pure diagnostic; gate ids are documented on
+// Pr36AuditCounters::f2_gate_skip).
+static inline void pr36_count_gate_skip(SegmentPtr sg, int gate) {
+    if (sg && !sg->has_particle_info() &&
+        (sg->flags_any(SegmentFlags::kShowerTrajectory) ||
+         sg->flags_any(SegmentFlags::kShowerTopology)))
+        PR::g_pr36_audit.f2_gate_skip[gate].fetch_add(1, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -146,9 +230,8 @@ static bool low_energy_michel(NuEContext& ctx, ShowerPtr shower, TaggerInfo& ti)
         if (!vtx1->cluster() || vtx1->cluster() != start_cl) continue;
         if (!vtx1->descriptor_valid()) continue;
         int deg = 0;
-        for (auto [eit, eend] = boost::out_edges(vtx1->get_descriptor(), ctx.graph);
-             eit != eend; ++eit) {
-            if (shower_segs.count(ctx.graph[*eit].segment)) ++deg;
+        for (auto eit : sorted_out_edges(vtx1->get_descriptor(), ctx.graph)) {
+            if (shower_segs.count(ctx.graph[eit].segment)) ++deg;
         }
         if (deg >= 3) ++n_3seg;
     }
@@ -236,7 +319,7 @@ static bool angular_cut(NuEContext& ctx, ShowerPtr shower,
 
     VertexPtr  vertex = shower->get_start_vertex_and_type().first;
     SegmentPtr sg     = shower->start_segment();
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 0, sg, vertex);
 
     Vector dir_beam(0, 0, 1);
     Vector dir_shower = shower_cal_dir_3vector(*shower, vertex_point, 30*units::cm);
@@ -249,8 +332,8 @@ static bool angular_cut(NuEContext& ctx, ShowerPtr shower,
 
     if (vertex && vertex->descriptor_valid()) {
         auto vd = vertex->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1) continue;
             Vector dir1     = segment_cal_dir_3vector(sg1, vertex_point, 15*units::cm);
             double seg_angle = dir1.angle(dir_beam) / M_PI * 180.0;
@@ -310,7 +393,15 @@ static bool angular_cut(NuEContext& ctx, ShowerPtr shower,
     if (ctx.main_cluster && ctx.main_cluster->grouping())
         fiducial_utils = ctx.main_cluster->grouping()->get_fiducialutils();
 
-    if (fiducial_utils) {
+    // doc 75 -- nue_sp_consistent_fv: route this containment test through the
+    // configured fiducial (sbnd_pr_fv) instead of the grouping's FiducialUtils
+    // zero-margin sensitive union.  Same -1.5 cm tolerance either way
+    // (prototype NeutrinoID_nue_tagger.h:504,511, stm_tol_vec); default
+    // nullptr = legacy path, byte-identical.  The legacy call's own 5-element
+    // literal is untouched; the new path uses the 6-element form to avoid the
+    // FiducialUtils 5-element size(>=3) mapping trap (doc 75 FV audit) -- both
+    // are numerically the uniform -1.5 cm the prototype passes.
+    if (fiducial_utils || ctx.self.m_nue_fiducial) {
         IndexedSegmentSet fv_segs;
         IndexedVertexSet  fv_vtxs;
         shower->fill_sets(fv_vtxs, fv_segs, /*flag_exclude_start_segment=*/false);
@@ -319,9 +410,12 @@ static bool angular_cut(NuEContext& ctx, ShowerPtr shower,
         for (VertexPtr vtx1 : fv_vtxs) {
             if (vtx1 == start_vtx) continue;
             if (!vtx1->cluster() || vtx1->cluster() != start_cl) continue;
-            if (!fiducial_utils->inside_fiducial_volume(vtx_fit_pt(vtx1),
-                    {-1.5*units::cm, -1.5*units::cm, -1.5*units::cm, -1.5*units::cm, -1.5*units::cm}))
-                flag_main_outside = true;
+            const bool inside = ctx.self.m_nue_fiducial
+                ? contained_tol_nue(ctx.self.m_nue_fiducial, vtx_fit_pt(vtx1),
+                                     std::vector<double>(6, -1.5*units::cm))
+                : fiducial_utils->inside_fiducial_volume(vtx_fit_pt(vtx1),
+                    {-1.5*units::cm, -1.5*units::cm, -1.5*units::cm, -1.5*units::cm, -1.5*units::cm});
+            if (!inside) flag_main_outside = true;
         }
     }
 
@@ -368,7 +462,7 @@ static bool compare_muon_energy(NuEContext& ctx, ShowerPtr shower,
     Vector dir_drift(1, 0, 0);
     VertexPtr  vertex = shower->get_start_vertex_and_type().first;
     SegmentPtr sg     = shower->start_segment();
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 1, sg, vertex);
 
     // Shower direction
     Vector dir_shower;
@@ -392,15 +486,18 @@ static bool compare_muon_energy(NuEContext& ctx, ShowerPtr shower,
     // the input muon_length, update E_muon
     if (ctx.main_vertex && ctx.main_vertex->descriptor_valid()) {
         auto vd = ctx.main_vertex->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
-            if (!sg1 || !sg1->has_particle_info()) continue;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
+            if (!sg1 || !sg1->has_particle_info()) {
+                pr36_count_gate_skip(sg1, 0);  // doc pr/36 F2
+                continue;
+            }
             int pdg = sg1->particle_info()->pdg();
             if (pdg == 13 || pdg == 2212) {
                 double length       = segment_track_length(sg1);
                 double medium_dQ_dx = segment_median_dQ_dx(sg1);
-                double dQ_dx_cut    = 0.8866 + 0.9533 * std::pow(18*units::cm / length, 0.4234);
-                if (medium_dQ_dx < dQ_dx_cut * 43e3 / units::cm) {
+                double dQ_dx_cut    = ctx.self.muon_dqdx_cut(length);
+                if (medium_dQ_dx < dQ_dx_cut * ctx.self.m_mip_dqdx_median) {
                     double tmp_energy = muon_range_fn->scalar_function(length / units::cm) * units::MeV;
                     if (tmp_energy > E_muon) E_muon = tmp_energy;
                 }
@@ -629,14 +726,20 @@ static bool pi0_identification(NuEContext& ctx,
 
         if (dir1.magnitude() > 0) {
             // Precompute total track length per cluster (used to check acc_length > 0)
+            // ordered_edges (not boost::edges): the += accumulates in iteration
+            // order and FP addition is not associative, so a pointer-ordered
+            // walk gives a last-ulp-different acc_length between runs.
             std::map<Facade::Cluster*, double> cluster_acc_length;
-            for (auto [eit, eend] = boost::edges(ctx.graph); eit != eend; ++eit) {
-                SegmentPtr sg1 = ctx.graph[*eit].segment;
+            for (const auto& ed : ordered_edges(ctx.graph)) {
+                SegmentPtr sg1 = ctx.graph[ed].segment;
                 if (sg1 && sg1->cluster())
                     cluster_acc_length[sg1->cluster()] += segment_track_length(sg1);
             }
 
-            for (const auto& vd : graph_nodes(ctx.graph)) {
+            // ordered_nodes (not graph_nodes): this loop push_back()s one entry
+            // per surviving vertex into pio_2_v_*, so the *order* of the output
+            // vectors is the loop order.  graph_nodes() is pointer order.
+            for (const auto& vd : ordered_nodes(ctx.graph)) {
                 VertexPtr vtx1 = ctx.graph[vd].vertex;
                 if (!vtx1) continue;
                 if (vtx1->cluster() == vertex->cluster()) continue;
@@ -702,14 +805,14 @@ static bool single_shower(NuEContext& ctx, ShowerPtr shower,
 
     VertexPtr  vertex = shower->get_start_vertex_and_type().first;
     SegmentPtr sg     = shower->start_segment();
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 2, sg, vertex);
 
     double Eshower = (shower->get_kine_best() != 0)
                      ? shower->get_kine_best()
                      : shower->get_kine_charge();
 
     // Normalized stem dQ/dx (first ≤3 fit points near the vertex)
-    auto vec_dQ_dx = shower->get_stem_dQ_dx(vertex, sg, 20);
+    auto vec_dQ_dx = shower->get_stem_dQ_dx(vertex, sg, 20, ctx.self.m_mip_dqdx_median);
     double max_dQ_dx = 0;
     for (size_t i = 0; i < vec_dQ_dx.size(); ++i) {
         if (vec_dQ_dx[i] > max_dQ_dx) max_dQ_dx = vec_dQ_dx[i];
@@ -741,22 +844,22 @@ static bool single_shower(NuEContext& ctx, ShowerPtr shower,
 
     if (vertex && vertex->descriptor_valid()) {
         auto vd = vertex->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
 
-            double medium_dQ_dx = segment_median_dQ_dx(sg1) / (43e3 / units::cm);
+            double medium_dQ_dx = segment_median_dQ_dx(sg1) / ctx.self.m_mip_dqdx_median;
             double length       = segment_track_length(sg1);
 
             // 7022_110_5542: count non-shower-flagged segments with sufficient length/dQ_dx
             if (!seg_is_shower(sg1) &&
-                (!sg1->dir_weak() || (sg1->dir_weak() && length > 4.2*units::cm) ||
+                (!ctx.self.seg_dir_weak(sg1) || (ctx.self.seg_dir_weak(sg1) && length > 4.2*units::cm) ||
                  (length > 0.6*units::cm && medium_dQ_dx > 3) ||
                  (length > 1.6*units::cm && medium_dQ_dx > 2.2))) {
                 ++num_valid_tracks;
                 if (length > max_length) max_length = length;
             } else {
-                double dQ_dx_cut = 0.8866 + 0.9533 * std::pow(18*units::cm / length, 0.4234);
+                double dQ_dx_cut = ctx.self.muon_dqdx_cut(length);
                 if (medium_dQ_dx > dQ_dx_cut) {
                     ++num_valid_tracks;
                     if (length > max_length) max_length = length;
@@ -844,7 +947,10 @@ static bool multiple_showers(NuEContext& ctx, ShowerPtr max_shower,
     if (mv_it != ctx.map_vertex_to_shower.end()) {
         for (ShowerPtr shower : mv_it->second) {
             SegmentPtr sg = shower->start_segment();
-            if (!sg || !sg->has_particle_info() || sg->particle_info()->pdg() != 11) continue;
+            if (!sg || !sg->has_particle_info() || sg->particle_info()->pdg() != 11) {
+                pr36_count_gate_skip(sg, 1);  // doc pr/36 F2
+                continue;
+            }
             if (shower == max_shower) continue;
             auto [vtx, conn_type] = shower->get_start_vertex_and_type();
             if (conn_type > 1) continue;
@@ -889,7 +995,10 @@ static bool multiple_showers(NuEContext& ctx, ShowerPtr max_shower,
 
     for (ShowerPtr shower : ctx.showers) {
         SegmentPtr sg = shower->start_segment();
-        if (!sg || !sg->has_particle_info() || sg->particle_info()->pdg() != 11) continue;
+        if (!sg || !sg->has_particle_info() || sg->particle_info()->pdg() != 11) {
+            pr36_count_gate_skip(sg, 2);  // doc pr/36 F2
+            continue;
+        }
         if (sg->cluster() == ctx.main_vertex->cluster()) continue;
 
         auto [vtx, conn_type] = shower->get_start_vertex_and_type();
@@ -971,7 +1080,7 @@ static bool other_showers(NuEContext& ctx, ShowerPtr shower,
 
     VertexPtr  vertex = shower->get_start_vertex_and_type().first;
     SegmentPtr sg     = shower->start_segment();
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 3, sg, vertex);
 
     // ------------------------------------------------------------------
     // Quick survey: off-main-cluster showers for flag_single_shower path.
@@ -981,7 +1090,10 @@ static bool other_showers(NuEContext& ctx, ShowerPtr shower,
 
     for (ShowerPtr shower1 : ctx.showers) {
         SegmentPtr sg1 = shower1->start_segment();
-        if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) continue;
+        if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) {
+            pr36_count_gate_skip(sg1, 3);  // doc pr/36 F2
+            continue;
+        }
         if (sg1->cluster() == ctx.main_vertex->cluster()) continue;
         auto [vtx1, conn1] = shower1->get_start_vertex_and_type();
         double E_shower1 = (shower1->get_kine_best() != 0)
@@ -1006,7 +1118,10 @@ static bool other_showers(NuEContext& ctx, ShowerPtr shower,
 
     for (ShowerPtr shower1 : ctx.showers) {
         SegmentPtr sg1 = shower1->start_segment();
-        if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) continue;
+        if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) {
+            pr36_count_gate_skip(sg1, 4);  // doc pr/36 F2
+            continue;
+        }
         if (shower1 == shower) continue;
 
         auto [vtx1, conn1] = shower1->get_start_vertex_and_type();
@@ -1143,7 +1258,7 @@ static bool vertex_inside_shower(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
 
     VertexPtr  vertex = shower->get_start_vertex_and_type().first;
     SegmentPtr sg     = shower->start_segment();
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 4, sg, vertex);
 
     // ------------------------------------------------------------------
     // Block 1: check for segments nearly anti-parallel to the shower.
@@ -1157,12 +1272,12 @@ static bool vertex_inside_shower(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
 
         if (vertex && vertex->descriptor_valid()) {
             auto vd = vertex->get_descriptor();
-            for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-                SegmentPtr sg1 = ctx.graph[*eit].segment;
+            for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+                SegmentPtr sg1 = ctx.graph[eit].segment;
                 if (!sg1 || sg1 == sg) continue;
                 Vector dir2    = segment_cal_dir_3vector(sg1, vertex_point, 15*units::cm);
                 double angle   = dir2.angle(dir1) / M_PI * 180.0;
-                if (!seg_is_shower(sg1) && !sg1->dir_weak()) ++num_good_tracks;
+                if (!seg_is_shower(sg1) && !ctx.self.seg_dir_weak(sg1)) ++num_good_tracks;
                 if (angle > max_angle && segment_track_length(sg1) > 1.0*units::cm) {
                     max_angle = angle;
                     max_sg = sg;    // prototype assigns sg (start seg), not sg1
@@ -1253,8 +1368,8 @@ static bool vertex_inside_shower(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
 
             if (vertex->descriptor_valid()) {
                 auto vd = vertex->get_descriptor();
-                for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-                    SegmentPtr sg1 = ctx.graph[*eit].segment;
+                for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+                    SegmentPtr sg1 = ctx.graph[eit].segment;
                     if (!sg1 || sg1 == sg) continue;
                     Vector dir1 = segment_cal_dir_3vector(sg1, vertex_point, 15*units::cm);
 
@@ -1263,9 +1378,9 @@ static bool vertex_inside_shower(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
                         180.0 - dir1.angle(dir_shower) / M_PI * 180.0,
                         180.0 - dir1.angle(dir2_sg)   / M_PI * 180.0);
 
-                    double norm_dQ_dx = segment_median_dQ_dx(sg1) / (43e3 / units::cm);
+                    double norm_dQ_dx = segment_median_dQ_dx(sg1) / ctx.self.m_mip_dqdx_median;
                     double length     = segment_track_length(sg1);
-                    bool   is_weak    = sg1->dir_weak();
+                    bool   is_weak    = ctx.self.seg_dir_weak(sg1);
 
                     if (angle > max_angle) {
                         max_angle        = angle;
@@ -1375,7 +1490,7 @@ static bool broken_muon_id(NuEContext& ctx, ShowerPtr shower, TaggerInfo& ti) {
 
     VertexPtr  vertex = shower->get_start_vertex_and_type().first;
     SegmentPtr sg     = shower->start_segment();
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 5, sg, vertex);
 
     // Pre-fill shower internal segment/vertex sets (replaces get_map_seg_vtxs / get_map_vtx_segs)
     IndexedSegmentSet shower_segs;
@@ -1402,9 +1517,21 @@ static bool broken_muon_id(NuEContext& ctx, ShowerPtr shower, TaggerInfo& ti) {
         //         nearly collinearly (back-to-back, within 15°).
         if (curr_vtx && curr_vtx->descriptor_valid()) {
             auto vd = curr_vtx->get_descriptor();
-            for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-                SegmentPtr sg1 = ctx.graph[*eit].segment;
-                if (!sg1 || !shower_segs.count(sg1)) continue;
+            // The graph stores descriptors with boost::setS, so out_edges
+            // iterates in pointer order, which varies run to run.  When two
+            // segments pass the collinearity cut the first-match walk was
+            // run-to-run bimodal (nueCC evt 469665: segs {27,29} both pass at
+            // one vertex — clus/docs/audits/pr11-latent-pattern-audit.md
+            // §5.10).  Iterate in stable graph-index order instead.  The
+            // prototype (NeutrinoID_nue_tagger.h:1048) iterates a pointer-
+            // keyed std::set — arbitrary order — so no parity is broken.
+            IndexedSegmentSet conn_segs;
+            for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+                SegmentPtr sg1 = ctx.graph[eit].segment;
+                if (sg1) conn_segs.insert(sg1);
+            }
+            for (SegmentPtr sg1 : conn_segs) {
+                if (!shower_segs.count(sg1)) continue;
                 if (muon_segments.count(sg1)) continue;
                 Vector dir2 = segment_cal_dir_3vector(sg1, curr_vtx_pt, 15*units::cm);
                 // back-to-back: 180° - angle < 15° AND length > 6cm
@@ -1497,12 +1624,31 @@ static bool broken_muon_id(NuEContext& ctx, ShowerPtr shower, TaggerInfo& ti) {
     double acc_length        = 0;
     double acc_direct_length = 0;
     std::set<Facade::Cluster*> tmp_clusters;
+    // doc pr/36 §10.7 (F6 = P8): the prototype counts distinct cluster IDS
+    // (std::set<int>, NeutrinoID_nue_tagger.h ~:1183) where the toolkit
+    // counts distinct pointers.  Both sets are filled; the knob picks which
+    // size feeds the multi-cluster test below.  Disagreement (= cluster<->id
+    // non-injectivity, doc 53) is counted regardless.
+    std::set<int> tmp_cluster_ids;
 
-    for (SegmentPtr mseg : muon_segments) {
+    // doc pr/36 §10.5 (F4 = P3): float sums in pointer-address order.  The
+    // prototype does the same (std::set<ProtoSegment*>,
+    // NeutrinoID_nue_tagger.h:1036 iterated :1139) -- hazard reproduced, not
+    // introduced; ordering by graph index is the M4 house-rule fix and moves
+    // FURTHER from the prototype's order.  Knob-off iterates the set as
+    // before, byte-identical.
+    std::vector<SegmentPtr> muon_seg_iter(muon_segments.begin(), muon_segments.end());
+    if (ctx.self.m_tagger_ordered_segment_sets)
+        std::sort(muon_seg_iter.begin(), muon_seg_iter.end(), SegmentIndexCmp{});
+    for (SegmentPtr mseg : muon_seg_iter) {
         acc_length        += segment_track_length(mseg);
         acc_direct_length += segment_track_direct_length(mseg);
         tmp_clusters.insert(mseg->cluster());
+        // Null cluster keeps the legacy behavior of a distinct set entry.
+        tmp_cluster_ids.insert(mseg->cluster() ? mseg->cluster()->get_cluster_id() : -1);
     }
+    if (tmp_cluster_ids.size() != tmp_clusters.size())
+        PR::g_pr36_audit.f6_id_vs_ptr_disagree.fetch_add(1, std::memory_order_relaxed);
 
     auto muon_range_fn = ctx.particle_data->get_range_function("muon");
     double Ep = muon_range_fn->scalar_function(acc_length / units::cm) * units::MeV;
@@ -1546,7 +1692,9 @@ static bool broken_muon_id(NuEContext& ctx, ShowerPtr shower, TaggerInfo& ti) {
         (Ep > Eshower * 0.55 ||
          acc_length > 0.65 * shower->get_total_length() ||
          connected_length > 0.95 * shower->get_total_length()) &&
-        tmp_clusters.size() > 1 &&
+        // doc pr/36 §10.7 (F6): id count (prototype) vs pointer count (legacy).
+        (ctx.self.m_broken_muon_cluster_id_count
+             ? tmp_cluster_ids.size() : tmp_clusters.size()) > 1 &&
         acc_direct_length > 0.94 * acc_length &&
         Eshower < 350*units::MeV) {
         // 7004_989_49482: cut only if shower is simple and muon dominates
@@ -1673,15 +1821,15 @@ static bool mip_quality(NuEContext& ctx,
         if (mv_it != ctx.map_vertex_to_shower.end()) {
             for (ShowerPtr shower1 : mv_it->second) {
                 SegmentPtr sg1 = shower1->start_segment();
-                if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11)
+                if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) {
+                    pr36_count_gate_skip(sg1, 5);  // doc pr/36 F2
                     continue;
+                }
                 // Check if sg1 is connected at main_vertex
                 bool at_main = false;
                 if (ctx.main_vertex && ctx.main_vertex->descriptor_valid()) {
-                    for (auto [eit,eend] = boost::out_edges(
-                             ctx.main_vertex->get_descriptor(), ctx.graph);
-                         eit != eend; ++eit) {
-                        if (ctx.graph[*eit].segment == sg1) { at_main = true; break; }
+                    for (auto eit : sorted_out_edges(ctx.main_vertex->get_descriptor(), ctx.graph)) {
+                        if (ctx.graph[eit].segment == sg1) { at_main = true; break; }
                     }
                 }
                 if (at_main) {
@@ -1693,9 +1841,8 @@ static bool mip_quality(NuEContext& ctx,
         }
         // Count non-shower tracks at vertex
         if (vertex && vertex->descriptor_valid()) {
-            for (auto [eit,eend] = boost::out_edges(vertex->get_descriptor(), ctx.graph);
-                 eit != eend; ++eit) {
-                SegmentPtr sg1 = ctx.graph[*eit].segment;
+            for (auto eit : sorted_out_edges(vertex->get_descriptor(), ctx.graph)) {
+                SegmentPtr sg1 = ctx.graph[eit].segment;
                 if (sg1 && !seg_is_shower(sg1)) ++n_tracks;
             }
         }
@@ -1713,12 +1860,19 @@ static bool mip_quality(NuEContext& ctx,
         Point v_pt = vtx_fit_pt(vertex);
         Vector dir1 = shower_cal_dir_3vector(*shower, v_pt, 6*units::cm);
 
-        for (ShowerPtr shower1 : connected_showers) {
+        // doc pr/36 §10.5 (F4 = P5): first-wins booleans and shortest-length
+        // tie-breaks over a std::set<ShowerPtr> iterate in pointer-address
+        // order; the prototype's std::set<WCShower*> does the same (hazard
+        // reproduced).  Knob-on iterates in shower-id order (M4 house rule).
+        std::vector<ShowerPtr> conn_shower_iter(connected_showers.begin(), connected_showers.end());
+        if (ctx.self.m_tagger_ordered_segment_sets)
+            std::sort(conn_shower_iter.begin(), conn_shower_iter.end(), ShowerIndexCmp{});
+        for (ShowerPtr shower1 : conn_shower_iter) {
             if (shower1 == shower) continue;
             SegmentPtr sg1  = shower1->start_segment();
-            double norm_dQ  = segment_median_dQ_dx(sg1) / (43e3 / units::cm);
+            double norm_dQ  = segment_median_dQ_dx(sg1) / ctx.self.m_mip_dqdx_median;
             double length1  = segment_track_length(sg1);
-            double dQ_cut   = 0.8866 + 0.9533 * std::pow(18*units::cm / length1, 0.4234);
+            double dQ_cut   = ctx.self.muon_dqdx_cut(length1);
             if (norm_dQ > dQ_cut) { flag_split = false; flag_proton = true; }
             if (tmp_pi0_showers.count(shower1)) flag_inside_pi0 = true;
 
@@ -1792,7 +1946,7 @@ static bool high_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInf
     int conn_type  = shower->get_start_vertex_and_type().second;
 
     // Stem dQ/dx (normalized, first ≤3 fit points)
-    auto vec_dQ_dx = shower->get_stem_dQ_dx(vtx, sg, 20);
+    auto vec_dQ_dx = shower->get_stem_dQ_dx(vtx, sg, 20, ctx.self.m_mip_dqdx_median);
     double max_dQ_dx = 0;
     for (size_t i = 0; i < vec_dQ_dx.size(); ++i) {
         if (vec_dQ_dx[i] > max_dQ_dx) max_dQ_dx = vec_dQ_dx[i];
@@ -1817,13 +1971,13 @@ static bool high_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInf
         bool   flag_all_showers = true;
 
         auto vd = vtx->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             bool is_pdg11 = sg1->has_particle_info() && sg1->particle_info()->pdg() == 11;
             bool is_weak_muon = sg1->has_particle_info() &&
                                 sg1->particle_info()->pdg() == 13 &&
-                                sg1->dir_weak() &&
+                                ctx.self.seg_dir_weak(sg1) &&
                                 segment_track_length(sg1) < 6*units::cm;
             if (is_pdg11 || is_weak_muon) {
                 Point dir2_pt = vtx_point;
@@ -1834,9 +1988,9 @@ static bool high_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInf
             } else {
                 flag_all_showers = false;
             }
-            double norm_dQ = segment_median_dQ_dx(sg1) / (43e3 / units::cm);
+            double norm_dQ = segment_median_dQ_dx(sg1) / ctx.self.m_mip_dqdx_median;
             bool   is_proton = sg1->has_particle_info() && sg1->particle_info()->pdg() == 2212;
-            if ((!sg1->dir_weak() || is_proton || segment_track_length(sg1) > 20*units::cm) &&
+            if ((!ctx.self.seg_dir_weak(sg1) || is_proton || segment_track_length(sg1) > 20*units::cm) &&
                 !seg_is_shower(sg1))
                 ++n_valid_tracks;
             else if (norm_dQ > 2.0 && segment_track_length(sg1) > 1.8*units::cm)
@@ -1850,8 +2004,10 @@ static bool high_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInf
             for (ShowerPtr shower1 : mv_it->second) {
                 if (shower1 == shower) continue;
                 SegmentPtr sg1 = shower1->start_segment();
-                if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11)
+                if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) {
+                    pr36_count_gate_skip(sg1, 6);  // doc pr/36 F2
                     continue;
+                }
                 auto [vtx1, conn1] = shower1->get_start_vertex_and_type();
                 double E1 = (shower1->get_kine_best() != 0)
                             ? shower1->get_kine_best() : shower1->get_kine_charge();
@@ -1887,8 +2043,8 @@ static bool high_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInf
             double min_ang2  = 180;
             SegmentPtr min_sg = nullptr;
 
-            for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-                SegmentPtr sg1 = ctx.graph[*eit].segment;
+            for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+                SegmentPtr sg1 = ctx.graph[eit].segment;
                 if (!sg1 || sg1 == sg) continue;
                 Point dir2_pt = vtx_point;
                 Vector dir2 = segment_cal_dir_3vector(sg1, dir2_pt, 5*units::cm);
@@ -1903,9 +2059,8 @@ static bool high_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInf
             auto iterate_pts = [&](auto begin_it, auto end_it) {
                 for (auto it1 = begin_it; it1 != end_it; ++it1) {
                     double min_dis = 1e9;
-                    for (auto [eit2, eend2] = boost::out_edges(vd, ctx.graph);
-                         eit2 != eend2; ++eit2) {
-                        SegmentPtr sg2 = ctx.graph[*eit2].segment;
+                    for (auto eit2 : sorted_out_edges(vd, ctx.graph)) {
+                        SegmentPtr sg2 = ctx.graph[eit2].segment;
                         if (!sg2 || sg2 == sg) continue;
                         double dis = segment_get_closest_point(sg2, it1->point).first;
                         if (dis < min_dis) min_dis = dis;
@@ -1926,10 +2081,10 @@ static bool high_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInf
                      ray_length(Ray{vtx_point, min_fits.back().point}));
                 if (min_front_near)
                     medium_dQ_dx = segment_median_dQ_dx(min_sg, 0, ncount)
-                                   / (43e3 / units::cm);
+                                   / ctx.self.m_mip_dqdx_median;
                 else
                     medium_dQ_dx = segment_median_dQ_dx(min_sg, n_min-1-ncount, n_min-1)
-                                   / (43e3 / units::cm);
+                                   / ctx.self.m_mip_dqdx_median;
             }
 
             if (min_ang2 < 15 && medium_dQ_dx > 0.95 && ncount > 5  && Eshower < 1500*units::MeV)
@@ -1982,7 +2137,7 @@ static bool low_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInfo
 
     VertexPtr  vtx      = shower->get_start_vertex_and_type().first;
     SegmentPtr sg       = shower->start_segment();
-    Point vtx_point = seg_endpoint_near(sg, vtx_fit_pt(vtx));
+    Point vtx_point = seg_endpoint_near_vtx(ctx.self, 6, sg, vtx);
 
     // Pre-fill shower internal sets
     IndexedSegmentSet shower_segs;
@@ -2008,15 +2163,15 @@ static bool low_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInfo
 
     if (vtx && vtx->descriptor_valid()) {
         auto vd = vtx->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             Point dir2_pt = vtx_point;
             Vector dir2 = segment_cal_dir_3vector(sg1, dir2_pt, 5*units::cm);
             double tmp_angle = dir2.angle(dir1_stem) / M_PI * 180.0;
             if (tmp_angle < min_angle_vtx) min_angle_vtx = tmp_angle;
             bool is_proton = sg1->has_particle_info() && sg1->particle_info()->pdg() == 2212;
-            if ((!sg1->dir_weak() || is_proton || segment_track_length(sg1) > 20*units::cm) &&
+            if ((!ctx.self.seg_dir_weak(sg1) || is_proton || segment_track_length(sg1) > 20*units::cm) &&
                 !seg_is_shower(sg1))
                 ++n_valid_tracks;
         }
@@ -2052,11 +2207,12 @@ static bool low_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInfo
         if (!vtx1->cluster() || vtx1->cluster() != sg->cluster()) continue;
         if (!vtx1->descriptor_valid()) continue;
 
-        // Collect shower-internal segments at vtx1
+        // Collect shower-internal segments at vtx1.  Stable edge-index order:
+        // front()/back() below pick the two direction segments (the prototype
+        // used an ordered set here).
         std::vector<SegmentPtr> vtx_ss;
-        for (auto [eit, eend] = boost::out_edges(vtx1->get_descriptor(), ctx.graph);
-             eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto edesc : sorted_out_edges(vtx1->get_descriptor(), ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[edesc].segment;
             if (sg1 && shower_segs.count(sg1)) vtx_ss.push_back(sg1);
         }
         if (vtx_ss.empty()) continue;
@@ -2088,8 +2244,8 @@ static bool low_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInfo
     // ------------------------------------------------------------------
     if (vtx && vtx->descriptor_valid()) {
         auto vd = vtx->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             bool flag_ov2 = false;
             Point dir2_pt = vtx_point;
@@ -2105,7 +2261,7 @@ static bool low_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInfo
                 n_vtx_segs_global > 1 && Eshower < 300*units::MeV && main_len < 20*units::cm)
                 flag_ov2 = true;
             // 7020_249_12479
-            if (sg1->dir_weak() && len1 < 8*units::cm && ang2 < 30 &&
+            if (ctx.self.seg_dir_weak(sg1) && len1 < 8*units::cm && ang2 < 30 &&
                 n_vtx_segs_global == 2 && Eshower < 400*units::MeV)
                 flag_ov2 = true;
 
@@ -2117,7 +2273,7 @@ static bool low_energy_overlapping(NuEContext& ctx, ShowerPtr shower, TaggerInfo
             ti.lol_2_v_vtx_n_segs.push_back(n_vtx_segs_global);
             ti.lol_2_v_energy.push_back(Eshower / units::MeV);
             ti.lol_2_v_shower_main_length.push_back(main_len / units::cm);
-            ti.lol_2_v_flag_dir_weak.push_back(sg1->dir_weak());
+            ti.lol_2_v_flag_dir_weak.push_back(ctx.self.seg_dir_weak(sg1));
 
             if (flag_ov2) flag_overlap_2_save = true;
         }
@@ -2221,8 +2377,8 @@ static bool bad_reconstruction_1(NuEContext& ctx, ShowerPtr shower,
         Point ovp = vtx_fit_pt(other_vtx);
         Vector dir_1 = segment_cal_dir_3vector(sg, ovp, 10*units::cm);
         auto ov_vd = other_vtx->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(ov_vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(ov_vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             Point dir2_pt = ovp;
             Vector dir_2 = segment_cal_dir_3vector(sg1, dir2_pt, 10*units::cm);
@@ -2290,7 +2446,7 @@ static bool bad_reconstruction_1(NuEContext& ctx, ShowerPtr shower,
 //   fid->inside_fiducial_volume(p, offset_x, &tol) → fiducial_utils->inside_fiducial_volume(p, tol)
 //   shower->get_particle_type()                     → shower->get_particle_type()  (direct)
 //   shower->get_end_point()                         → shower->get_end_point()      (direct)
-//   stw_3 global vertex loop                        → graph_nodes(ctx.graph)
+//   stw_3 global vertex loop                        → ordered_nodes(ctx.graph)
 //   vtx1->get_wcpt().{x,y,z}                        → vtx1->wcpt().point.{x,y,z}
 // ===========================================================================
 static bool shower_to_wall(NuEContext& ctx, ShowerPtr shower,
@@ -2315,11 +2471,11 @@ static bool shower_to_wall(NuEContext& ctx, ShowerPtr shower,
     Point vertex_point = vertex_at_front ? sg_fits.front().point : sg_fits.back().point;
     int n_fits = (int)sg_fits.size();
     double medium_dQ_dx = vertex_at_front
-        ? segment_median_dQ_dx(sg, 0, 6)            / (43e3 / units::cm)
-        : segment_median_dQ_dx(sg, n_fits-1-6, n_fits-1) / (43e3 / units::cm);
+        ? segment_median_dQ_dx(sg, 0, 6)            / ctx.self.m_mip_dqdx_median
+        : segment_median_dQ_dx(sg, n_fits-1-6, n_fits-1) / ctx.self.m_mip_dqdx_median;
 
     // Stem dQ/dx (normalized, first ≤3 fit points)
-    auto vec_dQ_dx = shower->get_stem_dQ_dx(vertex, sg, 20);
+    auto vec_dQ_dx = shower->get_stem_dQ_dx(vertex, sg, 20, ctx.self.m_mip_dqdx_median);
     double max_dQ_dx = 0;
     for (size_t i = 0; i < vec_dQ_dx.size(); ++i) {
         if (vec_dQ_dx[i] > max_dQ_dx) max_dQ_dx = vec_dQ_dx[i];
@@ -2336,11 +2492,30 @@ static bool shower_to_wall(NuEContext& ctx, ShowerPtr shower,
     if (ctx.main_cluster && ctx.main_cluster->grouping())
         fiducial_utils = ctx.main_cluster->grouping()->get_fiducialutils();
 
+    // doc 75 -- nue_sp_consistent_fv (see angular_cut above for the rationale
+    // and the 5-vs-6-element note).  Legacy `stm_tol_vec` (5-element) stays
+    // untouched; the new path uses its own 6-element uniform -1.5 cm form.
+    const std::vector<double> stm_tol_vec6(6, -1.5*units::cm);
+    auto inside_fv_walk = [&](const Point& p) -> bool {
+        if (ctx.self.m_nue_fiducial) return contained_tol_nue(ctx.self.m_nue_fiducial, p, stm_tol_vec6);
+        return fiducial_utils->inside_fiducial_volume(p, stm_tol_vec);
+    };
+
     double dis = 0;
-    if (fiducial_utils) {
+    // A shower with no points within 15 cm of its vertex gives a zero (or
+    // NaN) direction; the walk below then never moves and never leaves the
+    // fiducial volume -- an infinite loop (PDVD stm3 arm, 039253:13 and
+    // 039349:48, both 40+ min at 100 % CPU in this loop; doc pdvd/25
+    // sec 13.4 item 11).  The sibling walk in bad_reconstruction_2 below
+    // already skips a zero dir1; mirror it here, and cap the walk at a
+    // length no finite fiducial volume can exceed.  Every shower with a
+    // usable direction takes exactly the same path as before.
+    if ((fiducial_utils || ctx.self.m_nue_fiducial) && dir.magnitude() > 0) {
         const double step = 1*units::cm;
+        const size_t max_steps = 100000;   // 1 km
+        size_t nsteps = 0;
         Point test_p = vertex_point + dir * step;
-        while (fiducial_utils->inside_fiducial_volume(test_p, stm_tol_vec)) {
+        while (inside_fv_walk(test_p) && ++nsteps < max_steps) {
             test_p = test_p + dir * step;
         }
         dis = ray_length(Ray{vertex_point, test_p});
@@ -2381,12 +2556,11 @@ static bool shower_to_wall(NuEContext& ctx, ShowerPtr shower,
     // Count valid tracks at vertex (for non-single-shower path)
     int num_valid_tracks = 0;
     if (vertex && vertex->descriptor_valid()) {
-        for (auto [eit, eend] = boost::out_edges(vertex->get_descriptor(), ctx.graph);
-             eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vertex->get_descriptor(), ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             if (!seg_is_shower(sg1) &&
-                (!sg1->dir_weak() || segment_track_length(sg1) > 5*units::cm))
+                (!ctx.self.seg_dir_weak(sg1) || segment_track_length(sg1) > 5*units::cm))
                 ++num_valid_tracks;
         }
     }
@@ -2434,7 +2608,9 @@ static bool shower_to_wall(NuEContext& ctx, ShowerPtr shower,
     // ------------------------------------------------------------------
     // flag_bad3: vertices of other clusters in backward direction
     // ------------------------------------------------------------------
-    for (const auto& vd : graph_nodes(ctx.graph)) {
+    // ordered_nodes (not graph_nodes): push_back()s one entry per surviving
+    // vertex into stw_3_v_*, so loop order IS the output vector order.
+    for (const auto& vd : ordered_nodes(ctx.graph)) {
         VertexPtr vtx1 = ctx.graph[vd].vertex;
         if (!vtx1) continue;
         if (vtx1->cluster() == vertex->cluster()) continue;
@@ -2479,11 +2655,11 @@ static bool shower_to_wall(NuEContext& ctx, ShowerPtr shower,
 
                 double dis1 = 0;
                 bool flag_bad4 = false;  // per-element flag (prototype resets each iteration)
-                if (dir1.angle(dir) / M_PI * 180.0 < 30 && fiducial_utils) {
+                if (dir1.angle(dir) / M_PI * 180.0 < 30 && (fiducial_utils || ctx.self.m_nue_fiducial)) {
                     const double step = 1*units::cm;
                     Point end_pt = shower1->get_end_point();
                     Point test_p = end_pt;
-                    while (fiducial_utils->inside_fiducial_volume(test_p, stm_tol_vec)) {
+                    while (inside_fv_walk(test_p)) {
                         test_p = test_p + dir1 * step;
                     }
                     dis1 = ray_length(Ray{end_pt, test_p});
@@ -2539,7 +2715,7 @@ static bool single_shower_pio_tagger(NuEContext& ctx, ShowerPtr shower,
 
     VertexPtr  vtx = shower->get_start_vertex_and_type().first;
     SegmentPtr sg  = shower->start_segment();
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vtx));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 7, sg, vtx);
 
     Vector shower_dir = shower_cal_dir_3vector(*shower, vertex_point, 15*units::cm);
     double shower_angle = shower_dir.angle(dir_beam) / M_PI * 180.0;
@@ -2551,8 +2727,10 @@ static bool single_shower_pio_tagger(NuEContext& ctx, ShowerPtr shower,
     if (mv_it != ctx.map_vertex_to_shower.end()) {
         for (ShowerPtr shower1 : mv_it->second) {
             SegmentPtr sg1 = shower1->start_segment();
-            if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11)
+            if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) {
+                pr36_count_gate_skip(sg1, 7);  // doc pr/36 F2
                 continue;
+            }
             if (shower1 == shower) continue;
             if (shower1->get_start_vertex_and_type().second > 2) continue;
 
@@ -2603,8 +2781,8 @@ static bool single_shower_pio_tagger(NuEContext& ctx, ShowerPtr shower,
     double     max_angle_sg = 0;
     if (max_vtx && max_vtx->descriptor_valid()) {
         auto vd = max_vtx->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || !shower_segs.count(sg1)) continue;
             Point max_vtx_pt = vtx_fit_pt(max_vtx);
             Vector dir1 = segment_cal_dir_3vector(sg1, max_vtx_pt, 15*units::cm);
@@ -2622,8 +2800,8 @@ static bool single_shower_pio_tagger(NuEContext& ctx, ShowerPtr shower,
             (ray_length(Ray{vtx_fit_pt(max_vtx), max_fits.front().point}) <=
              ray_length(Ray{vtx_fit_pt(max_vtx), max_fits.back().point}));
         double medium_dQ_dx = max_front_near
-            ? segment_median_dQ_dx(max_sg, 0,       std::min(6, n_max-1)) / (43e3/units::cm)
-            : segment_median_dQ_dx(max_sg, std::max(0, n_max-7), n_max-1) / (43e3/units::cm);
+            ? segment_median_dQ_dx(max_sg, 0,       std::min(6, n_max-1)) / ctx.self.m_mip_dqdx_median
+            : segment_median_dQ_dx(max_sg, std::max(0, n_max-7), n_max-1) / ctx.self.m_mip_dqdx_median;
 
         // dQ/dx at shower start: max of first 3 per-fit-point normalized values
         double start_dQ_dx = 0;
@@ -2636,7 +2814,7 @@ static bool single_shower_pio_tagger(NuEContext& ctx, ShowerPtr shower,
         auto accumulate_start = [&](auto begin_it, auto end_it) {
             for (auto it = begin_it; it != end_it; ++it) {
                 if (ncount > 2) break;
-                double dqdx = it->dQ / (it->dx + 1e-9) / (43e3 / units::cm);
+                double dqdx = it->dQ / (it->dx + 1e-9) / ctx.self.m_mip_dqdx_median;
                 if (dqdx > start_dQ_dx) start_dQ_dx = dqdx;
                 ++ncount;
             }
@@ -2963,7 +3141,7 @@ static bool bad_reconstruction_3(NuEContext& ctx,
     // ------------------------------------------------------------------
     {
         SegmentPtr sg = shower->start_segment();
-        Point vp = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+        Point vp = seg_endpoint_near_vtx(ctx.self, 8, sg, vertex);
 
         Vector dir_sg = segment_cal_dir_3vector(sg, vp, 15*units::cm);
         Vector dir;
@@ -3137,7 +3315,7 @@ static bool bad_reconstruction_2(NuEContext& ctx,
     int n_ele = 0, n_other = 0;
     for (SegmentPtr sg1 : shower_segs) {
         if (sg1->cluster() != sg->cluster()) continue;
-        double med   = segment_median_dQ_dx(sg1) / (43e3/units::cm);
+        double med   = segment_median_dQ_dx(sg1) / ctx.self.m_mip_dqdx_median;
         double ratio = segment_track_direct_length(sg1) / segment_track_length(sg1);
         if (sg1->flags_any(SegmentFlags::kShowerTopology) ||
             (sg1->flags_any(SegmentFlags::kShowerTrajectory) && med < 1.3) ||
@@ -3150,8 +3328,23 @@ static bool bad_reconstruction_2(NuEContext& ctx,
     FiducialUtilsPtr fiducial_utils;
     if (ctx.main_cluster && ctx.main_cluster->grouping())
         fiducial_utils = ctx.main_cluster->grouping()->get_fiducialutils();
-    bool other_fid = fiducial_utils
+    // doc 75 -- nue_sp_consistent_fv.  Legacy call passes NO tolerance at all
+    // (FiducialUtils zero-margin union).  The prototype's NULL-tolerance
+    // bad_reconstruction_2 (NeutrinoID_nue_tagger.h:3222,3230) resolves to its
+    // non-SCB polygons, which carry a baked-in UNIFORM boundary_dis_cut=3cm
+    // inset (ToyFiducial.cxx:118-131) -- so the faithful translation of "no
+    // tolerance" here is the configured fiducial WITH a uniform -3cm
+    // tolerance, not the bare box (doc 75 FV audit -- sbnd_pr_fv alone insets
+    // only 0.4-0.85cm from the zero-margin union and, being one box across
+    // both TPCs, also removes the |x|<0.45 CPA hole).
+    bool other_fid;
+    if (ctx.self.m_nue_fiducial) {
+        other_fid = contained_tol_nue(ctx.self.m_nue_fiducial, vtx_fit_pt(other_vertex),
+                                       std::vector<double>(6, -3.0*units::cm));
+    } else {
+        other_fid = fiducial_utils
                      ? fiducial_utils->inside_fiducial_volume(vtx_fit_pt(other_vertex)) : true;
+    }
 
     if (Eshower < 150*units::MeV && total_main_length/total_length > 0.95 &&
         ((n_ele == 0 && n_other > 0) ||
@@ -3170,7 +3363,7 @@ static bool bad_reconstruction_2(NuEContext& ctx,
     // ------------------------------------------------------------------
     // br3_3/br3_4: backward segments in main cluster
     // ------------------------------------------------------------------
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 9, sg, vertex);
     Point other_point  = (ray_length(Ray{vtx_fit_pt(vertex), sg_fits.front().point}) <=
                           ray_length(Ray{vtx_fit_pt(vertex), sg_fits.back().point}))
                          ? sg_fits.back().point : sg_fits.front().point;
@@ -3268,8 +3461,8 @@ static bool bad_reconstruction_2(NuEContext& ctx,
         Point ovp = vtx_fit_pt(other_vertex);
         size_t n_other_vtx_segs = boost::out_degree(other_vertex->get_descriptor(), ctx.graph);
         auto ov_vd = other_vertex->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(ov_vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(ov_vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             VertexPtr vtx_1 = find_other_vertex(ctx.graph, sg1, other_vertex);
             if (!vtx_1) continue;
@@ -3321,7 +3514,7 @@ static bool bad_reconstruction_2(NuEContext& ctx,
         if (sg1->cluster() != vertex->cluster()) continue;
         int n = (int)sg1->fits().size();
         for (int i = 0; i < n - 5; ++i) {
-            double med = segment_median_dQ_dx(sg1, i, i+5) / (43e3/units::cm);
+            double med = segment_median_dQ_dx(sg1, i, i+5) / ctx.self.m_mip_dqdx_median;
             if (med > max_dQ_dx) max_dQ_dx = med;
         }
     }
@@ -3395,7 +3588,7 @@ static bool track_overclustering(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
 
     VertexPtr  vertex = shower->get_start_vertex_and_type().first;
     SegmentPtr sg     = shower->start_segment();
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 10, sg, vertex);
 
     // Pre-fill shower internal sets
     IndexedSegmentSet shower_segs;
@@ -3408,9 +3601,9 @@ static bool track_overclustering(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
     auto shower_segs_at = [&](VertexPtr vtx) -> std::vector<SegmentPtr> {
         std::vector<SegmentPtr> out;
         if (!vtx || !vtx->descriptor_valid()) return out;
-        for (auto [eit,eend] = boost::out_edges(vtx->get_descriptor(), ctx.graph);
-             eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        // Stable edge-index order (consumers may pick first/last elements).
+        for (auto edesc : sorted_out_edges(vtx->get_descriptor(), ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[edesc].segment;
             if (sg1 && shower_segs.count(sg1)) out.push_back(sg1);
         }
         return out;
@@ -3433,7 +3626,7 @@ static bool track_overclustering(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
         bool flag_bad1 = false;
 
         int pdg = sg1->has_particle_info() ? sg1->particle_info()->pdg() : 0;
-        if (pdg != 11 && !sg1->dir_weak()) {
+        if (pdg != 11 && !ctx.self.seg_dir_weak(sg1)) {
             double len1 = segment_track_length(sg1);
             size_t max_deg = std::max(deg1, deg2);
             if (std::min(dis1, dis2) > 10*units::cm &&
@@ -3444,9 +3637,9 @@ static bool track_overclustering(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
         }
 
         double tmp_length = segment_track_length(sg1);
-        double dQ_dx_cut  = 0.8866 + 0.9533 * std::pow(18*units::cm/tmp_length, 0.4234);
+        double dQ_dx_cut  = ctx.self.muon_dqdx_cut(tmp_length);
         if (std::isinf(dQ_dx_cut) || std::isnan(dQ_dx_cut)) dQ_dx_cut = 10;
-        double med = segment_median_dQ_dx(sg1) / (43e3/units::cm);
+        double med = segment_median_dQ_dx(sg1) / ctx.self.m_mip_dqdx_median;
 
         // 7055_677_33891
         if (tmp_length > 12*units::cm &&
@@ -3456,7 +3649,7 @@ static bool track_overclustering(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
             flag_bad1 = true;
 
         ti.tro_1_v_particle_type.push_back(pdg);
-        ti.tro_1_v_flag_dir_weak.push_back(sg1->dir_weak());
+        ti.tro_1_v_flag_dir_weak.push_back(ctx.self.seg_dir_weak(sg1));
         ti.tro_1_v_min_dis.push_back(std::min(dis1,dis2) / units::cm);
         ti.tro_1_v_sg1_length.push_back(tmp_length / units::cm);
         ti.tro_1_v_shower_main_length.push_back(total_length_main / units::cm);
@@ -3502,7 +3695,16 @@ static bool track_overclustering(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
     }
 
     double stem_length_1 = 0;
-    for (SegmentPtr s : muon_segs) stem_length_1 += segment_track_length(s);
+    // doc pr/36 §10.5 (F4): address-ordered float sum; prototype identical
+    // (std::set<ProtoSegment*>).  Knob-on sums in graph-index order.  The
+    // tro_3 sum over the same (grown) set below gets the same treatment --
+    // a fourth live site the audit's §6 census missed.
+    {
+        std::vector<SegmentPtr> iter(muon_segs.begin(), muon_segs.end());
+        if (ctx.self.m_tagger_ordered_segment_sets)
+            std::sort(iter.begin(), iter.end(), SegmentIndexCmp{});
+        for (SegmentPtr s : iter) stem_length_1 += segment_track_length(s);
+    }
 
     // Shower direction for use in tro_2 cross-product check
     Vector dir_shower;
@@ -3644,7 +3846,13 @@ static bool track_overclustering(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
     }
 
     double stem_length_3 = 0;
-    for (SegmentPtr s : muon_segs) stem_length_3 += segment_track_length(s);
+    // doc pr/36 §10.5 (F4): see stem_length_1 above.
+    {
+        std::vector<SegmentPtr> iter(muon_segs.begin(), muon_segs.end());
+        if (ctx.self.m_tagger_ordered_segment_sets)
+            std::sort(iter.begin(), iter.end(), SegmentIndexCmp{});
+        for (SegmentPtr s : iter) stem_length_3 += segment_track_length(s);
+    }
     if (stem_length_3 > 120*units::cm) flag_bad3 = true;
 
     ti.tro_3_stem_length = stem_length_3 / units::cm;
@@ -3676,7 +3884,7 @@ static bool track_overclustering(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
             double angle2 = std::min(
                 std::fabs(M_PI/2.0 - dir1_stem.angle(drift_dir)) / M_PI * 180.0,
                 std::fabs(M_PI/2.0 - dir2.angle(drift_dir)) / M_PI * 180.0);
-            double med    = segment_median_dQ_dx(sg1) / (43e3/units::cm);
+            double med    = segment_median_dQ_dx(sg1) / ctx.self.m_mip_dqdx_median;
 
             // end_dQ_dx: dQ/dx at the vtx1 end of sg1
             const auto& f1 = sg1->fits();
@@ -3685,8 +3893,8 @@ static bool track_overclustering(NuEContext& ctx, ShowerPtr shower, TaggerInfo& 
                  ray_length(Ray{vtx_fit_pt(vtx1), f1.back().point}));
             int nf1 = (int)f1.size();
             double end_dQ_dx = vtx1_at_front
-                ? segment_median_dQ_dx(sg1, 0, std::min(6, nf1-1)) / (43e3/units::cm)
-                : segment_median_dQ_dx(sg1, std::max(0, nf1-7), nf1-1) / (43e3/units::cm);
+                ? segment_median_dQ_dx(sg1, 0, std::min(6, nf1-1)) / ctx.self.m_mip_dqdx_median
+                : segment_median_dQ_dx(sg1, std::max(0, nf1-7), nf1-1) / ctx.self.m_mip_dqdx_median;
 
             bool flag_bad4 = false;
             double dir2_mag = dir2.magnitude();
@@ -3816,7 +4024,7 @@ static int mip_identification(NuEContext& ctx,
     double Eshower = (shower->get_kine_best() != 0)
                      ? shower->get_kine_best() : shower->get_kine_charge();
 
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 11, sg, vertex);
 
     // Shower direction (same logic as single_shower / bad_reconstruction_1)
     Vector dir_shower;
@@ -3837,7 +4045,7 @@ static int mip_identification(NuEContext& ctx,
     if      (Eshower  < 300*units::MeV) dQ_dx_cut = 1.3;
 
     // Per-fit-point normalized dQ/dx along the stem (up to 20 points)
-    auto vec_dQ_dx = shower->get_stem_dQ_dx(vertex, sg, 20);
+    auto vec_dQ_dx = shower->get_stem_dQ_dx(vertex, sg, 20, ctx.self.m_mip_dqdx_median);
     // Ensure at least 2 elements for early accesses
     while (vec_dQ_dx.size() < 2) vec_dQ_dx.push_back(0.0);
 
@@ -3966,11 +4174,10 @@ static int mip_identification(NuEContext& ctx,
                         ? boost::out_degree(vertex->get_descriptor(), ctx.graph) : 0;
     int n_good_tracks = 0;
     if (vertex && vertex->descriptor_valid()) {
-        for (auto [eit,eend] = boost::out_edges(vertex->get_descriptor(), ctx.graph);
-             eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vertex->get_descriptor(), ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
-            if (!sg1->dir_weak() || segment_track_length(sg1) > 10*units::cm)
+            if (!ctx.self.seg_dir_weak(sg1) || segment_track_length(sg1) > 10*units::cm)
                 ++n_good_tracks;
         }
     }
@@ -4072,7 +4279,10 @@ static int mip_identification(NuEContext& ctx,
     for (ShowerPtr shower1 : ctx.showers) {
         if (shower1 == shower) continue;
         SegmentPtr sg1 = shower1->start_segment();
-        if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) continue;
+        if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) {
+            pr36_count_gate_skip(sg1, 8);  // doc pr/36 F2
+            continue;
+        }
         auto [vtx1, conn1] = shower1->get_start_vertex_and_type();
         double E1 = (shower1->get_kine_best() != 0)
                     ? shower1->get_kine_best() : shower1->get_kine_charge();
@@ -4257,7 +4467,10 @@ bool PatternAlgorithms::nue_tagger(
     if (mv_it != map_vertex_to_shower.end()) {
         for (ShowerPtr shower : mv_it->second) {
             SegmentPtr sg = shower->start_segment();
-            if (!sg || !sg->has_particle_info() || sg->particle_info()->pdg() != 11) continue;
+            if (!sg || !sg->has_particle_info() || sg->particle_info()->pdg() != 11) {
+                pr36_count_gate_skip(sg, 9);  // doc pr/36 F2
+                continue;
+            }
 
             double tmp_energy = (shower->get_kine_best() != 0)
                                 ? shower->get_kine_best() : shower->get_kine_charge();
@@ -4271,17 +4484,15 @@ bool PatternAlgorithms::nue_tagger(
                 if (vtx1->cluster() != sg->cluster()) continue;
                 if (!vtx1->descriptor_valid()) continue;
                 int cnt = 0;
-                for (auto [eit,eend] = boost::out_edges(vtx1->get_descriptor(), graph);
-                     eit != eend; ++eit)
-                    if (sh_segs.count(graph[*eit].segment)) ++cnt;
+                for (auto eit : sorted_out_edges(vtx1->get_descriptor(), graph)) 
+                    if (sh_segs.count(graph[eit].segment)) ++cnt;
                 if (cnt >= 3) ++n_3seg;
             }
 
             // Check sg is directly connected to main_vertex in the global graph
             bool sg_at_main = false;
-            for (auto [eit,eend] = boost::out_edges(main_vertex->get_descriptor(), graph);
-                 eit != eend; ++eit)
-                if (graph[*eit].segment == sg) { sg_at_main = true; break; }
+            for (auto eit : sorted_out_edges(main_vertex->get_descriptor(), graph)) 
+                if (graph[eit].segment == sg) { sg_at_main = true; break; }
 
             if (sg_at_main && (tmp_energy > 80*units::MeV ||
                                (tmp_energy > 60*units::MeV && n_segs >= 3 && n_3seg > 0))) {
@@ -4301,20 +4512,19 @@ bool PatternAlgorithms::nue_tagger(
     flag_nue = true;
 
     SegmentPtr sg = max_shower->start_segment();
-    Point test_p  = seg_endpoint_near(sg, vtx_fit_pt(main_vertex));
+    Point test_p  = seg_endpoint_near_vtx(*this, 12, sg, main_vertex);
     Vector dir_beam(0, 0, 1);
     Vector dir    = shower_cal_dir_3vector(*max_shower, test_p, 15*units::cm);
     double angle_beam = dir.angle(dir_beam) / M_PI * 180.0;
 
     // Count valid tracks at main_vertex
     int num_valid_tracks = 0;
-    for (auto [eit,eend] = boost::out_edges(main_vertex->get_descriptor(), graph);
-         eit != eend; ++eit) {
-        SegmentPtr sg1 = graph[*eit].segment;
+    for (auto eit : sorted_out_edges(main_vertex->get_descriptor(), graph)) {
+        SegmentPtr sg1 = graph[eit].segment;
         if (!sg1 || sg1 == sg) continue;
         double len1 = segment_track_length(sg1);
         if (!seg_is_shower(sg1) && (len1 > 8*units::cm ||
-            (!sg1->dir_weak() && len1 > 5*units::cm)))
+            (!seg_dir_weak(sg1) && len1 > 5*units::cm)))
             ++num_valid_tracks;
     }
 
@@ -4398,6 +4608,12 @@ bool PatternAlgorithms::nue_tagger(
 
     // track_overclustering
     if (track_overclustering(ctx, max_shower, ti)) flag_nue = false;
+
+    // doc pr/36 §10.8 (F7 = P4).  prototype (NeutrinoID_nue_tagger.h lines
+    // 257-260): if (flag_nue){ neutrino_type |= 1UL << 5; }.  The
+    // singlephoton counterpart (NeutrinoID_singlephoton_tagger.h:536-539) is
+    // commented out in the prototype and is deliberately NOT reproduced.
+    if (m_neutrino_type_bitmask && flag_nue) ti.neutrino_type |= 1 << 5;
 
     return flag_nue;
 }

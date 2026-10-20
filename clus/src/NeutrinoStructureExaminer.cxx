@@ -1,24 +1,140 @@
 #include "WireCellClus/NeutrinoPatternBase.h"
 #include "WireCellClus/PRSegmentFunctions.h"
+#include "WireCellClus/ExaminerPassBudget.h"
 
 #include "WireCellAux/Logger.h"
+#include "WireCellUtil/Spdlog.h" // for fmt, used by the pr/72 round 2 census
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <optional>
 
 using namespace WireCell::Clus::PR;
 using namespace WireCell::Clus;
 
 static auto s_log = WireCell::Log::logger("clus.NeutrinoPattern");
 
+// doc sbnd_xin/docs/pr/72 round 2: census call counter for
+// examine_structure_3's WCT_ES3_MERGE_CENSUS diagnostic (see below).
+// Only ever incremented when the census is enabled; otherwise dead.
+static std::atomic<long> s_es3_calls{0};
+
+namespace {
+    // doc sbnd_xin/docs/pr/64 round 8: examine_structure_final_1/_1p/_3 merge
+    // a short/duplicate/degenerate segment into a surviving neighbor,
+    // rebuilding the survivor's wcpts/fits/"main" cloud but never its
+    // "associate_points" cloud (the actual charge/blob association from
+    // clustering_points).  If the segment being deleted here had non-empty
+    // associate_points, those points are simply discarded with no
+    // replacement, and reassociate_cluster_orphans' any_orphan trigger
+    // (pr/59) never fires for a survivor that already had SOME points of
+    // its own -- see PatternAlgorithms::m_assoc_clear_on_merge's doc comment
+    // in NeutrinoPatternBase.h for the full mechanism and the 18259-18625
+    // case that found this.  No-op (and no mutation at all) when disabled or
+    // when the deleted segment had no associate_points -- byte-identical to
+    // before by construction.
+    void pr64_clear_survivor_on_merge(bool enabled, WireCell::Clus::PR::SegmentPtr loser,
+                                       WireCell::Clus::PR::SegmentPtr survivor) {
+        if (!enabled || !loser || !survivor) return;
+        auto dpc = loser->dpcloud("associate_points");
+        if (!dpc || dpc->npoints() == 0) return;
+        survivor->dpcloud("associate_points", nullptr);
+    }
+
+    // doc sbnd_xin/docs/pr/72 round 2: diagnostic-only helpers for
+    // examine_structure_3's WCT_ES3_MERGE_CENSUS (env-gated; unset => these
+    // are never called, no behavior change of any kind).  They deliberately
+    // DUPLICATE segment_cal_dir_3vector's and segment_median_dQ_dx's
+    // arithmetic bit-for-bit rather than reusing/wrapping those functions,
+    // because the census needs the point count and raw distance behind each
+    // figure -- a bare angle or median can't distinguish "no points in
+    // range" from "centroid exactly on the vertex" / "true zero contrast".
+    // The duplication never replaces a value production computes and never
+    // feeds back into the merge decision (18255-196649: see doc pr/72).
+
+    // Mirrors segment_cal_dir_3vector(seg, p, dis_cut) exactly (see
+    // PRSegmentFunctions.cxx), additionally reporting the point count n and
+    // the raw centroid distance d that a bare direction vector hides.
+    struct Es3DirScan {
+        WireCell::Vector dir{0, 0, 0};
+        int n = 0;
+        double d = -1;  // internal units; |centroid - p|; -1 sentinel when n == 0
+    };
+    Es3DirScan es3_census_dir_scan(WireCell::Clus::PR::SegmentPtr seg, const WireCell::Point& p, double dis_cut) {
+        Es3DirScan r;
+        if (!seg) return r;
+        WireCell::Point sum(0, 0, 0);
+        for (const auto& fit : seg->fits()) {
+            if ((fit.point - p).magnitude() < dis_cut) {
+                sum = sum + fit.point;
+                r.n++;
+            }
+        }
+        if (r.n == 0) return r;
+        WireCell::Point avg = sum * (1.0 / r.n);
+        WireCell::Vector v = avg - p;
+        r.d = v.magnitude();
+        if (r.d > 0) r.dir = v.norm();
+        return r;
+    }
+
+    // (180deg - angle between two unit vectors), the same convention
+    // examine_structure_3 uses for angle_10cm/angle_3cm: small = collinear.
+    // -1 when either scan found zero points in range -- callers must check
+    // n on both scans, not just this return value, before trusting it.
+    double es3_census_angle_deg(const Es3DirScan& a, const Es3DirScan& b) {
+        if (a.dir.magnitude() == 0 || b.dir.magnitude() == 0) return -1.0;
+        double cosv = a.dir.dot(b.dir) / (a.dir.magnitude() * b.dir.magnitude());
+        return (3.1415926 - std::acos(cosv)) / 3.1415926 * 180.0;
+    }
+
+    // Mirrors segment_median_dQ_dx's filter (fit.valid() && fit.dx > 0 &&
+    // fit.dQ >= 0) and formula (dQ / (dx + 1e-9)), median via nth_element --
+    // additionally reporting the surviving count, since 0 is the explicit
+    // "dQ/dx unavailable on this arm" marker (a segment fresh out of the
+    // last find_other_segments round can still carry the Fit{} default
+    // dQ=-1, which fails the filter entirely).  When vtx_point is non-null,
+    // splits by distance from it at cut (near: <cut, far: >=cut) so a short
+    // arm's near-vertex dQ/dx isn't diluted against a long arm's whole-track
+    // median.
+    struct Es3DqdxStat {
+        double median = -1;
+        int n = 0;
+    };
+    Es3DqdxStat es3_census_dqdx(WireCell::Clus::PR::SegmentPtr seg, const WireCell::Point* vtx_point, bool near, double cut) {
+        Es3DqdxStat st;
+        if (!seg) return st;
+        std::vector<double> vals;
+        for (const auto& fit : seg->fits()) {
+            if (!(fit.valid() && fit.dx > 0 && fit.dQ >= 0)) continue;
+            if (vtx_point) {
+                double dis = (fit.point - *vtx_point).magnitude();
+                if (near && !(dis < cut)) continue;
+                if (!near && !(dis >= cut)) continue;
+            }
+            vals.push_back(fit.dQ / (fit.dx + 1e-9));
+        }
+        st.n = static_cast<int>(vals.size());
+        if (!vals.empty()) {
+            size_t mid = vals.size() / 2;
+            std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+            st.median = vals[mid];
+        }
+        return st;
+    }
+}
+
 void PatternAlgorithms::examine_structure(Graph& graph, Facade::Cluster& cluster, TrackFitting& track_fitter, IDetectorVolumes::pointer dv){
     // Change 2 to 1 (merge two segments into one straight segment)
     if (examine_structure_2(graph, cluster, track_fitter, dv)) {
-        track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+        track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
     }
 
     // Straighten 1 (replace curved segments with straight lines)
     if (examine_structure_1(graph, cluster, track_fitter, dv)) {
-        track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+        track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
     }
 }
 
@@ -36,17 +152,18 @@ bool PatternAlgorithms::examine_structure_1(Graph& graph, Facade::Cluster& clust
         return false;
     }
     
-    // Iterate through all edges (segments) in the graph
-    auto [ebegin, eend] = boost::edges(graph);
-    for (auto eit = ebegin; eit != eend; ++eit) {
-        SegmentPtr sg = graph[*eit].segment;
-        
+    // Iterate through all edges (segments) in the graph, in stable edge-index
+    // order.  This loop rewrites segment paths in place (no graph mutation),
+    // so a snapshot vector is safe here.
+    for (const auto& ed : ordered_edges(graph)) {
+        SegmentPtr sg = graph[ed].segment;
+
         // Skip if segment doesn't belong to this cluster
         if (!sg || sg->cluster() != &cluster) continue;
-        
+
         // Get segment properties
         double length = segment_track_length(sg);
-        double medium_dQ_dx = segment_median_dQ_dx(sg) / (43e3/units::cm);
+        double medium_dQ_dx = segment_median_dQ_dx(sg) / m_mip_dqdx_median;
         
         // Check if segment is short enough and has reasonable dQ/dx
         if (length < 5*units::cm || (length < 8*units::cm && medium_dQ_dx > 1.5)) {
@@ -91,7 +208,7 @@ bool PatternAlgorithms::examine_structure_1(Graph& graph, Facade::Cluster& clust
                 auto test_wpid = dv->contained_by(test_p);
                 if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                     auto temp_p_raw = transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
-                    if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0)) {
+                    if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0, m_good_point_pitch_frac)) {
                         n_bad++;
                     }
                 } else {
@@ -180,7 +297,9 @@ bool PatternAlgorithms::examine_structure_2(Graph& graph, Facade::Cluster& clust
     }
     
     bool flag_continue = true;
+    ExaminerPassCounter epb_examine_structure_2("examine_structure_2", cluster.get_cluster_id());   // doc pdvd/26 round 2
     while (flag_continue) {
+        if (epb_examine_structure_2.exceeded()) break;
         flag_continue = false;
 
         // Iterate in insertion order for deterministic results
@@ -194,15 +313,21 @@ bool PatternAlgorithms::examine_structure_2(Graph& graph, Facade::Cluster& clust
             auto vd = vtx->get_descriptor();
             if (boost::degree(vd, graph) != 2) continue;
 
-            // Get the two segments connected to this vertex
-            auto edge_range = boost::out_edges(vd, graph);
-            auto eit = edge_range.first;
-            SegmentPtr sg1 = graph[*eit].segment;
-            ++eit;
-            SegmentPtr sg2 = graph[*eit].segment;
-            
+            // doc pr/48: never merge through a protected break vertex (the
+            // two-end dQ/dx break's straight class-A junction is exactly the
+            // geometry this straight-line test re-merges).  No-op when no
+            // vertex carries the flag => byte-identical.
+            if (vtx->flags_any(VertexFlags::kProtectedBreak)) continue;
+
+            // Get the two segments connected to this vertex, in stable
+            // edge-index order: sg1/sg2 determine the direction (vtx1->vtx2)
+            // of the merged replacement segment.
+            auto sorted_edges_2 = sorted_out_edges(vd, graph);
+            SegmentPtr sg1 = graph[sorted_edges_2[0]].segment;
+            SegmentPtr sg2 = graph[sorted_edges_2[1]].segment;
+
             if (!sg1 || !sg2) continue;
-            
+
             // double length1 = segment_track_length(sg1);
             // double length2 = segment_track_length(sg2);
             
@@ -245,7 +370,7 @@ bool PatternAlgorithms::examine_structure_2(Graph& graph, Facade::Cluster& clust
                 auto test_wpid = dv->contained_by(test_p);
                 if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                     auto temp_p_raw = transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
-                    if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0)) {
+                    if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0, m_good_point_pitch_frac)) {
                         n_bad++;
                     }
                 } else {
@@ -357,11 +482,28 @@ bool PatternAlgorithms::examine_structure_2(Graph& graph, Facade::Cluster& clust
 }
 
 bool PatternAlgorithms::examine_structure_3(Graph& graph, Facade::Cluster& cluster, TrackFitting& track_fitter, IDetectorVolumes::pointer dv){
+    // doc pr/72 round 2: log-only, env-gated (WCT_ES3_MERGE_CENSUS unset =>
+    // es3_census is false, nothing gated on it below ever runs -- no log
+    // lines, no extra computation, no behavior change of any kind).  See
+    // the ES3PB/ES3CENSUS/ES3MERGE blocks below and the es3_census_* helpers
+    // at the top of this file.  es3_call disambiguates multiple invocations
+    // of this function within one process; es3_sweep disambiguates the
+    // re-scan this function does after every merge (the while loop below --
+    // a declined junction is re-examined once per sweep, and only the
+    // terminal sweep, the one with no merge, enumerates every surviving
+    // junction).
+    static const bool es3_census = std::getenv("WCT_ES3_MERGE_CENSUS") != nullptr;
+    const long es3_call = es3_census ? ++s_es3_calls : -1;
+    int es3_sweep = -1;
+
     bool flag_update = false;
     bool flag_continue = true;
-    
+
+    ExaminerPassCounter epb_examine_structure_3("examine_structure_3", cluster.get_cluster_id());   // doc pdvd/26 round 2
     while (flag_continue) {
+        if (epb_examine_structure_3.exceeded()) break;
         flag_continue = false;
+        es3_sweep++;
 
         // Iterate in insertion order for deterministic results
         for (const auto& vd_cur : ordered_nodes(graph)) {
@@ -374,15 +516,32 @@ bool PatternAlgorithms::examine_structure_3(Graph& graph, Facade::Cluster& clust
             auto vd = vtx->get_descriptor();
             if (boost::degree(vd, graph) != 2) continue;
 
-            // Get the two segments connected to this vertex
-            auto edge_range = boost::out_edges(vd, graph);
-            auto eit = edge_range.first;
-            SegmentPtr sg1 = graph[*eit].segment;
-            ++eit;
-            SegmentPtr sg2 = graph[*eit].segment;
-            
+            // doc pr/72 round 2: log-only, env-gated (WCT_ES3_MERGE_CENSUS)
+            // census of every degree-2 junction skipped because it is
+            // already protected, so the population report can account for
+            // every degree-2 vertex ES3 sees -- not just the ones it merges
+            // or declines on angle grounds.  No-op when disabled.
+            if (es3_census && vtx->flags_any(VertexFlags::kProtectedBreak)) {
+                WireCell::Point pb_point = vtx->fit().valid() ? vtx->fit().point : vtx->wcpt().point;
+                SPDLOG_LOGGER_DEBUG(s_log,
+                    "ES3PB call={} sweep={} clus={} vtx=({:.2f},{:.2f},{:.2f})",
+                    es3_call, es3_sweep, cluster.ident(),
+                    pb_point.x()/units::cm, pb_point.y()/units::cm, pb_point.z()/units::cm);
+            }
+
+            // doc pr/48: never merge through a protected break vertex.
+            // No-op when no vertex carries the flag => byte-identical.
+            if (vtx->flags_any(VertexFlags::kProtectedBreak)) continue;
+
+            // Get the two segments connected to this vertex, in stable
+            // edge-index order: sg1/sg2 determine the direction of the
+            // merged replacement segment.
+            auto sorted_edges_2 = sorted_out_edges(vd, graph);
+            SegmentPtr sg1 = graph[sorted_edges_2[0]].segment;
+            SegmentPtr sg2 = graph[sorted_edges_2[1]].segment;
+
             if (!sg1 || !sg2) continue;
-            
+
             // Get the other vertices (endpoints)
             VertexPtr vtx1 = find_other_vertex(graph, sg1, vtx);
             VertexPtr vtx2 = find_other_vertex(graph, sg2, vtx);
@@ -395,7 +554,91 @@ bool PatternAlgorithms::examine_structure_3(Graph& graph, Facade::Cluster& clust
             // Calculate direction vectors at 10cm
             WireCell::Vector dir1 = segment_cal_dir_3vector(sg1, vtx_point, 10*units::cm);
             WireCell::Vector dir2 = segment_cal_dir_3vector(sg2, vtx_point, 10*units::cm);
-            
+
+            // doc pr/72 round 2: log-only, env-gated (WCT_ES3_MERGE_CENSUS)
+            // census of every degree-2 junction ES3 evaluates -- merged and
+            // declined alike (production's TRACE at the merge site below
+            // only fires on an actual merge, so declined junctions
+            // otherwise leave no trace).  Placed here, before the
+            // zero-magnitude `continue` right below, so degenerate
+            // (direction-undetermined) junctions are captured too.
+            // Deliberately recomputes its own independent multi-radius scan
+            // (es3_census_dir_scan -- bit-identical formula to
+            // segment_cal_dir_3vector, see that helper's comment) rather
+            // than reusing dir1/dir2 above, so this block is fully
+            // self-contained: it only READS graph/segment/vertex state,
+            // never dir1/dir2/angle_10cm, and the unedited lines below are
+            // untouched regardless of whether this block runs.
+            if (es3_census) {
+                static const std::array<double, 6> radii_cm = {2.0, 3.0, 5.0, 10.0, 15.0, 20.0};
+
+                WireCell::Point vtx1_point = vtx1->fit().valid() ? vtx1->fit().point : vtx1->wcpt().point;
+                WireCell::Point vtx2_point = vtx2->fit().valid() ? vtx2->fit().point : vtx2->wcpt().point;
+
+                long deg1 = vtx1->descriptor_valid() ? static_cast<long>(boost::degree(vtx1->get_descriptor(), graph)) : -1;
+                long deg2 = vtx2->descriptor_valid() ? static_cast<long>(boost::degree(vtx2->get_descriptor(), graph)) : -1;
+
+                double len1 = segment_track_length(sg1);
+                double len2 = segment_track_length(sg2);
+                double dlen1 = segment_track_direct_length(sg1);
+                double dlen2 = segment_track_direct_length(sg2);
+                double dev1 = segment_track_max_deviation(sg1);
+                double dev2 = segment_track_max_deviation(sg2);
+
+                Es3DqdxStat q1w = es3_census_dqdx(sg1, nullptr, false, 0);
+                Es3DqdxStat q2w = es3_census_dqdx(sg2, nullptr, false, 0);
+                Es3DqdxStat q1n = es3_census_dqdx(sg1, &vtx_point, true, 5 * units::cm);
+                Es3DqdxStat q2n = es3_census_dqdx(sg2, &vtx_point, true, 5 * units::cm);
+                Es3DqdxStat q1f = es3_census_dqdx(sg1, &vtx_point, false, 5 * units::cm);
+                Es3DqdxStat q2f = es3_census_dqdx(sg2, &vtx_point, false, 5 * units::cm);
+                double mip1 = (q1w.n > 0 && m_mip_dqdx_median != 0) ? q1w.median / m_mip_dqdx_median : -1.0;
+                double mip2 = (q2w.n > 0 && m_mip_dqdx_median != 0) ? q2w.median / m_mip_dqdx_median : -1.0;
+
+                std::string line = fmt::format(
+                    "ES3CENSUS call={} sweep={} clus={} "
+                    "vtx=({:.2f},{:.2f},{:.2f}) v1=({:.2f},{:.2f},{:.2f}) v2=({:.2f},{:.2f},{:.2f}) "
+                    "vfit={} v1fit={} v2fit={} "
+                    "deg1={} deg2={} pb1={} pb2={} ngv={} nge={} "
+                    "len1={:.3f} len2={:.3f} dlen1={:.3f} dlen2={:.3f} dev1={:.3f} dev2={:.3f} "
+                    "nfit1={} nfit2={} nwcp1={} nwcp2={} "
+                    "q1={:.3f} q2={:.3f} nq1={} nq2={} "
+                    "qn1={:.3f} qn2={:.3f} nqn1={} nqn2={} qf1={:.3f} qf2={:.3f} nqf1={} nqf2={}",
+                    es3_call, es3_sweep, cluster.ident(),
+                    vtx_point.x()/units::cm, vtx_point.y()/units::cm, vtx_point.z()/units::cm,
+                    vtx1_point.x()/units::cm, vtx1_point.y()/units::cm, vtx1_point.z()/units::cm,
+                    vtx2_point.x()/units::cm, vtx2_point.y()/units::cm, vtx2_point.z()/units::cm,
+                    vtx->fit().valid() ? 1 : 0, vtx1->fit().valid() ? 1 : 0, vtx2->fit().valid() ? 1 : 0,
+                    deg1, deg2,
+                    vtx1->flags_any(VertexFlags::kProtectedBreak) ? 1 : 0,
+                    vtx2->flags_any(VertexFlags::kProtectedBreak) ? 1 : 0,
+                    static_cast<long>(boost::num_vertices(graph)), static_cast<long>(boost::num_edges(graph)),
+                    len1/units::cm, len2/units::cm, dlen1/units::cm, dlen2/units::cm, dev1/units::cm, dev2/units::cm,
+                    sg1->fits().size(), sg2->fits().size(), sg1->wcpts().size(), sg2->wcpts().size(),
+                    mip1, mip2, q1w.n, q2w.n,
+                    q1n.median, q2n.median, q1n.n, q2n.n, q1f.median, q2f.median, q1f.n, q2f.n);
+
+                double ang3_c = -1.0, ang10_c = -1.0;
+                for (double r_cm : radii_cm) {
+                    Es3DirScan a = es3_census_dir_scan(sg1, vtx_point, r_cm * units::cm);
+                    Es3DirScan b = es3_census_dir_scan(sg2, vtx_point, r_cm * units::cm);
+                    double ang = es3_census_angle_deg(a, b);
+                    double dA1_cm = (a.n > 0) ? a.d / units::cm : -1.0;
+                    double dA2_cm = (b.n > 0) ? b.d / units::cm : -1.0;
+                    line += fmt::format(" R{}: ang={:.3f} nA1={} dA1={:.3f} nA2={} dA2={:.3f}",
+                        static_cast<int>(r_cm), ang, a.n, dA1_cm, b.n, dA2_cm);
+                    if (r_cm == 3.0) ang3_c = ang;
+                    if (r_cm == 10.0) ang10_c = ang;
+                }
+
+                bool pass10_c = (ang10_c >= 0) && (ang10_c < 18);
+                bool pass3_c = (ang3_c >= 0) && (ang3_c < 27);
+                bool predmerge_c = pass10_c && pass3_c;
+                line += fmt::format(" ang10={:.3f} ang3={:.3f} pass10={} pass3={} predmerge={}",
+                    ang10_c, ang3_c, pass10_c ? 1 : 0, pass3_c ? 1 : 0, predmerge_c ? 1 : 0);
+
+                SPDLOG_LOGGER_DEBUG(s_log, "{}", line);
+            }
+
             if (dir1.magnitude() == 0 || dir2.magnitude() == 0) continue;
 
             // Calculate 10cm angle (180 - angle between directions)
@@ -412,8 +655,44 @@ bool PatternAlgorithms::examine_structure_3(Graph& graph, Facade::Cluster& clust
                 
                 // Check if segments are nearly collinear (small 3cm angle)
                 if (angle_3cm < 27) {
+                    // doc pr/72 round 2: guard against merging a genuine
+                    // near-vertex track stub into an unrelated shower/track
+                    // trunk (18255-196649).  Default OFF (m_es3_stub_guard
+                    // false) -- when off, es3_stub_suppress is never called
+                    // and this block is a no-op, so the merge below is
+                    // reached exactly as before by construction (M10-style
+                    // guard, not an edit to the angle arithmetic above).
+                    // See Es3StubGuardParams' doc comment
+                    // (PRSegmentFunctions.h) for the 117-event fit that
+                    // chose the defaults and PatternAlgorithms::m_es3_stub_guard*
+                    // (NeutrinoPatternBase.h) for the byte-identity argument.
+                    if (m_es3_stub_guard) {
+                        double len1_g = segment_track_length(sg1);
+                        double len2_g = segment_track_length(sg2);
+                        bool sg1_is_short = len1_g <= len2_g;
+                        double len_short = sg1_is_short ? len1_g : len2_g;
+                        double len_long  = sg1_is_short ? len2_g : len1_g;
+                        int nfit_short = static_cast<int>((sg1_is_short ? sg1 : sg2)->fits().size());
+                        int nfit_long  = static_cast<int>((sg1_is_short ? sg2 : sg1)->fits().size());
+                        VertexPtr vtx_short = sg1_is_short ? vtx1 : vtx2;
+                        int deg_short = vtx_short->descriptor_valid()
+                            ? static_cast<int>(boost::degree(vtx_short->get_descriptor(), graph)) : -1;
+
+                        Es3StubGuardParams sg_params;
+                        sg_params.stub_max = m_es3sg_stub_max;
+                        sg_params.len_ratio = m_es3sg_len_ratio;
+                        sg_params.ang3_min = m_es3sg_ang3_min;
+                        sg_params.ang_ratio = m_es3sg_ang_ratio;
+                        sg_params.require_terminal = m_es3sg_require_terminal;
+
+                        if (es3_stub_suppress(len_short, len_long, angle_3cm, angle_10cm,
+                                               deg_short, nfit_short, nfit_long, sg_params)) {
+                            continue;
+                        }
+                    }
+
                     SPDLOG_LOGGER_TRACE(s_log, "examine_structure: Cluster: {} Merge two segments into one according to angle {}° (10cm) and {}° (3cm)", cluster.ident(), angle_10cm, angle_3cm);
-                    
+
                     // Merge the two segments by combining their WCPoint lists.
                     // Use graph topology to determine orientation — i.e. which wcpt
                     // endpoint of each segment is at the shared vertex (vtx) — rather
@@ -460,6 +739,28 @@ bool PatternAlgorithms::examine_structure_3(Graph& graph, Facade::Cluster& clust
                     }
 
                     if (merged_wcpts.empty()) continue;  // degenerate: both wcpts lists empty
+
+                    // doc pr/72 round 2: log-only, env-gated
+                    // (WCT_ES3_MERGE_CENSUS) ground truth that production
+                    // actually merged this junction, for cross-checking
+                    // against the ES3CENSUS line above (every ES3MERGE must
+                    // coordinate-match an ES3CENSUS line with
+                    // ang10<18 && ang3<27 && predmerge=1).  Emitted before
+                    // add_segment/remove_segment/remove_vertex below so vtx/
+                    // vtx1/vtx2 are still valid and merged_wcpts is final.
+                    if (es3_census) {
+                        WireCell::Point vtx1_point = vtx1->fit().valid() ? vtx1->fit().point : vtx1->wcpt().point;
+                        WireCell::Point vtx2_point = vtx2->fit().valid() ? vtx2->fit().point : vtx2->wcpt().point;
+                        SPDLOG_LOGGER_DEBUG(s_log,
+                            "ES3MERGE call={} sweep={} clus={} vtx=({:.2f},{:.2f},{:.2f}) "
+                            "v1=({:.2f},{:.2f},{:.2f}) v2=({:.2f},{:.2f},{:.2f}) "
+                            "ang10={:.3f} ang3={:.3f} merged_nwcp={}",
+                            es3_call, es3_sweep, cluster.ident(),
+                            vtx_point.x()/units::cm, vtx_point.y()/units::cm, vtx_point.z()/units::cm,
+                            vtx1_point.x()/units::cm, vtx1_point.y()/units::cm, vtx1_point.z()/units::cm,
+                            vtx2_point.x()/units::cm, vtx2_point.y()/units::cm, vtx2_point.z()/units::cm,
+                            angle_10cm, angle_3cm, merged_wcpts.size());
+                    }
 
                     // Create new segment with merged points
                     auto new_seg = make_segment();
@@ -603,7 +904,7 @@ bool PatternAlgorithms::examine_structure_4(VertexPtr vertex, bool flag_final_ve
                 auto test_wpid1 = dv->contained_by(test_p1);
                 if (test_wpid1.face() != -1 && test_wpid1.apa() != -1) {
                     auto temp_p_raw = transform->backward(test_p1, cluster_t0, test_wpid1.face(), test_wpid1.apa());
-                    if (!grouping->is_good_point(temp_p_raw, test_wpid1.apa(), test_wpid1.face(), 0.3*units::cm, 0, 0)) {
+                    if (!grouping->is_good_point(temp_p_raw, test_wpid1.apa(), test_wpid1.face(), 0.3*units::cm, 0, 0, m_good_point_pitch_frac)) {
                         n_bad++;
                     }
                 } else {
@@ -718,9 +1019,9 @@ bool PatternAlgorithms::crawl_segment(Graph& graph, Facade::Cluster& cluster, Se
     {
         // Collect (edge_index, segment, ref_point) triples, then sort by edge_index
         std::vector<std::tuple<int, SegmentPtr, Facade::geo_point_t>> tmp;
-        auto edge_range = boost::out_edges(vd, graph);
-        for (auto eit = edge_range.first; eit != edge_range.second; ++eit) {
-            SegmentPtr sg = graph[*eit].segment;
+        const auto edge_range = sorted_out_edges(vd, graph);
+        for (auto eit : edge_range) {
+            SegmentPtr sg = graph[eit].segment;
             if (!sg || sg == seg) continue;
 
             const auto& fits = sg->fits();
@@ -735,7 +1036,7 @@ bool PatternAlgorithms::crawl_segment(Graph& graph, Facade::Cluster& cluster, Se
                     min_point = fits[i].point;
                 }
             }
-            tmp.emplace_back(graph[*eit].index, sg, min_point);
+            tmp.emplace_back(graph[eit].index, sg, min_point);
         }
         std::sort(tmp.begin(), tmp.end(),
                   [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
@@ -803,7 +1104,7 @@ bool PatternAlgorithms::crawl_segment(Graph& graph, Facade::Cluster& cluster, Se
                 auto test_wpid = dv->contained_by(test_p);
                 if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                     auto temp_p_raw = transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
-                    if (!cluster.grouping()->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2 * units::cm, 0, 0)) {
+                    if (!cluster.grouping()->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2 * units::cm, 0, 0, m_good_point_pitch_frac)) {
                         n_bad++;
                         if (n_bad > 0) break;
                     }
@@ -951,7 +1252,7 @@ bool PatternAlgorithms::crawl_segment(Graph& graph, Facade::Cluster& cluster, Se
         }
         
         // Perform multi-tracking
-        track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+        track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
         
         flag = true;
         break;
@@ -1002,10 +1303,10 @@ void PatternAlgorithms::examine_segment(Graph& graph, Facade::Cluster& cluster, 
             
             // Check angles with other connected segments
             auto vd = vtx->get_descriptor();
-            auto edge_range = boost::out_edges(vd, graph);
+            const auto edge_range = sorted_out_edges(vd, graph);
             
-            for (auto eit = edge_range.first; eit != edge_range.second; ++eit) {
-                SegmentPtr sg1 = graph[*eit].segment;
+            for (auto eit : edge_range) {
+                SegmentPtr sg1 = graph[eit].segment;
                 if (!sg1 || sg1 == sg) continue;
                 
                 auto dir3 = segment_cal_dir_3vector(sg1, vtx_point, 2 * units::cm);
@@ -1064,10 +1365,10 @@ void PatternAlgorithms::examine_segment(Graph& graph, Facade::Cluster& cluster, 
                     
                     if (vtx2->descriptor_valid()) {
                         auto v2d = vtx2->get_descriptor();
-                        auto edge_range = boost::out_edges(v2d, graph);
+                        const auto edge_range = sorted_out_edges(v2d, graph);
                         
-                        for (auto eit = edge_range.first; eit != edge_range.second; ++eit) {
-                            SegmentPtr sg = graph[*eit].segment;
+                        for (auto eit : edge_range) {
+                            SegmentPtr sg = graph[eit].segment;
                             if (!sg) continue;
                             
                             // Check if this segment is also connected to vtx1
@@ -1104,11 +1405,12 @@ void PatternAlgorithms::examine_segment(Graph& graph, Facade::Cluster& cluster, 
         if (!vtx->descriptor_valid()) continue;
         
         auto vd = vtx->get_descriptor();
-        auto edge_range = boost::out_edges(vd, graph);
-        
+
+        // Stable edge-index order: the dedup below keeps the FIRST segment of
+        // each endpoint pair, so which duplicate survives depends on order.
         std::vector<SegmentPtr> tmp_segments;
-        for (auto eit = edge_range.first; eit != edge_range.second; ++eit) {
-            SegmentPtr sg = graph[*eit].segment;
+        for (auto edesc : sorted_out_edges(vd, graph)) {
+            SegmentPtr sg = graph[edesc].segment;
             if (sg) tmp_segments.push_back(sg);
         }
         
@@ -1262,6 +1564,28 @@ bool PatternAlgorithms::examine_vertices_1p(Graph&graph, VertexPtr v1, VertexPtr
 
             for (size_t i = 0; i < seg_fits.size(); i++) {
                 auto test_wpid = dv->contained_by(seg_fits[i].point);
+                // Same guard as the pts_2 loop below (:~1330) and the vertex
+                // points at :1185: a fit point outside every detector volume
+                // yields apa()/face() == -1 and backward() is then
+                // m_trigger_offsets.at(-1) -> std::out_of_range, aborting the
+                // job (the class-C crash shape, doc pr/11 sec 6.3).  Skip the
+                // point rather than the event.
+                if (test_wpid.apa() == -1 || test_wpid.face() == -1) {
+                    // doc pr/30 §11, F2 site 2 (was P9).  flag_dead starts
+                    // true and only a LIVE point clears it, so a skipped point
+                    // votes "this segment lies in a dead region" -- the
+                    // opposite polarity to site 1 in the very same stage.
+                    //
+                    // The prototype's answer: get_closest_dead_chs() looks the
+                    // channel up in dead_uchs/dead_vchs/dead_wchs; an
+                    // out-of-detector point projects to a channel that is not
+                    // in those maps, so it returns FALSE, and the prototype's
+                    // caller (NeutrinoID_proto_vertex.h:3094) then sets
+                    // flag_dead = false.  EXACT parity restoration.
+                    g_port_audit.oov_dead_scan.fetch_add(1, std::memory_order_relaxed);
+                    if (m_oov_prototype_parity) { flag_dead = false; break; }
+                    continue;
+                }
                 auto p_raw = transform->backward(seg_fits[i].point, cluster_t0, test_wpid.face(), test_wpid.apa());
                 if (!cluster.grouping()->get_closest_dead_chs(p_raw, 1, test_wpid.apa(), test_wpid.face(), pind)) {
                     flag_dead = false;
@@ -1275,9 +1599,9 @@ bool PatternAlgorithms::examine_vertices_1p(Graph&graph, VertexPtr v1, VertexPtr
                 // Check if the third view forms a line
                 // Find the other segment connected to v1
                 SegmentPtr sg1 = nullptr;
-                auto edge_range = boost::out_edges(v1d, graph);
-                for (auto eit = edge_range.first; eit != edge_range.second; ++eit) {
-                    SegmentPtr temp_sg = graph[*eit].segment;
+                const auto edge_range = sorted_out_edges(v1d, graph);
+                for (auto eit : edge_range) {
+                    SegmentPtr temp_sg = graph[eit].segment;
                     if (temp_sg && temp_sg != sg) {
                         sg1 = temp_sg;
                         break;
@@ -1301,6 +1625,12 @@ bool PatternAlgorithms::examine_vertices_1p(Graph&graph, VertexPtr v1, VertexPtr
                 // equals what pind=0 would return.  p_wire_ch is the plane-correct channel.
                 for (size_t i = 0; i < pts_2.size(); i++) {
                     auto test_wpid = dv->contained_by(pts_2[i].point);
+                    // Same guard the vertex points get at :1185 -- a fit point outside
+                    // every detector volume yields apa()/face() == -1, and fastgeom()
+                    // then does m_anodes.at(-1) (Facade_Grouping.cxx:741), aborting the
+                    // job with std::out_of_range "map::at" (SBND MCP2025C evt 49951).
+                    // Skip the point rather than the event.
+                    if (test_wpid.apa() == -1 || test_wpid.face() == -1) continue;
                     auto [p_t_raw, p_wire_ch] = cluster.grouping()->convert_3Dpoint_time_ch(pts_2[i].point, test_wpid.apa(), test_wpid.face(), pind);
                     double p_t = double(p_t_raw) / ntime_ticks;
                     double p_wire = p_wire_ch;
@@ -1345,7 +1675,7 @@ bool PatternAlgorithms::examine_vertices_1p(Graph&graph, VertexPtr v1, VertexPtr
                         auto test_wpid = dv->contained_by(test_p);
                         if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                             auto temp_p_raw = transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
-                            if (!cluster.grouping()->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2 * units::cm, 0, 0)) {
+                            if (!cluster.grouping()->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2 * units::cm, 0, 0, m_good_point_pitch_frac)) {
                                 n_bad++;
                             }
                         }
@@ -1386,13 +1716,18 @@ bool PatternAlgorithms::examine_vertices_1(Graph&graph, Facade::Cluster&cluster,
         // Check if vertex has exactly 2 connections (potential candidate)
         if (boost::degree(vd_cur, graph) != 2) continue;
 
+        // doc pr/48: a protected break vertex is never a relocation/merge
+        // candidate.  No-op when no vertex carries the flag.
+        if (vtx->flags_any(VertexFlags::kProtectedBreak)) continue;
+
         // Get the two connected segments and cache their neighbor vertices,
-        // avoiding redundant find_other_vertex calls later.
+        // avoiding redundant find_other_vertex calls later.  Stable
+        // edge-index order: the loop below merges at the FIRST qualifying
+        // segment.
         std::vector<std::pair<SegmentPtr, VertexPtr>> seg_vtx_pairs;
-        auto [ebegin, eend] = boost::out_edges(vd_cur, graph);
-        for (auto eit = ebegin; eit != eend; ++eit) {
-            SegmentPtr seg = graph[*eit].segment;
-            if (seg) seg_vtx_pairs.emplace_back(seg, graph[boost::target(*eit, graph)].vertex);
+        for (auto edesc : sorted_out_edges(vd_cur, graph)) {
+            SegmentPtr seg = graph[edesc].segment;
+            if (seg) seg_vtx_pairs.emplace_back(seg, graph[boost::target(edesc, graph)].vertex);
         }
         
         if (seg_vtx_pairs.size() != 2) continue;
@@ -1470,7 +1805,7 @@ bool PatternAlgorithms::examine_vertices_1(Graph&graph, Facade::Cluster&cluster,
         remove_vertex(graph, v1);
         
         // Update tracking
-        track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+        track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
     }
     
     return flag_continue;
@@ -1492,9 +1827,14 @@ bool PatternAlgorithms::examine_vertices_2(Graph&graph, Facade::Cluster&cluster,
         auto vertices = find_vertices(graph, segment);
         VertexPtr vtx1 = vertices.first;
         VertexPtr vtx2 = vertices.second;
-        
+
         if (!vtx1 || !vtx2) continue;
-        
+
+        // doc pr/48: never collapse a segment whose endpoint is a protected
+        // break vertex.  No-op when no vertex carries the flag.
+        if (vtx1->flags_any(VertexFlags::kProtectedBreak) ||
+            vtx2->flags_any(VertexFlags::kProtectedBreak)) continue;
+
         // Get positions (prefer fit point over wcpt)
         Facade::geo_point_t p1 = vtx1->fit().valid() ? vtx1->fit().point : vtx1->wcpt().point;
         Facade::geo_point_t p2 = vtx2->fit().valid() ? vtx2->fit().point : vtx2->wcpt().point;
@@ -1533,13 +1873,14 @@ bool PatternAlgorithms::examine_vertices_2(Graph&graph, Facade::Cluster&cluster,
             // Remove the segment between v1 and v2
             remove_segment(graph, sg);
             
-            // Collect all segments connected to v2 (excluding the one we just removed)
+            // Collect all segments connected to v2 (excluding the one we just
+            // removed).  Stable edge-index order: each is replaced by a NEW
+            // segment below, assigning new graph indices in this order.
             std::vector<SegmentPtr> v2_segments;
             if (v2->descriptor_valid()) {
                 auto vd2 = v2->get_descriptor();
-                auto [ebegin2, eend2] = boost::out_edges(vd2, graph);
-                for (auto eit2 = ebegin2; eit2 != eend2; ++eit2) {
-                    SegmentPtr seg2 = graph[*eit2].segment;
+                for (auto edesc : sorted_out_edges(vd2, graph)) {
+                    SegmentPtr seg2 = graph[edesc].segment;
                     if (seg2) {
                         v2_segments.push_back(seg2);
                     }
@@ -1589,7 +1930,7 @@ bool PatternAlgorithms::examine_vertices_2(Graph&graph, Facade::Cluster&cluster,
             }
             
             // Update tracking
-            track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+            track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
         }else{
             flag_continue = false;
         }
@@ -1629,9 +1970,9 @@ bool PatternAlgorithms::examine_vertices_4p(Graph&graph, VertexPtr v1, VertexPtr
     if (!v1->descriptor_valid()) return true;
     auto vd1 = v1->get_descriptor();
     
-    auto [ebegin, eend] = boost::out_edges(vd1, graph);
-    for (auto eit = ebegin; eit != eend; ++eit) {
-        SegmentPtr sg = graph[*eit].segment;
+    const auto ebegin_edges = sorted_out_edges(vd1, graph);
+    for (auto eit : ebegin_edges) {
+        SegmentPtr sg = graph[eit].segment;
         if (!sg || sg == sg1) continue;
         
         // Get segment points (fit points, matching prototype's get_point_vec())
@@ -1670,7 +2011,7 @@ bool PatternAlgorithms::examine_vertices_4p(Graph&graph, VertexPtr v1, VertexPtr
             auto test_wpid = dv->contained_by(test_p);
             if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                 auto temp_p_raw = transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
-                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2 * units::cm, 0, 0)) {
+                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2 * units::cm, 0, 0, m_good_point_pitch_frac)) {
                     n_bad++;
                 }
             }
@@ -1704,9 +2045,11 @@ bool PatternAlgorithms::examine_vertices_4(Graph&graph, Facade::Cluster&cluster,
     // Snapshot all segments before iterating — the loop body calls remove_segment/add_segment
     // which would invalidate boost::edges iterators (even with listS storage the removed
     // edge's list node is freed, making the live iterator dangle on the next ++eit).
+    // Stable edge-index order: the first passing segment triggers a merge and
+    // restart, so iteration order is a topology decision.
     std::vector<SegmentPtr> all_segments;
-    for (auto [eit, eend] = boost::edges(graph); eit != eend; ++eit) {
-        SegmentPtr s = graph[*eit].segment;
+    for (const auto& ed : ordered_edges(graph)) {
+        SegmentPtr s = graph[ed].segment;
         if (s && s->cluster() == &cluster) all_segments.push_back(s);
     }
 
@@ -1752,17 +2095,22 @@ bool PatternAlgorithms::examine_vertices_4(Graph&graph, Facade::Cluster&cluster,
             auto vd1 = v1->get_descriptor();
             auto vd2 = v2->get_descriptor();
             
-            if (boost::degree(vd1, graph) >= 2 && examine_vertices_4p(graph, v1, v2, track_fitter, dv) && v1 != main_vertex) {
+            // doc pr/48: !flags_any(kProtectedBreak) on the dying vertex --
+            // examine_vertices_4's unconditional < 2 cm floor is exactly the
+            // rule that erased 18255-59335's correctly-found kink break, and
+            // a two-end-break arm may legitimately be shorter than 2 cm.
+            if (boost::degree(vd1, graph) >= 2 && !v1->flags_any(VertexFlags::kProtectedBreak) && examine_vertices_4p(graph, v1, v2, track_fitter, dv) && v1 != main_vertex) {
                 // Merge v1's segments to v2
                 
                 // Get v2 position
                 Facade::geo_point_t vtx_new_point = v2->wcpt().point;
                 
-                // Collect segments connected to v1 (except sg)
+                // Collect segments connected to v1 (except sg).  Stable
+                // edge-index order: each is removed and re-added below,
+                // assigning NEW graph indices in this order.
                 std::vector<SegmentPtr> v1_segments;
-                auto [e1begin, e1end] = boost::out_edges(vd1, graph);
-                for (auto e1it = e1begin; e1it != e1end; ++e1it) {
-                    SegmentPtr sg1 = graph[*e1it].segment;
+                for (auto edesc : sorted_out_edges(vd1, graph)) {
+                    SegmentPtr sg1 = graph[edesc].segment;
                     if (sg1 && sg1 != sg) {
                         v1_segments.push_back(sg1);
                     }
@@ -1897,20 +2245,21 @@ bool PatternAlgorithms::examine_vertices_4(Graph&graph, Facade::Cluster&cluster,
                 
                 flag_continue = true;
                 // std::cout << "Cluster: " << cluster.ident() << " Merge Vertices Type III" << std::endl;
-                track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+                track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
                 break;
                 
-            } else if (boost::degree(vd2, graph) >= 2 && examine_vertices_4p(graph, v2, v1, track_fitter, dv) && v2 != main_vertex) {
+            } else if (boost::degree(vd2, graph) >= 2 && !v2->flags_any(VertexFlags::kProtectedBreak) && examine_vertices_4p(graph, v2, v1, track_fitter, dv) && v2 != main_vertex) {
                 // Merge v2's segments to v1 (symmetric case)
                 
                 // Get v1 position
                 Facade::geo_point_t vtx_new_point = v1->wcpt().point;
                 
-                // Collect segments connected to v2 (except sg)
+                // Collect segments connected to v2 (except sg).  Stable
+                // edge-index order: each is removed and re-added below,
+                // assigning NEW graph indices in this order.
                 std::vector<SegmentPtr> v2_segments;
-                auto [e2begin, e2end] = boost::out_edges(vd2, graph);
-                for (auto e2it = e2begin; e2it != e2end; ++e2it) {
-                    SegmentPtr sg1 = graph[*e2it].segment;
+                for (auto edesc : sorted_out_edges(vd2, graph)) {
+                    SegmentPtr sg1 = graph[edesc].segment;
                     if (sg1 && sg1 != sg) {
                         v2_segments.push_back(sg1);
                     }
@@ -2045,7 +2394,7 @@ bool PatternAlgorithms::examine_vertices_4(Graph&graph, Facade::Cluster&cluster,
                 
                 flag_continue = true;
                 // std::cout << "Cluster: " << cluster.ident() << " Merge Vertices Type III" << std::endl;
-                track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+                track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
                 break;
             }
         }
@@ -2059,7 +2408,9 @@ bool PatternAlgorithms::examine_vertices_4(Graph&graph, Facade::Cluster&cluster,
 void PatternAlgorithms::examine_vertices(Graph& graph, Facade::Cluster& cluster, TrackFitting& track_fitter, IDetectorVolumes::pointer dv, VertexPtr main_vertex){
     bool flag_continue = true;
     
+    ExaminerPassCounter epb_examine_vertices("examine_vertices", cluster.get_cluster_id());   // doc pdvd/26 round 2
     while (flag_continue) {
+        if (epb_examine_vertices.exceeded()) break;
         flag_continue = false;
         
         // Examine and clean up segment topology
@@ -2091,7 +2442,9 @@ void PatternAlgorithms::examine_partial_identical_segments(Graph& graph, Facade:
     
     
     
+    ExaminerPassCounter epb_examine_partial_identical_segments("examine_partial_identical_segments", cluster.get_cluster_id());   // doc pdvd/26 round 2
     while (flag_continue) {
+        if (epb_examine_partial_identical_segments.exceeded()) break;
         flag_continue = false;
         
         // Iterate in insertion order for deterministic results
@@ -2109,16 +2462,10 @@ void PatternAlgorithms::examine_partial_identical_segments(Graph& graph, Facade:
             double max_dis = 0;
             Facade::geo_point_t max_point;
 
-            // Collect out-edges in insertion order for deterministic pair selection
-            std::vector<edge_descriptor> out_edges_sorted;
-            {
-                auto [oe_begin, oe_end] = boost::out_edges(vd_cur, graph);
-                out_edges_sorted.assign(oe_begin, oe_end);
-                std::sort(out_edges_sorted.begin(), out_edges_sorted.end(),
-                          [&graph](const edge_descriptor& a, const edge_descriptor& b) {
-                              return graph[a].index < graph[b].index;
-                          });
-            }
+            // Collect out-edges in edge-index order for deterministic pair
+            // selection.  This site hand-rolled sorted_out_edges before the
+            // sweep; it is now the shared helper.
+            const std::vector<edge_descriptor> out_edges_sorted = sorted_out_edges(vd_cur, graph);
             for (auto eit1 = out_edges_sorted.begin(); eit1 != out_edges_sorted.end(); ++eit1) {
                 SegmentPtr sg1 = graph[*eit1].segment;
                 if (!sg1) continue;
@@ -2173,13 +2520,14 @@ void PatternAlgorithms::examine_partial_identical_segments(Graph& graph, Facade:
             
             // If significant overlap found (>5cm), split the vertex
             if (max_dis > 5.0 * units::cm) {
-                // Find closest existing vertex to max_point
+                // Find closest existing vertex to max_point.  Stable
+                // node-index order: min_vertex is a tie-broken argmin that
+                // becomes a merge target.
                 double min_dis = 1e9;
                 VertexPtr min_vertex = nullptr;
-                
-                auto [vbegin2, vend2] = boost::vertices(graph);
-                for (auto vit2 = vbegin2; vit2 != vend2; ++vit2) {
-                    VertexPtr vtx1 = graph[*vit2].vertex;
+
+                for (const auto& nd2 : ordered_nodes(graph)) {
+                    VertexPtr vtx1 = graph[nd2].vertex;
                     if (!vtx1 || vtx1->cluster() != &cluster) continue;
                     
                     Facade::geo_point_t vtx1_point = vtx1->fit().valid() ? vtx1->fit().point : vtx1->wcpt().point;
@@ -2191,8 +2539,53 @@ void PatternAlgorithms::examine_partial_identical_segments(Graph& graph, Facade:
                     }
                 }
                 
-                if (min_dis < 0.3 * units::cm) {
-                    // Merge to existing vertex
+                // doc pdvd/26 round 2: decide the merge target BEFORE branching.  The
+                // prototype tests the existing vertices against max_point, but the
+                // new vertex is created at the steiner point closest to max_point,
+                // which on a sparse cloud can be centimetres away (8.7 cm on PDVD
+                // 039349/14).  So when no vertex sits at max_point, also test them
+                // against where the vertex would actually go: a vertex within 0.3 cm
+                // of that steiner point is the merge target -- creating a second
+                // vertex there would be the "ping-pong" variant of the round-1 fixed
+                // point.  The split vertex itself there is the round-1 case (skip).
+                // Neither test fires when the closest steiner point is near max_point,
+                // i.e. on every dense cloud: that path is unchanged.
+                VertexPtr merge_target = (min_dis < 0.3 * units::cm) ? min_vertex : nullptr;
+                std::optional<Facade::geo_point_t> split_pt;
+                if (!merge_target) {
+                    split_pt = partial_identical_split_point(cluster, max_point, vtx->wcpt().point);
+                    if (!split_pt) {
+                        SPDLOG_LOGGER_DEBUG(s_log,
+                            "examine_partial_identical_segments: cluster {} degenerate split skipped: "
+                            "vtx=({:.1f},{:.1f},{:.1f}) max_dis={:.2f} cm max_point=({:.1f},{:.1f},{:.1f}) nv={} ne={}",
+                            cluster.get_cluster_id(),
+                            vtx->wcpt().point.x(), vtx->wcpt().point.y(), vtx->wcpt().point.z(),
+                            max_dis / units::cm, max_point.x(), max_point.y(), max_point.z(),
+                            boost::num_vertices(graph), boost::num_edges(graph));
+                        continue;
+                    }
+                    const auto [near_v, near_d] = closest_cluster_vertex(graph, cluster, *split_pt);
+                    if (near_v && near_d < 0.3 * units::cm) {
+                        if (near_v == vtx) {
+                            SPDLOG_LOGGER_DEBUG(s_log,
+                                "examine_partial_identical_segments: cluster {} degenerate split skipped (vertex itself, {:.2f} cm)",
+                                cluster.get_cluster_id(), near_d / units::cm);
+                            continue;
+                        }
+                        SPDLOG_LOGGER_DEBUG(s_log,
+                            "examine_partial_identical_segments: cluster {} split point coincides with an existing vertex "
+                            "({:.2f} cm; {:.2f} cm from max_point) -- merging there instead of a duplicate vertex (doc pdvd/26 round 2)",
+                            cluster.get_cluster_id(), near_d / units::cm,
+                            ray_length(Ray{*split_pt, max_point}) / units::cm);
+                        merge_target = near_v;
+                    }
+                }
+
+                if (merge_target) {
+                    // Merge to existing vertex (the block below is the prototype's,
+                    // written against min_vertex; the round-2 redirect only changes
+                    // which vertex that is).
+                    min_vertex = merge_target;
                     
                     // Check if there's already a segment between min_vertex and vtx
                     SegmentPtr good_segment = find_segment(graph, min_vertex, vtx);
@@ -2258,23 +2651,18 @@ void PatternAlgorithms::examine_partial_identical_segments(Graph& graph, Facade:
                         }
                     }
                     
-                    track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+                    track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
                     
                 } else {
-                    // Create new vertex at split point
-                    if (!cluster.has_pc("steiner_pc")) continue;
-                    // Get steiner point cloud
-                    const auto& steiner_pc = cluster.get_pc("steiner_pc");
-                    const auto& coords = cluster.get_default_scope().coords;
-                    const auto& x_coords = steiner_pc.get(coords.at(0))->elements<double>();
-                    const auto& y_coords = steiner_pc.get(coords.at(1))->elements<double>();
-                    const auto& z_coords = steiner_pc.get(coords.at(2))->elements<double>();
-
-                    // Find closest steiner point
-                    auto knn_results = cluster.kd_steiner_knn(1, max_point, "steiner_pc");
-                    if (!knn_results.empty()) {
-                        size_t idx = knn_results[0].first;
-                        Facade::geo_point_t vtx_new_point(x_coords[idx], y_coords[idx], z_coords[idx]);
+                    // Create new vertex at the split point (doc pdvd/26: the point
+                    // comes from partial_identical_split_point() above; when it
+                    // has none -- no steiner cloud, or the closest steiner point to
+                    // the overlap's far end is this very vertex -- the vertex was
+                    // skipped WITHOUT raising flag_continue.  Before, an empty kNN
+                    // fell through to flag_continue = true and the self-coincident
+                    // case cloned the vertex in place forever, PDVD 039349/14, /53).
+                    {
+                        Facade::geo_point_t vtx_new_point = *split_pt;   // non-const: do_rough_path takes geo_point_t&
                         
                         // Create new vertex
                         auto vtx2 = make_vertex(graph);
@@ -2337,7 +2725,7 @@ void PatternAlgorithms::examine_partial_identical_segments(Graph& graph, Facade:
                             }
                         }
                         
-                        track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+                        track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
                     }
                 }
                 
@@ -2347,6 +2735,68 @@ void PatternAlgorithms::examine_partial_identical_segments(Graph& graph, Facade:
             if (flag_continue) break;
         }
     }
+}
+
+std::optional<Facade::geo_point_t> PatternAlgorithms::partial_identical_split_point(const Facade::Cluster& cluster, const Facade::geo_point_t& max_point, const Facade::geo_point_t& vtx_point) const
+{
+    // Same present-but-empty guard as do_rough_path (SBND MC evt 11): the kNN
+    // on a point-less cloud returns nothing and [0] would read past the end.
+    if (!cluster.has_pc("steiner_pc")) return std::nullopt;
+    const auto& steiner_pc = cluster.get_pc("steiner_pc");
+    if (steiner_pc.size_major() == 0) return std::nullopt;
+    const auto& coords = cluster.get_default_scope().coords;
+    const auto& x_coords = steiner_pc.get(coords.at(0))->elements<double>();
+    const auto& y_coords = steiner_pc.get(coords.at(1))->elements<double>();
+    const auto& z_coords = steiner_pc.get(coords.at(2))->elements<double>();
+
+    // Closest steiner point to the far end of the overlap (prototype:
+    // pcloud->get_closest_wcpoint(max_point), NeutrinoID_proto_vertex.h).
+    auto knn_results = cluster.kd_steiner_knn(1, max_point, "steiner_pc");
+    if (knn_results.empty()) return std::nullopt;
+    const size_t idx = knn_results[0].first;
+    const Facade::geo_point_t pt(x_coords[idx], y_coords[idx], z_coords[idx]);
+
+    // The degenerate case (doc pdvd/26, PDVD 039349/14 and /53): the overlap
+    // lies in a charge gap and the closest steiner point to its far end is the
+    // vertex's own position.  A vertex "split" there clones the vertex in
+    // place, hands the clone the same two segments, and the next pass finds
+    // the identical overlap on the clone -- a fixed point of the while loop.
+    // 0.1 cm is "the same point" (steiner spacing is several mm; the split the
+    // caller wants is > 5 cm out), and the tolerance only matters when the
+    // vertex is not itself exactly a steiner point.
+    if ((pt - vtx_point).magnitude() < 0.1 * units::cm) return std::nullopt;
+    return pt;
+}
+
+std::pair<VertexPtr, double> PatternAlgorithms::closest_cluster_vertex(Graph& graph, const Facade::Cluster& cluster, const Facade::geo_point_t& point) const
+{
+    VertexPtr best;
+    double best_d = 1e9;
+    for (const auto& nd : ordered_nodes(graph)) {
+        VertexPtr v = graph[nd].vertex;
+        if (!v || v->cluster() != &cluster) continue;
+        const double d = ray_length(Ray{point, v->wcpt().point});
+        if (d < best_d) {
+            best_d = d;
+            best = v;
+        }
+    }
+    return {best, best_d};
+}
+
+// doc pdvd/26 round 2 -- see ExaminerPassBudget.h.
+bool ExaminerPassCounter::exceeded()
+{
+    if (++passes <= kExaminerPassBudget) return false;
+    SPDLOG_LOGGER_WARN(s_log,
+        "{}: cluster {} exceeded the examiner pass budget ({}) -- stopping the loop where it stands (doc pdvd/26 round 2)",
+        who, cluster_id, kExaminerPassBudget);
+    return true;
+}
+
+ExaminerPassCounter::~ExaminerPassCounter()
+{
+    SPDLOG_LOGGER_DEBUG(s_log, "examiner passes: {} cluster {} passes={}", who, cluster_id, passes);
 }
 
 Facade::geo_point_t PatternAlgorithms::get_local_extension(Facade::Cluster& cluster, const Facade::geo_point_t& wcp){
@@ -2370,6 +2820,21 @@ Facade::geo_point_t PatternAlgorithms::get_local_extension(Facade::Cluster& clus
     
     // If angle is close to perpendicular to drift (90° ± 7.5°), return original point
     if (std::fabs(angle - 90.0) < 7.5) {
+        // doc pr/67 P2.  This early return is the ISOCHRONOUS case by
+        // definition: a track perpendicular to the drift direction is exactly
+        // what "isochronous" means here.  So the one stage that exists to push
+        // a trajectory endpoint further out (examine_vertices_3) is a
+        // structural no-op precisely where the owner reports the trajectory
+        // stopping short.  Faithful to the prototype (PR3DCluster_path.h:288-316,
+        // same 7.5 deg band) -- surfaced, not changed (M15).
+        // Log-only, gated => byte-identical when off.
+        if (m_traj_cover_probe) {
+            SPDLOG_LOGGER_DEBUG(s_log,
+                "pr67 get_local_extension: NO-OP, drift angle {:.1f} deg is within 7.5 deg of "
+                "perpendicular (isochronous) at ({:.2f},{:.2f},{:.2f}) cluster {}",
+                angle, wcp.x()/units::cm, wcp.y()/units::cm, wcp.z()/units::cm,
+                cluster.get_cluster_id());
+        }
         return wcp;
     }
     
@@ -2428,9 +2893,9 @@ void PatternAlgorithms::examine_vertices_3(Graph& graph, Facade::Cluster& main_c
         
         // Get the single connected segment
         SegmentPtr sg = nullptr;
-        auto [ebegin, eend] = boost::out_edges(vd, graph);
-        for (auto eit = ebegin; eit != eend; ++eit) {
-            sg = graph[*eit].segment;
+        const auto ebegin_edges = sorted_out_edges(vd, graph);
+        for (auto eit : ebegin_edges) {
+            sg = graph[eit].segment;
             break;
         }
         if (!sg) continue;
@@ -2451,9 +2916,36 @@ void PatternAlgorithms::examine_vertices_3(Graph& graph, Facade::Cluster& main_c
         // Check if extension found a different point
         bool same_as_vtx = (ray_length(Ray{wcp1_point, vtx->wcpt().point}) < 0.01 * units::cm);
         bool same_as_wcp2 = (ray_length(Ray{wcp1_point, wcp2.point}) < 0.01 * units::cm);
-        
+
         if (same_as_vtx || same_as_wcp2) continue;
-        
+
+        // Round 5 (doc sbnd_xin/docs/pr/24 sec. 18).  get_local_extension's
+        // Hough-transform direction estimate is poorly conditioned at the
+        // axial extreme of an isochronous sheet and can return a point that
+        // is actually CLOSER to the segment's far endpoint than the vertex
+        // it started from -- a retraction, not an extension, that neither
+        // this loop nor the prototype's own examine_vertices_3
+        // (NeutrinoID_proto_vertex.h:2412-2463) ever checked for.  When
+        // m_v3_extension_guard is on, reject any candidate that does not
+        // grow the distance to wcp2 by more than m_v3_extension_min_gain
+        // (a small negative default tolerates the legacy arm's few-mm
+        // legitimate retreat while rejecting a multi-cm amputation).
+        // C++ default false => unconditional accept, byte-identical.
+        if (m_v3_extension_guard) {
+            double dis_old = ray_length(Ray{vtx->wcpt().point, wcp2.point});
+            double dis_new = ray_length(Ray{wcp1_point, wcp2.point});
+            if (dis_new - dis_old <= m_v3_extension_min_gain) {
+                SPDLOG_LOGGER_DEBUG(s_log, "examine_vertices_3: reject retracting get_local_extension "
+                    "cluster={} vtx=({:.2f},{:.2f},{:.2f}) candidate=({:.2f},{:.2f},{:.2f}) "
+                    "dis_to_far_old={:.2f}cm dis_to_far_new={:.2f}cm",
+                    main_cluster.get_cluster_id(),
+                    vtx->wcpt().point.x()/units::cm, vtx->wcpt().point.y()/units::cm, vtx->wcpt().point.z()/units::cm,
+                    wcp1_point.x()/units::cm, wcp1_point.y()/units::cm, wcp1_point.z()/units::cm,
+                    dis_old/units::cm, dis_new/units::cm);
+                continue;
+            }
+        }
+
         // Create new path from extended point to other end
         std::vector<Facade::geo_point_t> path_points;
         if (flag_start) {
@@ -2484,7 +2976,7 @@ void PatternAlgorithms::examine_vertices_3(Graph& graph, Facade::Cluster& main_c
     }
     
     if (flag_refit) {
-        track_fitter.do_multi_tracking(true, true, false, false, false, &main_cluster);
+        track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &main_cluster);
     }
 
     // Find and remove redundant short segments
@@ -2522,8 +3014,8 @@ void PatternAlgorithms::examine_vertices_3(Graph& graph, Facade::Cluster& main_c
         // Pre-snapshot the other-segment list once (outside the point loop) so
         // we avoid re-iterating boost::edges and re-filtering on every point.
         std::vector<SegmentPtr> other_segs;
-        for (auto [e2b, e2e] = boost::edges(graph); e2b != e2e; ++e2b) {
-            SegmentPtr sg1 = graph[*e2b].segment;
+        for (const auto& ed2 : ordered_edges(graph)) {
+            SegmentPtr sg1 = graph[ed2].segment;
             if (sg1 && sg1 != sg) other_segs.push_back(sg1);
         }
 
@@ -2533,7 +3025,33 @@ void PatternAlgorithms::examine_vertices_3(Graph& graph, Facade::Cluster& main_c
         for (size_t i = 0; i < pts.size(); i++) {
             // Get APA and face for this point
             auto wpid = dv->contained_by(pts[i].point);
-            if (wpid.apa() == -1 || wpid.face() == -1) continue;
+            if (wpid.apa() == -1 || wpid.face() == -1) {
+                // doc pr/30 §11, F2 site 3 (was P9) -- the consequential one.
+                // A skipped point cannot contribute num_unique, and
+                // num_unique == 0 puts the segment on
+                // segments_to_be_removed: the guard's default answer here
+                // DELETES a segment from the graph.  Third distinct polarity
+                // of the same guard in the same stage.
+                //
+                // The prototype does not vote at all: get_closest_2d_dis is a
+                // pure kd-tree 2-D distance over the segment's own projected
+                // point cloud with NO volume check
+                // (ProtoSegment.cxx:1094-1103), so the point participates
+                // normally and, being outside every TPC, will generally sit
+                // far from every other segment in some view -- i.e. count as
+                // unique and keep the segment.
+                //
+                // HONEST LABEL: unlike sites 1 and 2 this is a DIRECTIONAL
+                // INFERENCE, not an exact parity restoration -- the prototype
+                // computes a real distance rather than returning a fixed
+                // false, so "outside every TPC => unique" is very likely but
+                // not proven.  It is also the non-destructive choice, which is
+                // the right tiebreak for a branch whose other outcome removes
+                // a segment.
+                g_port_audit.oov_unique_scan.fetch_add(1, std::memory_order_relaxed);
+                if (m_oov_prototype_parity) { num_unique++; break; }
+                continue;
+            }
 
             double min_u = 1e9;
             double min_v = 1e9;
@@ -2619,7 +3137,7 @@ void PatternAlgorithms::examine_vertices_3(Graph& graph, Facade::Cluster& main_c
     
     // Refit if segments were removed
     if (segments_to_be_removed.size() > 0) {
-        track_fitter.do_multi_tracking(true, true, false, false, false, &main_cluster);
+        track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &main_cluster);
     }
 }
 
@@ -2640,7 +3158,9 @@ bool PatternAlgorithms::examine_structure_final_1(Graph& graph, VertexPtr main_v
         return false;
     }
     
+    ExaminerPassCounter epb_examine_structure_final_1("examine_structure_final_1", cluster.get_cluster_id());   // doc pdvd/26 round 2
     while (flag_continue) {
+        if (epb_examine_structure_final_1.exceeded()) break;
         flag_continue = false;
         
         // Iterate in insertion order for deterministic results
@@ -2653,19 +3173,22 @@ bool PatternAlgorithms::examine_structure_final_1(Graph& graph, VertexPtr main_v
             // Skip the main vertex
             if (vtx == main_vertex) continue;
 
+            // doc pr/48: never merge through a protected break vertex.
+            if (vtx->flags_any(VertexFlags::kProtectedBreak)) continue;
+
             // Only consider vertices with exactly 2 connections
             auto vd = vtx->get_descriptor();
             if (boost::degree(vd, graph) != 2) continue;
             
-            // Get the two segments connected to this vertex
-            auto edge_range = boost::out_edges(vd, graph);
-            auto eit = edge_range.first;
-            SegmentPtr sg1 = graph[*eit].segment;
-            ++eit;
-            SegmentPtr sg2 = graph[*eit].segment;
-            
+            // Get the two segments connected to this vertex, in stable
+            // edge-index order: sg2 is the duplicate that gets removed below,
+            // so the survivor must not depend on pointer order.
+            auto sorted_edges_2 = sorted_out_edges(vd, graph);
+            SegmentPtr sg1 = graph[sorted_edges_2[0]].segment;
+            SegmentPtr sg2 = graph[sorted_edges_2[1]].segment;
+
             if (!sg1 || !sg2) continue;
-            
+
             // Check if segments have identical endpoints (same start and end points)
             const auto& wcpts1 = sg1->wcpts();
             const auto& wcpts2 = sg2->wcpts();
@@ -2683,6 +3206,7 @@ bool PatternAlgorithms::examine_structure_final_1(Graph& graph, VertexPtr main_v
                 // Segments are identical, delete one
                 s_log->trace("examine_structure_final_1: cluster {} removing duplicate segment at vtx ({:.2f},{:.2f},{:.2f})",
                     cluster.ident(), vtx->wcpt().point.x()/units::cm, vtx->wcpt().point.y()/units::cm, vtx->wcpt().point.z()/units::cm);
+                pr64_clear_survivor_on_merge(m_assoc_clear_on_merge, sg2, sg1);
                 remove_segment(graph, sg2);
                 flag_update = true;
                 flag_continue = true;
@@ -2725,7 +3249,7 @@ bool PatternAlgorithms::examine_structure_final_1(Graph& graph, VertexPtr main_v
                 auto test_wpid = dv->contained_by(test_p);
                 if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                     auto temp_p_raw = transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
-                    if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0)) {
+                    if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0, m_good_point_pitch_frac)) {
                         n_bad++;
                     }
                 }
@@ -2751,7 +3275,7 @@ bool PatternAlgorithms::examine_structure_final_1(Graph& graph, VertexPtr main_v
     } // while continue
     
     if (flag_update) {
-        track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+        track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
     }
     
     return flag_update;
@@ -2765,13 +3289,12 @@ bool PatternAlgorithms::examine_structure_final_1p(Graph& graph, VertexPtr main_
     auto vd = main_vertex->get_descriptor();
     if (boost::degree(vd, graph) != 2) return flag_update;
     
-    // Get the two segments connected to main_vertex
-    auto edge_range = boost::out_edges(vd, graph);
-    auto eit = edge_range.first;
-    SegmentPtr sg1 = graph[*eit].segment;
-    ++eit;
-    SegmentPtr sg2 = graph[*eit].segment;
-    
+    // Get the two segments connected to main_vertex, in stable edge-index
+    // order: sg1/sg2 roles feed the merge decision below.
+    auto sorted_edges_2 = sorted_out_edges(vd, graph);
+    SegmentPtr sg1 = graph[sorted_edges_2[0]].segment;
+    SegmentPtr sg2 = graph[sorted_edges_2[1]].segment;
+
     if (!sg1 || !sg2) return flag_update;
     
     // Get main vertex position
@@ -2873,9 +3396,9 @@ bool PatternAlgorithms::examine_structure_final_1p(Graph& graph, VertexPtr main_
             std::vector<SegmentPtr> vtx_segments;
             if (vtx->descriptor_valid()) {
                 auto vtx_vd = vtx->get_descriptor();
-                auto [vtx_ebegin, vtx_eend] = boost::out_edges(vtx_vd, graph);
-                for (auto vtx_eit = vtx_ebegin; vtx_eit != vtx_eend; ++vtx_eit) {
-                    SegmentPtr seg = graph[*vtx_eit].segment;
+                // Stable edge-index order: re-adds below assign new indices.
+                for (auto edesc : sorted_out_edges(vtx_vd, graph)) {
+                    SegmentPtr seg = graph[edesc].segment;
                     if (seg && seg != sg1) {
                         vtx_segments.push_back(seg);
                     }
@@ -2891,6 +3414,7 @@ bool PatternAlgorithms::examine_structure_final_1p(Graph& graph, VertexPtr main_
             }
             
             // Delete sg1 and vtx
+            pr64_clear_survivor_on_merge(m_assoc_clear_on_merge, sg1, sg2);
             remove_segment(graph, sg1);
             remove_vertex(graph, vtx);
             s_log->trace("examine_structure_final_1p: cluster {} merged short sg1 ({:.2f} cm) into sg2 at main_vtx ({:.2f},{:.2f},{:.2f})",
@@ -2971,9 +3495,9 @@ bool PatternAlgorithms::examine_structure_final_1p(Graph& graph, VertexPtr main_
             std::vector<SegmentPtr> vtx_segments;
             if (vtx->descriptor_valid()) {
                 auto vtx_vd = vtx->get_descriptor();
-                auto [vtx_ebegin, vtx_eend] = boost::out_edges(vtx_vd, graph);
-                for (auto vtx_eit = vtx_ebegin; vtx_eit != vtx_eend; ++vtx_eit) {
-                    SegmentPtr seg = graph[*vtx_eit].segment;
+                // Stable edge-index order: re-adds below assign new indices.
+                for (auto edesc : sorted_out_edges(vtx_vd, graph)) {
+                    SegmentPtr seg = graph[edesc].segment;
                     if (seg && seg != sg2) {
                         vtx_segments.push_back(seg);
                     }
@@ -2989,6 +3513,7 @@ bool PatternAlgorithms::examine_structure_final_1p(Graph& graph, VertexPtr main_
             }
             
             // Delete sg2 and vtx
+            pr64_clear_survivor_on_merge(m_assoc_clear_on_merge, sg2, sg1);
             remove_segment(graph, sg2);
             remove_vertex(graph, vtx);
             s_log->trace("examine_structure_final_1p: cluster {} merged short sg2 ({:.2f} cm) into sg1 at main_vtx ({:.2f},{:.2f},{:.2f})",
@@ -2999,7 +3524,7 @@ bool PatternAlgorithms::examine_structure_final_1p(Graph& graph, VertexPtr main_
 
         // If we updated, redo multi-tracking
         if (flag_update) {
-            track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+            track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
         }
     }
 
@@ -3021,40 +3546,46 @@ bool PatternAlgorithms::examine_structure_final_2(Graph& graph, VertexPtr main_v
     
     // Continue looping until no more updates
     bool flag_continue = true;
+    ExaminerPassCounter epb_examine_structure_final_2("examine_structure_final_2", cluster.get_cluster_id());   // doc pdvd/26 round 2
     while (flag_continue) {
+        if (epb_examine_structure_final_2.exceeded()) break;
         flag_continue = false;
         bool flag_update = false;
         
         auto main_vd = main_vertex->get_descriptor();
-        
-        // Loop over all segments connected to main_vertex
-        auto [ebegin, eend] = boost::out_edges(main_vd, graph);
-        for (auto eit = ebegin; eit != eend; ++eit) {
-            SegmentPtr sg = graph[*eit].segment;
+
+        // Loop over all segments connected to main_vertex.  Stable edge-index
+        // order: the first neighbor within 2 cm wins (merge + restart).
+        for (auto edesc : sorted_out_edges(main_vd, graph)) {
+            SegmentPtr sg = graph[edesc].segment;
             if (!sg) continue;
-            
+
             // Find the other vertex of this segment
             VertexPtr vtx1 = find_other_vertex(graph, sg, main_vertex);
             if (!vtx1 || !vtx1->descriptor_valid()) continue;
-            
+
+            // doc pr/48: a protected break vertex is never absorbed into the
+            // main vertex.  No-op when no vertex carries the flag.
+            if (vtx1->flags_any(VertexFlags::kProtectedBreak)) continue;
+
             // Skip if either vertex has only 1 connection
             auto vtx1_vd = vtx1->get_descriptor();
             if (boost::degree(vtx1_vd, graph) == 1 || boost::degree(main_vd, graph) == 1) continue;
-            
+
             // Check distance between vertices
             WireCell::Point main_vtx_point = main_vertex->fit().valid() ? main_vertex->fit().point : main_vertex->wcpt().point;
             WireCell::Point vtx1_point = vtx1->fit().valid() ? vtx1->fit().point : vtx1->wcpt().point;
-            
+
             double dis = ray_length(Ray{main_vtx_point, vtx1_point});
-            
+
             if (dis < 2.0*units::cm) {
                 // Check if vtx1 can be merged into main_vertex
                 flag_update = true;
                 
                 // Check all segments connected to vtx1 (except sg)
-                auto [vtx1_ebegin, vtx1_eend] = boost::out_edges(vtx1_vd, graph);
-                for (auto vtx1_eit = vtx1_ebegin; vtx1_eit != vtx1_eend; ++vtx1_eit) {
-                    SegmentPtr sg1 = graph[*vtx1_eit].segment;
+                const auto vtx1_ebegin_edges = sorted_out_edges(vtx1_vd, graph);
+                for (auto vtx1_eit : vtx1_ebegin_edges) {
+                    SegmentPtr sg1 = graph[vtx1_eit].segment;
                     if (!sg1 || sg1 == sg) continue;
                     
                     const auto& sg1_wcpts = sg1->wcpts();
@@ -3087,7 +3618,7 @@ bool PatternAlgorithms::examine_structure_final_2(Graph& graph, VertexPtr main_v
                             auto test_wpid = dv->contained_by(sg1_wcpts.at(i).point);
                             if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                                 auto temp_p_raw = transform->backward(sg1_wcpts.at(i).point, cluster_t0, test_wpid.face(), test_wpid.apa());
-                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0)) {
+                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0, m_good_point_pitch_frac)) {
                                     flag_connect = false;
                                     break;
                                 }
@@ -3098,7 +3629,7 @@ bool PatternAlgorithms::examine_structure_final_2(Graph& graph, VertexPtr main_v
                             auto test_wpid = dv->contained_by(sg1_wcpts.at(i).point);
                             if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                                 auto temp_p_raw = transform->backward(sg1_wcpts.at(i).point, cluster_t0, test_wpid.face(), test_wpid.apa());
-                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0)) {
+                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0, m_good_point_pitch_frac)) {
                                     flag_connect = false;
                                     break;
                                 }
@@ -3124,7 +3655,7 @@ bool PatternAlgorithms::examine_structure_final_2(Graph& graph, VertexPtr main_v
                             auto test_wpid = dv->contained_by(test_p);
                             if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                                 auto temp_p_raw = transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
-                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0)) {
+                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0, m_good_point_pitch_frac)) {
                                     n_bad++;
                                 }
                             }
@@ -3142,7 +3673,7 @@ bool PatternAlgorithms::examine_structure_final_2(Graph& graph, VertexPtr main_v
                         auto test_wpid = dv->contained_by(test_p);
                         if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                             auto temp_p_raw = transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
-                            if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0)) {
+                            if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0, m_good_point_pitch_frac)) {
                                 flag_update = true;
                             }
                         }
@@ -3158,7 +3689,7 @@ bool PatternAlgorithms::examine_structure_final_2(Graph& graph, VertexPtr main_v
                             auto mid_wpid = dv->contained_by(mid_p);
                             if (mid_wpid.face() != -1 && mid_wpid.apa() != -1) {
                                 auto mid_p_raw = transform->backward(mid_p, cluster_t0, mid_wpid.face(), mid_wpid.apa());
-                                if (!grouping->is_good_point(mid_p_raw, mid_wpid.apa(), mid_wpid.face(), 0.2*units::cm, 0, 0)) {
+                                if (!grouping->is_good_point(mid_p_raw, mid_wpid.apa(), mid_wpid.face(), 0.2*units::cm, 0, 0, m_good_point_pitch_frac)) {
                                     flag_update = true;
                                 }
                             }
@@ -3186,7 +3717,7 @@ bool PatternAlgorithms::examine_structure_final_2(Graph& graph, VertexPtr main_v
         if (flag_update) {
             flag_continue = true;
             flag_updated = true;
-            track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+            track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
         }
     }
     
@@ -3208,22 +3739,24 @@ bool PatternAlgorithms::examine_structure_final_3(Graph& graph, VertexPtr main_v
     
     // Continue looping until no more updates
     bool flag_continue = true;
+    ExaminerPassCounter epb_examine_structure_final_3("examine_structure_final_3", cluster.get_cluster_id());   // doc pdvd/26 round 2
     while (flag_continue) {
+        if (epb_examine_structure_final_3.exceeded()) break;
         flag_continue = false;
         bool flag_update = false;
         
         auto main_vd = main_vertex->get_descriptor();
-        
-        // Loop over all segments connected to main_vertex
-        auto [ebegin, eend] = boost::out_edges(main_vd, graph);
-        for (auto eit = ebegin; eit != eend; ++eit) {
-            SegmentPtr sg = graph[*eit].segment;
+
+        // Loop over all segments connected to main_vertex.  Stable edge-index
+        // order: the first neighbor within 2.5 cm wins (merge + restart).
+        for (auto edesc : sorted_out_edges(main_vd, graph)) {
+            SegmentPtr sg = graph[edesc].segment;
             if (!sg) continue;
-            
+
             // Find the other vertex of this segment
             VertexPtr vtx1 = find_other_vertex(graph, sg, main_vertex);
             if (!vtx1 || !vtx1->descriptor_valid()) continue;
-            
+
             // Skip if vtx1 has only 1 connection
             auto vtx1_vd = vtx1->get_descriptor();
             if (boost::degree(vtx1_vd, graph) == 1) continue;
@@ -3239,9 +3772,9 @@ bool PatternAlgorithms::examine_structure_final_3(Graph& graph, VertexPtr main_v
                 flag_update = true;
                 
                 // Check all segments connected to main_vertex (except sg)
-                auto [main_ebegin, main_eend] = boost::out_edges(main_vd, graph);
-                for (auto main_eit = main_ebegin; main_eit != main_eend; ++main_eit) {
-                    SegmentPtr sg1 = graph[*main_eit].segment;
+                const auto main_ebegin_edges = sorted_out_edges(main_vd, graph);
+                for (auto main_eit : main_ebegin_edges) {
+                    SegmentPtr sg1 = graph[main_eit].segment;
                     if (!sg1 || sg1 == sg) continue;
                     
                     const auto& sg1_wcpts = sg1->wcpts();
@@ -3274,7 +3807,7 @@ bool PatternAlgorithms::examine_structure_final_3(Graph& graph, VertexPtr main_v
                             auto test_wpid = dv->contained_by(sg1_wcpts.at(i).point);
                             if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                                 auto temp_p_raw = transform->backward(sg1_wcpts.at(i).point, cluster_t0, test_wpid.face(), test_wpid.apa());
-                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0)) {
+                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0, m_good_point_pitch_frac)) {
                                     flag_connect = false;
                                     break;
                                 }
@@ -3285,7 +3818,7 @@ bool PatternAlgorithms::examine_structure_final_3(Graph& graph, VertexPtr main_v
                             auto test_wpid = dv->contained_by(sg1_wcpts.at(i).point);
                             if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                                 auto temp_p_raw = transform->backward(sg1_wcpts.at(i).point, cluster_t0, test_wpid.face(), test_wpid.apa());
-                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0)) {
+                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.2*units::cm, 0, 0, m_good_point_pitch_frac)) {
                                     flag_connect = false;
                                     break;
                                 }
@@ -3311,7 +3844,7 @@ bool PatternAlgorithms::examine_structure_final_3(Graph& graph, VertexPtr main_v
                             auto test_wpid = dv->contained_by(test_p);
                             if (test_wpid.face() != -1 && test_wpid.apa() != -1) {
                                 auto temp_p_raw = transform->backward(test_p, cluster_t0, test_wpid.face(), test_wpid.apa());
-                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.3*units::cm, 0, 0)) {
+                                if (!grouping->is_good_point(temp_p_raw, test_wpid.apa(), test_wpid.face(), 0.3*units::cm, 0, 0, m_good_point_pitch_frac)) {
                                     n_bad++;
                                 }
                             }
@@ -3329,10 +3862,10 @@ bool PatternAlgorithms::examine_structure_final_3(Graph& graph, VertexPtr main_v
                         dis/units::cm);
                     
                     // Collect segments to update
+                    // Stable edge-index order: re-adds below assign new indices.
                     std::vector<SegmentPtr> segments_to_update;
-                    auto [main_ebegin2, main_eend2] = boost::out_edges(main_vd, graph);
-                    for (auto main_eit = main_ebegin2; main_eit != main_eend2; ++main_eit) {
-                        SegmentPtr sg1 = graph[*main_eit].segment;
+                    for (auto edesc : sorted_out_edges(main_vd, graph)) {
+                        SegmentPtr sg1 = graph[edesc].segment;
                         if (sg1 && sg1 != sg) {
                             segments_to_update.push_back(sg1);
                         }
@@ -3440,10 +3973,10 @@ bool PatternAlgorithms::examine_structure_final_3(Graph& graph, VertexPtr main_v
                     }
                     
                     // Reconnect segments from vtx1 to main_vertex (except sg)
+                    // Stable edge-index order: re-adds below assign new indices.
                     std::vector<SegmentPtr> vtx1_segments;
-                    auto [vtx1_ebegin2, vtx1_eend2] = boost::out_edges(vtx1_vd, graph);
-                    for (auto vtx1_eit = vtx1_ebegin2; vtx1_eit != vtx1_eend2; ++vtx1_eit) {
-                        SegmentPtr sg1 = graph[*vtx1_eit].segment;
+                    for (auto edesc : sorted_out_edges(vtx1_vd, graph)) {
+                        SegmentPtr sg1 = graph[edesc].segment;
                         if (sg1 && sg1 != sg) {
                             vtx1_segments.push_back(sg1);
                         }
@@ -3455,11 +3988,18 @@ bool PatternAlgorithms::examine_structure_final_3(Graph& graph, VertexPtr main_v
                             remove_segment(graph, sg1);
                             add_segment(graph, sg1, main_vertex, tt_vtx);
                         } else {
-                            // Self-loop case
+                            // Self-loop case: sg1 is discarded with no
+                            // successor.  segments_to_update are the segments
+                            // whose geometry now extends into the collapsed
+                            // main_vertex/vtx1 zone, so they are the closest
+                            // analog to a survivor for sg1's associate_points.
+                            for (auto& upd : segments_to_update) {
+                                pr64_clear_survivor_on_merge(m_assoc_clear_on_merge, sg1, upd);
+                            }
                             remove_segment(graph, sg1);
                         }
                     }
-                    
+
                     // Delete sg first, then vtx1.
                     // IMPORTANT: boost::remove_vertex automatically removes all
                     // incident edges, so removing vtx1 first would silently free
@@ -3467,6 +4007,9 @@ bool PatternAlgorithms::examine_structure_final_3(Graph& graph, VertexPtr main_v
                     // while the underlying edge is gone.  The subsequent
                     // remove_segment(sg) would then call boost::remove_edge on a
                     // freed descriptor → double-free crash.
+                    for (auto& upd : segments_to_update) {
+                        pr64_clear_survivor_on_merge(m_assoc_clear_on_merge, sg, upd);
+                    }
                     remove_segment(graph, sg);
                     remove_vertex(graph, vtx1);
                     
@@ -3479,7 +4022,7 @@ bool PatternAlgorithms::examine_structure_final_3(Graph& graph, VertexPtr main_v
         if (flag_update) {
             flag_continue = true;
             flag_updated = true;
-            track_fitter.do_multi_tracking(true, true, false, false, false, &cluster);
+            track_fitter.do_multi_tracking(true, true, false, m_fit_exclusion, false, &cluster);
         }
     }
     

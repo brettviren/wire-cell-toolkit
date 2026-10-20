@@ -40,6 +40,7 @@ Configuration cpp2cfg(const BlobSampler::CommonConfig& cc)
     for (const auto& res : cc.extra) {
         cfg["extra"].append(res);
     }
+    cfg["wrapped_channel_charge"] = cc.wrapped_channel_charge;
     return cfg;
 }
 BlobSampler::CommonConfig cfg2cpp(const Configuration& cfg,
@@ -58,6 +59,7 @@ BlobSampler::CommonConfig cfg2cpp(const Configuration& cfg,
     for (const auto& res : get(cfg, "extra", def.extra)) {
         cc.extra_re.push_back(std::regex(res));
     }
+    cc.wrapped_channel_charge = get(cfg, "wrapped_channel_charge", def.wrapped_channel_charge);
 
     return cc;
 }
@@ -201,15 +203,25 @@ struct BlobSampler::Sampler : public Aux::Logger
         return avg;
     }
 
-    // Match array name suffix against regexp
+    // Match array name suffix against regexp.  Memoized: the suffix
+    // vocabulary is a handful of fixed names asked once per sampled blob.
+    // Same thread-safety caveat as plane_ident2index below.
+    std::unordered_map<std::string, bool> extra_cache;
     bool is_extra(const std::string& suffix) {
+        auto hit = extra_cache.find(suffix);
+        if (hit != extra_cache.end()) {
+            return hit->second;
+        }
         std::smatch smatch;
+        bool found = false;
         for (const auto& re : cc.extra_re) {
             if (std::regex_match(suffix, smatch, re)) {
-                return true;
+                found = true;
+                break;
             }
         }
-        return false;
+        extra_cache.emplace(suffix, found);
+        return found;
     }
     
     // Fixme: this cache is not thread safe if a BlobSampler is shared
@@ -221,6 +233,39 @@ struct BlobSampler::Sampler : public Aux::Logger
     using ident2index_t = std::unordered_map<int, int>;
     using plane_ident2index_t = std::unordered_map<IWirePlane::pointer, ident2index_t>;
     plane_ident2index_t plane_ident2index;
+
+    // Slice activity re-keyed by channel IDENT, for the
+    // "wrapped_channel_charge" path.  ISlice::map_t is already ident-hashed
+    // and ident-compared (ISlice.h:36-48), so an ident is a complete key and
+    // this is a lossless re-keying, not an approximation.
+    //
+    // Only ever built after a p_chi2i miss, which can only happen on a wrapped
+    // strip's continuation -- so on SBND and uBooNE (no wrapped channels at
+    // all) this map is never built and the knob costs nothing.
+    //
+    // Iterating a pointer-keyed container is normally forbidden here, but the
+    // RESULT is order-independent: every source ident is distinct (IdentEq), so
+    // each lands in exactly one slot regardless of visit order.  Nothing
+    // ordered is derived from the traversal.  PointTreeBuilding::add_ctpc walks
+    // the same map to build the ctpc clouds.
+    // The cache key is held as a SHARED POINTER, not a raw one: a raw
+    // `const ISlice*` compares equal when a freed slice's address is reused by
+    // a new one, which would serve stale activity -- silently wrong charge,
+    // the same failure mode this path exists to fix.  Holding the pointer
+    // keeps the slice alive, so address equality really is identity.
+    ISlice::pointer act_slice{nullptr};
+    std::unordered_map<int, ISlice::value_t> act_by_ident;
+    const std::unordered_map<int, ISlice::value_t>& activity_by_ident(const ISlice::pointer& islice)
+    {
+        if (islice != act_slice) {
+            act_slice = islice;
+            act_by_ident.clear();
+            for (const auto& [ich, val] : islice->activity()) {
+                act_by_ident[ich->ident()] = val;
+            }
+        }
+        return act_by_ident;
+    }
 
     bool want_extra(const std::string& letter, const std::vector<std::string>& names) {
         for (const auto& name : names) {
@@ -334,16 +379,50 @@ struct BlobSampler::Sampler : public Aux::Logger
                 const auto& wpid_wire = iwire->planeid();
                 wpid_blob = WireCell::WirePlaneId(kAllLayers, wpid_wire.face(), wpid_wire.apa());
                 channel_ident[ipt] = iwire->channel();
-                channel_attach[ipt] = p_chi2i[channel_ident[ipt]];
-                auto ich = channels[channel_attach[ipt]];
 
-                
-
-                auto ait = activity.find(ich);
-                if (ait != activity.end()) {
-                    auto act = ait->second;
-                    charge_val[ipt] = act.value();
-                    charge_unc[ipt] = act.uncertainty();
+                auto chit = p_chi2i.find(channel_ident[ipt]);
+                if (chit != p_chi2i.end()) {
+                    // The plane lists this channel: index straight into it.
+                    channel_attach[ipt] = chit->second;
+                    auto ich = channels[chit->second];
+                    auto ait = activity.find(ich);
+                    if (ait != activity.end()) {
+                        auto act = ait->second;
+                        charge_val[ipt] = act.value();
+                        charge_unc[ipt] = act.uncertainty();
+                    }
+                }
+                else if (cc.wrapped_channel_charge) {
+                    // A wrapped strip's continuation.  Its channel is real and
+                    // carries real activity, but it is attached to the sibling
+                    // face's plane, so there is no index into THIS plane's
+                    // channel vector -- hence -1.  Resolve the charge by ident
+                    // instead, the way add_ctpc does by walking activity
+                    // forward, which is why the ctpc 2-D maps have always had
+                    // the charge these points were missing.
+                    channel_attach[ipt] = -1;
+                    const auto& abi = activity_by_ident(islice);
+                    auto ait = abi.find(channel_ident[ipt]);
+                    if (ait != abi.end()) {
+                        charge_val[ipt] = ait->second.value();
+                        charge_unc[ipt] = ait->second.uncertainty();
+                    }
+                }
+                else {
+                    // Legacy, reproduced exactly: operator[] INSERTED 0 for the
+                    // missing ident (so the cache answers 0 for it forever
+                    // after) and the charge was read from channels[0] -- some
+                    // unrelated channel, usually with no activity in this
+                    // slice, leaving charge_val AND charge_unc at 0.
+                    p_chi2i[channel_ident[ipt]] = 0;
+                    channel_attach[ipt] = 0;
+                    auto ich = channels[0];
+                    auto ait = activity.find(ich);
+                    if (ait != activity.end()) {
+                        auto act = ait->second;
+                        charge_val[ipt] = act.value();
+                        charge_unc[ipt] = act.uncertainty();
+                    }
                 }
 
                 // std::cout << "Test: wire_index " << wire_index[ipt]
@@ -720,11 +799,26 @@ struct Stepped : public BlobSampler::Sampler
 
     double tolerance{0.03};
 
+    // If true, a blob for which the stepped grid yields no accepted point
+    // (small blobs whose single wire-crossing candidate falls outside the
+    // third view's strip window) is given one point at the blob center.
+    bool center_fallback{false};
+
+    // doc pdvd/101: if true, also sample HALF-WAY between the stepped wires of
+    // the min and max views (a crossing of a wire centre with a wire boundary,
+    // or of two boundaries), i.e. the lattice is refined to half a pitch in
+    // both views.  The mid-view strip test and the integer-crossing range test
+    // are applied exactly as for the legacy points.  False (default) => the
+    // legacy points only, in the legacy order => byte-identical.
+    bool half_pitch{false};
+
     virtual void configure(const Configuration& cfg)
     {
         min_step_size = get(cfg, "min_step_size", min_step_size);
         max_step_fraction = get(cfg, "max_step_fraction", max_step_fraction);
         offset = get(cfg, "offset", offset);
+        center_fallback = get(cfg, "center_fallback", center_fallback);
+        half_pitch = get(cfg, "half_pitch", half_pitch);
     }
 
 
@@ -866,12 +960,65 @@ struct Stepped : public BlobSampler::Sampler
 
         // if (points.empty()) {
         //     int ident = iblob->ident();
-        //     SPDLOG_LOGGER_WARN(log, "Blob {} unsampled: minsiz={} maxsiz={} nwiresmin={} nwiresmax={} nrel={} npre={}.", 
+        //     SPDLOG_LOGGER_WARN(log, "Blob {} unsampled: minsiz={} maxsiz={} nwiresmin={} nwiresmax={} nrel={} npre={}.",
         //               ident, nmin, nmax, min_wires_set.size(), max_wires_set.size(), nrel_missed, npre_missed);
         //     for (const auto& strip : strips) {
         //         SPDLOG_LOGGER_WARN(log, "Blob {} strip: {}", ident, strip);
         //     }
         // }
+
+        if (half_pitch) {
+            // doc pdvd/101 (toy d101_toy.py sample(), lever A2): refine the lattice to half a
+            // pitch in the min and max views.  The ray grid is affine in the two indices, so
+            // one pitch step in the min (max) view along the other view's ray is dmin (dmax)
+            // in space and pmin (pmax) in mid-view pitch.  A stepped wire g gets a half
+            // position g+1/2 unless it is its strip's last wire (it stays inside the strip).
+            // The legacy (integer, integer) points were added above; only combinations with
+            // at least one half position are added here, each with the legacy range test at
+            // its integer crossing and the legacy mid-view strip test at its own position.
+            const Vector dmin = coords.ray_crossing({smin.layer, 1}, {smax.layer, 0}) -
+                                coords.ray_crossing({smin.layer, 0}, {smax.layer, 0});
+            const Vector dmax = coords.ray_crossing({smin.layer, 0}, {smax.layer, 1}) -
+                                coords.ray_crossing({smin.layer, 0}, {smax.layer, 0});
+            const double pmin = coords.pitch_location({smin.layer, 1}, {smax.layer, 0}, smid.layer) -
+                                coords.pitch_location({smin.layer, 0}, {smax.layer, 0}, smid.layer);
+            const double pmax = coords.pitch_location({smin.layer, 0}, {smax.layer, 1}, smid.layer) -
+                                coords.pitch_location({smin.layer, 0}, {smax.layer, 0}, smid.layer);
+            const auto last_min = smin.bounds.second - 1;
+            const auto last_max = smax.bounds.second - 1;
+            for (auto gmin : min_wires_set) {
+                for (int hmin = 0; hmin <= 1; ++hmin) {
+                    if (hmin == 1 && gmin >= last_min) continue;
+                    coordinate_t cmin{smin.layer, gmin};
+                    for (auto gmax : max_wires_set) {
+                        for (int hmax = 0; hmax <= 1; ++hmax) {
+                            if (hmin == 0 && hmax == 0) continue;  // the legacy point
+                            if (hmax == 1 && gmax >= last_max) continue;
+                            coordinate_t cmax{smax.layer, gmax};
+                            const double ploc0 = coords.pitch_location(cmin, cmax, 0);
+                            const double prel0 = coords.pitch_relative(ploc0, 0);
+                            const double ploc1 = coords.pitch_location(cmin, cmax, 1);
+                            const double prel1 = coords.pitch_relative(ploc1, 1);
+                            if (prel0 > 1 or prel0 < 0 or prel1 > 1 or prel1 < 0) continue;
+                            const double pitch = coords.pitch_location(cmin, cmax, smid.layer) + pitch_adjust
+                                               + 0.5 * hmin * pmin + 0.5 * hmax * pmax;
+                            const double pitch_relative = coords.pitch_relative(pitch, smid.layer);
+                            if (pitch_relative > smid.bounds.first - tolerance && pitch_relative < smid.bounds.second + tolerance) {
+                                points.push_back(coords.ray_crossing(cmin, cmax) + adjust
+                                                 + (0.5 * hmin) * dmin + (0.5 * hmax) * dmax);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (points.empty() && center_fallback) {
+            const auto& corners = iblob->shape().corners();
+            if (!corners.empty()) {
+                points.push_back(center_point(corners));
+            }
+        }
 
         intern(ds, points);
 
@@ -1333,44 +1480,35 @@ private:
             //     std::cout << "Channel ident: " << channel_ident << " " << p_chi2i.size() << std::endl;
             // }
 
-            // Look up channel index using the cache
+            // Look up channel index using the cache.  doc pdhd/04 sec 9: this is
+            // the SAME IWirePlane::channels() defect make_dataset carries, in its
+            // quieter form -- on a wrapped strip's continuation the plane's
+            // channel LIST has no entry and this site fails CLOSED (the wire is
+            // never bad) rather than reading channels[0].  Same knob, same fix:
+            // resolve the charge by channel IDENT through the slice.  Inert on a
+            // detector with no segment>0 wire, where the find never misses.
+            double uncertainty = 0;
+            bool have = false;
             auto chi2i_it = p_chi2i.find(channel_ident);
-            if (chi2i_it == p_chi2i.end()) {
-            return false;
+            if (chi2i_it != p_chi2i.end() &&
+                chi2i_it->second >= 0 && chi2i_it->second < (int)channels.size()) {
+                auto ait = activity.find(channels[chi2i_it->second]);
+                if (ait != activity.end()) {
+                    uncertainty = ait->second.uncertainty();
+                    have = true;
+                }
+            }
+            else if (cc.wrapped_channel_charge && iblob) {
+                const auto& abi = activity_by_ident(iblob->slice());
+                auto ait = abi.find(channel_ident);
+                if (ait != abi.end()) {
+                    uncertainty = ait->second.uncertainty();
+                    have = true;
+                }
             }
 
-            // if (flag_print) {
-            //     std::cout << "Found channel index: " << chi2i_it->second << " " << (int)channels.size() << std::endl;
-            // }
-
-            int channel_attach = chi2i_it->second;
-            if (channel_attach < 0 || channel_attach >= (int)channels.size()) {
-            return false;
-            }
-
-            auto ich = channels[channel_attach];
-
-            // if (flag_print){
-            //     std::cout << "Checking channel: " << ich << " " << activity.size() << std::endl;
-            // }
-
-            // Look up charge in activity map and check uncertainty
-            auto ait = activity.find(ich);
-            if (ait != activity.end()) {
-                auto act = ait->second;
-                double uncertainty = act.uncertainty();
-
-                // if (flag_print) {
-                //     std::cout << "Checking wire " << wire_index << " in plane " << plane_layer 
-                //             << ": charge=" << act.value() << ", uncertainty=" << uncertainty 
-                //             << ", threshold=" << dead_threshold << std::endl;
-                // }
-
-                // Plane is considered bad if uncertainty exceeds threshold
-                return uncertainty > dead_threshold;
-            }
-
-            return false;
+            // Plane is considered bad if uncertainty exceeds threshold
+            return have && uncertainty > dead_threshold;
         };
 
         // Check both first and last wire
@@ -1412,27 +1550,25 @@ private:
             }
         }
         
-        // Look up channel index using the cache
+        // Look up channel index using the cache.  Same defect and same fix as
+        // is_plane_bad above (doc pdhd/04 sec 9): a wrapped continuation is
+        // absent from the plane's channel LIST, so resolve it by channel IDENT.
         auto chi2i_it = p_chi2i.find(channel_ident);
-        if (chi2i_it == p_chi2i.end()) {
+        if (chi2i_it != p_chi2i.end() &&
+            chi2i_it->second >= 0 && chi2i_it->second < (int)channels.size()) {
+            auto ait = activity.find(channels[chi2i_it->second]);
+            if (ait != activity.end()) {
+                return ait->second.value();
+            }
             return 0.0;
         }
-        
-        int channel_attach = chi2i_it->second;
-        if (channel_attach < 0 || channel_attach >= (int)channels.size()) {
-            return 0.0;
+        if (cc.wrapped_channel_charge && iblob) {
+            const auto& abi = activity_by_ident(iblob->slice());
+            auto ait = abi.find(channel_ident);
+            if (ait != abi.end()) {
+                return ait->second.value();
+            }
         }
-        
-        auto ich = channels[channel_attach];
-        
-        // Look up charge in activity map
-        auto ait = activity.find(ich);
-
-        if (ait != activity.end()) {
-            auto act = ait->second;
-            return act.value();
-        }
-        
         return 0.0;
     }
 };

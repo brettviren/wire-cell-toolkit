@@ -61,8 +61,8 @@ static inline bool seg_is_shower(SegmentPtr seg) {
 // Prototype: map_vertex_segments[main_vertex].find(sg) != end()
 static bool seg_at_main_vertex(SegmentPtr sg, VertexPtr main_vertex, const Graph& graph) {
     if (!main_vertex || !main_vertex->descriptor_valid()) return false;
-    for (auto [eit, end] = boost::out_edges(main_vertex->get_descriptor(), graph); eit != end; ++eit) {
-        if (graph[*eit].segment == sg) return true;
+    for (auto eit : sorted_out_edges(main_vertex->get_descriptor(), graph)) {
+        if (graph[eit].segment == sg) return true;
     }
     return false;
 }
@@ -187,22 +187,22 @@ std::pair<bool, double> PatternAlgorithms::numu_tagger(
     // -----------------------------------------------------------------------
     if (main_vertex && main_vertex->descriptor_valid()) {
         auto vd = main_vertex->get_descriptor();
-        for (auto [eit, eit_end] = boost::out_edges(vd, graph); eit != eit_end; ++eit) {
-            SegmentPtr sg = graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, graph)) {
+            SegmentPtr sg = graph[eit].segment;
             if (!sg) continue;
 
             bool flag_numu_cc_1 = false;
             double length        = segment_track_length(sg);
             double direct_length = segment_track_direct_length(sg);
             double medium_dQ_dx  = segment_median_dQ_dx(sg);
-            double dQ_dx_cut     = 0.8866 + 0.9533 * std::pow(18*units::cm / length, 0.4234);
+            double dQ_dx_cut     = muon_dqdx_cut(length);
             int    pdg           = sg->has_particle_info() ? sg->particle_info()->pdg() : 0;
 
             auto [n_daughter_tracks, n_daughter_all] = count_daughters(graph, sg, main_vertex);
 
             if (std::abs(pdg) == 13 &&
                 length > dis_cut &&
-                medium_dQ_dx < dQ_dx_cut * 43e3/units::cm &&
+                medium_dQ_dx < dQ_dx_cut * m_mip_dqdx_median &&
                 (length > 40*units::cm || (length <= 40*units::cm && direct_length > 0.925 * length)) &&
                 !(n_daughter_tracks > 1 || n_daughter_all - n_daughter_tracks > 2)) {
                 flag_numu_cc_1 = true;
@@ -216,7 +216,7 @@ std::pair<bool, double> PatternAlgorithms::numu_tagger(
             ti.numu_cc_1_particle_type.push_back(static_cast<float>(pdg));
             ti.numu_cc_1_length.push_back(static_cast<float>(length / units::cm));
             ti.numu_cc_1_direct_length.push_back(static_cast<float>(direct_length / units::cm));
-            ti.numu_cc_1_medium_dQ_dx.push_back(static_cast<float>(medium_dQ_dx / (43e3/units::cm)));
+            ti.numu_cc_1_medium_dQ_dx.push_back(static_cast<float>(medium_dQ_dx / m_mip_dqdx_median));
             ti.numu_cc_1_dQ_dx_cut.push_back(static_cast<float>(dQ_dx_cut));
             ti.numu_cc_1_n_daughter_tracks.push_back(static_cast<float>(n_daughter_tracks));
             ti.numu_cc_1_n_daughter_all.push_back(static_cast<float>(n_daughter_all));
@@ -276,8 +276,10 @@ std::pair<bool, double> PatternAlgorithms::numu_tagger(
     double max_length_all   = 0;  // longest non-shower segment in main cluster
     SegmentPtr tmp_max_muon = nullptr;
 
-    for (auto [eit, eit_end] = boost::edges(graph); eit != eit_end; ++eit) {
-        SegmentPtr sg = graph[*eit].segment;
+    // ordered_edges, not boost::edges: acc_track_length accumulates in FP and
+    // max_length_all/tmp_max_muon are tie-broken by iteration order.
+    for (const auto& ed : ordered_edges(graph)) {
+        SegmentPtr sg = graph[ed].segment;
         if (!sg || !sg->cluster()) continue;
         if (sg->cluster()->get_cluster_id() != main_cl_id) continue;
 
@@ -293,7 +295,7 @@ std::pair<bool, double> PatternAlgorithms::numu_tagger(
 
         double direct_length = segment_track_direct_length(sg);
         double medium_dQ_dx  = segment_median_dQ_dx(sg);
-        double dQ_dx_cut     = 0.8866 + 0.9533 * std::pow(18*units::cm / length, 0.4234);
+        double dQ_dx_cut     = muon_dqdx_cut(length);
 
         if (sg->flags_any(SegmentFlags::kAvoidMuonCheck)) continue;
 
@@ -302,8 +304,8 @@ std::pair<bool, double> PatternAlgorithms::numu_tagger(
         // Prototype condition: (shower && !topo) || !shower || length > 50cm
         // = !is_shower_topo || length > 50cm (since !shower implies !topo in this context)
         if (!is_shower_topo || length > 50*units::cm) {
-            if (medium_dQ_dx < dQ_dx_cut * 1.05 * 43e3/units::cm &&
-                medium_dQ_dx > 0.75 * 43e3/units::cm &&
+            if (medium_dQ_dx < dQ_dx_cut * 1.05 * m_mip_dqdx_median &&
+                medium_dQ_dx > 0.75 * m_mip_dqdx_median &&
                 (direct_length > 0.925 * length || length > 50*units::cm)) {
 
                 if (length > max_length) {
@@ -371,10 +373,16 @@ std::pair<bool, double> PatternAlgorithms::numu_tagger(
     // -----------------------------------------------------------------------
     // Final numu CC decision.
     // Prototype: NeutrinoID_numu_tagger.h lines 240-260.
-    // neutrino_type bit-setting is omitted; caller uses the returned bool.
     // -----------------------------------------------------------------------
     flag_numu_cc = flag_numu_cc_1_save || flag_numu_cc_2_save || flag_numu_cc_3;
     ti.numu_cc_flag = static_cast<float>(flag_numu_cc);
+    // doc pr/36 §10.8 (F7 = P4).  prototype (NeutrinoID_numu_tagger.h lines
+    // 251-255): numu bit when CC, nc bit otherwise -- unconditional at the
+    // end of numu_tagger, so set whenever this tagger runs.
+    if (m_neutrino_type_bitmask) {
+        if (flag_numu_cc) ti.neutrino_type |= 1 << 2;  // numu
+        else              ti.neutrino_type |= 1 << 3;  // nc
+    }
 
     if ((max_muon_length > 100*units::cm || max_length_all > 120*units::cm) && flag_numu_cc)
         flag_long_muon = true;

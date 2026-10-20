@@ -74,7 +74,17 @@ void rezero(ArrayType& arr, const std::vector<size_t>& sv)
 // map" of the ISlice instances.  Old c-nodes with nullptr shoudl be
 // ignored but are left in order not to invalidate vertex descriptors.
 //
+// The by-value form copies its argument and (boost::adjacency_list has no
+// move constructor) copies it again on return, so a whole-event graph is
+// alive three times at once; to_arrays() uses the in-place form on its one
+// working copy (wcp-porting-img wcfm/docs/13).
 cluster_graph_t ClusterArrays::bodge_channel_slice(cluster_graph_t graph)
+{
+    bodge_channel_slice_inplace(graph);
+    return graph;
+}
+
+void ClusterArrays::bodge_channel_slice_inplace(cluster_graph_t& graph)
 {
     std::vector<cluster_vertex_t> old_cvtx;
     for (const auto& vtx : vertex_range(graph)) {
@@ -144,8 +154,6 @@ cluster_graph_t ClusterArrays::bodge_channel_slice(cluster_graph_t graph)
     for (auto cvtx : old_cvtx) {
         graph[cvtx].ptr = (size_t)0;
     }
-
-    return graph;
 }
 
 static bool is_old_chan(const cluster_node_t& node)
@@ -390,7 +398,11 @@ void ClusterArrays::to_arrays(const cluster_graph_t& cin_graph,
 
     // Change c-nodes from representing physical channels to
     // representing per-slice channels associated with activites.
-    const cluster_graph_t graph = bodge_channel_slice(cin_graph);
+    // One working copy, bodged in place (was bodge_channel_slice(), which
+    // held three copies at its return).
+    cluster_graph_t bodged(cin_graph);
+    bodge_channel_slice_inplace(bodged);
+    const cluster_graph_t& graph = bodged;
 
     // {                           // debugging
     //     std::cerr << "pre-bodge:  ";
@@ -539,7 +551,8 @@ void ClusterArrays::to_arrays(const cluster_graph_t& cin_graph,
 cluster_graph_t ClusterArrays::to_cluster(const node_array_set_t& nas,
                                           const edge_array_set_t& eas,
                                           const anodes_t& anodes,
-                                          double nudge)
+                                          double nudge,
+                                          bool restore_corners)
 {
     std::unordered_map<int, IAnodeFace::pointer> known_faces;
     for (const auto& anode : anodes) {
@@ -758,7 +771,11 @@ cluster_graph_t ClusterArrays::to_cluster(const node_array_set_t& nas,
         }        
     }
 
-    {                           // blobs
+    // A cluster whose blobs were ALL removed downstream (e.g. every blob of an
+    // isochronous track tagged by ProjectionDeghosting) is written with slices,
+    // channels and wires but no 'b' array; it must load back as such rather
+    // than throw std::out_of_range (wcp-porting-img/wcfm/docs/02, 2026-09-24).
+    if (nas.find('b') != nas.end()) { // blobs
         const auto& arr = nas.at('b');
         const size_t nnodes = arr.shape()[0];
         for (size_t ind=0; ind<nnodes; ++ind) {
@@ -811,7 +828,33 @@ cluster_graph_t ClusterArrays::to_cluster(const node_array_set_t& nas,
                 bshape.add(coords, strip, nudge);
             }
 
-            IBlob::pointer iblob = std::make_shared<SimpleBlob>(ident, val, unc, bshape, islice, iface);
+            auto sblob = std::make_shared<SimpleBlob>(ident, val, unc, bshape, islice, iface);
+
+            // Optionally carry the original imaging-time corners stored in the
+            // 'b' array onto the blob, so the dead-area "corner" point cloud uses
+            // them instead of re-deriving from the reloaded shape.  Layout (write
+            // side, to_blob): count at col (sigu_col+1) + 4 scalar fields + 6 wire
+            // bounds, then that many (y,z) pairs.  Only y,z are stored; the dead
+            // bee patch consumes only y,z, so x is set to 0.  Used only for the
+            // dead corner PC; the shape and all geometry consumers are untouched.
+            if (restore_corners) {
+                const node_array_t::size_type nc_col = (sigu_col + 1) + 4 + 6;
+                if (arr.shape()[1] > nc_col) {
+                    const size_t ncorners = static_cast<size_t>(brow[nc_col]);
+                    if (arr.shape()[1] >= nc_col + 1 + 2*ncorners) {
+                        std::vector<Point> corners;
+                        corners.reserve(ncorners);
+                        for (size_t ci=0; ci<ncorners; ++ci) {
+                            const double y = brow[nc_col + 1 + 2*ci];
+                            const double z = brow[nc_col + 2 + 2*ci];
+                            corners.emplace_back(0.0, y, z);
+                        }
+                        sblob->set_stored_corners(std::move(corners));
+                    }
+                }
+            }
+
+            IBlob::pointer iblob = sblob;
             graph[bvtx].ptr = iblob;
         }
     }

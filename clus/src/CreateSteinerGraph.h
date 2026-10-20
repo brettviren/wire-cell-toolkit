@@ -33,6 +33,34 @@ namespace WireCell::Clus::Steiner {
         std::string m_graph_name{"steiner"};
         bool m_replace{true};
         bool m_perf{false};
+        // When true (default, uBooNE) only clusters flagged beam_flash are
+        // processed.  Post-QL-matching detectors (e.g. SBND) have no
+        // beam_flash flag: set false to process every scope-passing cluster,
+        // with each flagged main cluster getting the main treatment.
+        bool m_require_beam_flash{true};
+        // Beam-window gate on the matched flash time (cluster_t0), the same
+        // [low, high) test TaggerCheckNeutrino/TaggerCheckTGM use.  When
+        // m_beam_window_only is false (default) or the window is empty
+        // (low >= high) every cluster selected by the rule above is processed,
+        // i.e. legacy behavior.  When on, only the beam-coincident bundle is
+        // retiled/graphed: its in-window main clusters plus the companions
+        // sharing their matched_flash_gid.  The downstream taggers
+        // (TGM/STM/FC) carry the same gate, so the clusters that lose their
+        // steiner graph are exactly the ones no tagger evaluates.
+        bool m_beam_window_only{false};
+        double m_beam_window_low{0};
+        double m_beam_window_high{0};
+        // doc pdvd/39: skip clusters already carrying any of these tagger
+        // flags (Facade flag_<NAME> scalars; names in the Flags namespace).
+        // Empty (the default) processes every cluster the rules above kept,
+        // i.e. legacy behavior, so configs without the key are byte-identical.
+        // PDVD passes ["TGM"] with tagger_check_tgm moved ahead of this stage:
+        // a through-going muon can never reach the STM tagger
+        // (TaggerCheckSTM.cxx:566 skips TGM-flagged mains), so building its
+        // Steiner graph is pure cost.  NB whoever sets this must set it on the
+        // steiner_refresh pass too -- that pass runs replace=false, i.e. it
+        // builds exactly the clusters that have no graph yet.
+        std::vector<std::string> m_skip_flags;
 
         Grapher::Config m_grapher_config;
 

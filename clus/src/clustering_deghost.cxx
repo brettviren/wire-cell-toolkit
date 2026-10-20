@@ -5,6 +5,9 @@
 #include "WireCellIface/IConfigurable.h"
 
 #include "WireCellUtil/NamedFactory.h"
+#include "WireCellUtil/Logging.h"
+
+#include <cstdlib>
 
 class ClusteringDeghost;
 WIRECELL_FACTORY(ClusteringDeghost, ClusteringDeghost,
@@ -55,11 +58,20 @@ static std::pair<size_t, size_t> skeleton_points_hilo(const Cluster& cluster)
 static std::vector<size_t> get_path_wcps(const Cluster& cluster, 
                                          IDetectorVolumes::pointer dv,
                                          IPCTransformSet::pointer pcts,
-                                         bool use_ctpc)
+                                         bool use_ctpc,
+                                         const std::string& graph_name)
 {
     auto [hi, lo] = skeleton_points_hilo(cluster);
+    // doc 79 round 0 (WCT_CTPC_EDGE_CENSUS): log-only cache census, default
+    // OFF.  Env unset => no log lines and no behavior change of any kind.
+    static const bool dg79_census = std::getenv("WCT_CTPC_EDGE_CENSUS") != nullptr;
+    if (dg79_census && use_ctpc) {
+        WireCell::Log::logger("clus")->debug(
+            "CTPC79CENSUS deghost path npoints={} length={:.1f}cm cached={}",
+            cluster.npoints(), cluster.get_length() / units::cm, cluster.has_graph("ctpc"));
+    }
     if (use_ctpc) {
-        return cluster.graph_algorithms("ctpc", dv, pcts).shortest_path(hi, lo);
+        return cluster.graph_algorithms(graph_name, dv, pcts).shortest_path(hi, lo);
     }
     else {
         return cluster.graph_algorithms().shortest_path(hi, lo);
@@ -73,7 +85,10 @@ static void clustering_deghost(Grouping& live_grouping,
                                IPCTransformSet::pointer pcts,
                                const Tree::Scope& scope,
                                const bool use_ctpc,
-                               double length_cut = 0);
+                               const std::string& graph_name,
+                               double length_cut = 0,
+                               bool allow_mixed_faces = false,
+                               bool empty_view_unique = false);
 
 class ClusteringDeghost : public IConfigurable, public Clus::IEnsembleVisitor, private NeedDV, private NeedPCTS, private NeedScope {
 public:
@@ -86,21 +101,43 @@ public:
         NeedScope::configure(config);
         
         use_ctpc_ = get(config, "use_ctpc", true);
+        // doc 79 round 2: graph flavor for the >30 cm skeleton shortest-path
+        // build.  Default "ctpc" == byte-identical legacy behavior;
+        // "ctpc_fast" arms the busy-cluster lazy walk (CtpcFastCfg,
+        // connect_graphs.h) for clusters with component count > 200.
+        graph_name_ = get(config, "graph_name", graph_name_);
         length_cut_ = get(config, "length_cut", 0);
+        // Waive the same-face requirement of the multi-APA drift-group
+        // validation (PDVD: both faces of a CRP share one drift volume).
+        allow_mixed_faces_ = get(config, "allow_mixed_faces", false);
+        // Group-stage (multi-APA) semantics for empty per-volume 2D indices:
+        // a point whose (face, apa) view holds no other cluster counts as
+        // unique evidence instead of as a (bogus) overlap.  Default OFF ==
+        // byte-identical legacy behavior; set true on drift-group instances.
+        empty_view_unique_ = get(config, "empty_view_unique", false);
     }
     virtual Configuration default_configuration() const {
         Configuration cfg;
+        cfg["use_ctpc"] = use_ctpc_;
+        cfg["length_cut"] = length_cut_;
+        cfg["allow_mixed_faces"] = allow_mixed_faces_;
+        cfg["empty_view_unique"] = empty_view_unique_;
+        cfg["graph_name"] = graph_name_;
         return cfg;
     }
-    
+
     void visit(Ensemble& ensemble) const {
         auto& live = *ensemble.with_name("live").at(0);
-        clustering_deghost(live, m_dv, m_pcts, m_scope,  use_ctpc_, length_cut_);
+        clustering_deghost(live, m_dv, m_pcts, m_scope,  use_ctpc_, graph_name_, length_cut_,
+                           allow_mixed_faces_, empty_view_unique_);
     }
-    
+
 private:
     bool use_ctpc_{true};
+    std::string graph_name_{"ctpc"};
     double length_cut_{0};
+    bool allow_mixed_faces_{false};
+    bool empty_view_unique_{false};
 };
 
 
@@ -115,14 +152,17 @@ private:
 #define LogDebug(x)
 #endif
 
-// This handles all faces within a single APA.
-// NOTE: multi-APA groupings are explicitly rejected (see apas.size() guard below).
+// This handles all faces within a single APA, or a multi-APA drift-side group
+// (x-aligned APAs with identical drift-x fiducial metadata viewed through the
+// same face, or both faces when allow_mixed_faces).  Multi-APA groupings are
+// validated; set empty_view_unique on group-stage instances (see configure()).
 static void clustering_deghost(
     Grouping& live_grouping,
     IDetectorVolumes::pointer dv,
     IPCTransformSet::pointer pcts,
     const Tree::Scope& scope,
-    const bool use_ctpc, double length_cut)
+    const bool use_ctpc, const std::string& graph_name, double length_cut,
+    bool allow_mixed_faces, bool empty_view_unique)
 {
     // Get all the wire plane IDs from the grouping
     const auto& wpids = live_grouping.dv_wpids();
@@ -170,8 +210,14 @@ static void clustering_deghost(
         af_dead_w_index[apa][face] = live_grouping.get_dead_winds(apa, face, 2);
     }
 
+    // Multi-APA groupings are allowed only when they form one drift volume.
+    // Single-APA (both faces) keeps the legacy unvalidated acceptance.
+    // Validate the LIVE wpids (the volumes clusters actually occupy), not the
+    // dv_wpids above: a face-restricted drift-group DetectorVolumes still
+    // reports both faces of its anodes, whose opposite faces legitimately
+    // carry different FV_x metadata.
     if (apas.size() > 1) {
-        raise<ValueError>("apas.size() %d > 1", apas.size());
+        validate_drift_group(live_grouping.wpids(), dv, allow_mixed_faces, "clustering_deghost");
     }
   
 
@@ -214,6 +260,12 @@ static void clustering_deghost(
         int best_val = 0;
         int best_idx = INT_MAX;
         for (const auto& [c, cnt] : m) {
+            // A null cluster key means "no live cluster at this 2D projection"
+            // (e.g. get_closest_2d_point_info on an empty per-face plane index,
+            // which can happen once dead/masked blobs populate a face whose
+            // plane has no live points).  It is not a real overlap and is absent
+            // from map_cluster_index, so skip it rather than at()-throwing.
+            if (!c) continue;
             int idx = map_cluster_index.at(c);
             if (cnt > best_val || (cnt == best_val && idx < best_idx)) {
                 best_val = cnt;
@@ -241,7 +293,7 @@ static void clustering_deghost(
             global_point_cloud->add_points(make_points_cluster(live_clusters.at(i), wpid_params, true));
             if (live_clusters.at(i)->get_length() >
                 30 * units::cm) {  // should be the default for most of them ...
-                const auto& path_wcps = get_path_wcps(*live_clusters.at(i), dv, pcts, use_ctpc);
+                const auto& path_wcps = get_path_wcps(*live_clusters.at(i), dv, pcts, use_ctpc, graph_name);
                 // global_skeleton_cloud->add_points(live_clusters.at(i), 1);
                 global_skeleton_cloud->add_points(make_points_cluster_skeleton(live_clusters.at(i), dv, wpid_params, path_wcps, true));
             }
@@ -292,11 +344,16 @@ static void clustering_deghost(
 
                     if (!flag_dead) {
                         std::tuple<double, const Cluster *, size_t> results =
-                            global_point_cloud->get_closest_2d_point_info(test_point, 0, test_wpid.face(), test_wpid.apa()); 
+                            global_point_cloud->get_closest_2d_point_info(test_point, 0, test_wpid.face(), test_wpid.apa());
 
-                
 
-                        if (std::get<0>(results) <= dis_cut / 3.) {
+
+                        // Empty view (distance -1) would otherwise satisfy the
+                        // <= comparisons and tally a bogus nullptr "overlap".
+                        if (empty_view_unique && std::get<0>(results) < 0) {
+                            num_unique[0]++;
+                        }
+                        else if (std::get<0>(results) <= dis_cut / 3.) {
                             if (map_cluster_num[0].find(std::get<1>(results)) == map_cluster_num[0].end()) {
                                 map_cluster_num[0][std::get<1>(results)] = 1;
                             }
@@ -305,9 +362,12 @@ static void clustering_deghost(
                             }
                         }
                         else {
-                            results = global_skeleton_cloud->get_closest_2d_point_info(test_point, 0, test_wpid.face(), test_wpid.apa()); 
+                            results = global_skeleton_cloud->get_closest_2d_point_info(test_point, 0, test_wpid.face(), test_wpid.apa());
 
-                            if (std::get<0>(results) <= dis_cut * 2.0) {
+                            if (empty_view_unique && std::get<0>(results) < 0) {
+                                num_unique[0]++;
+                            }
+                            else if (std::get<0>(results) <= dis_cut * 2.0) {
                                 if (map_cluster_num[0].find(std::get<1>(results)) == map_cluster_num[0].end()) {
                                     map_cluster_num[0][std::get<1>(results)] = 1;
                                 }
@@ -362,7 +422,10 @@ static void clustering_deghost(
                             LogDebug("results: cluster " << c->npoints() << " point " << p << " dist " << std::get<0>(results)/units::mm << " dist_cut: " << dis_cut);
                         }
                         #endif
-                        if (std::get<0>(results) <= dis_cut / 3.) {
+                        if (empty_view_unique && std::get<0>(results) < 0) {
+                            num_unique[1]++;
+                        }
+                        else if (std::get<0>(results) <= dis_cut / 3.) {
                             if (map_cluster_num[1].find(std::get<1>(results)) == map_cluster_num[1].end()) {
                                 map_cluster_num[1][std::get<1>(results)] = 1;
                             }
@@ -376,7 +439,10 @@ static void clustering_deghost(
 
                             // if (cluster->nchildren()==801 && j==0)  std::cout  << j << " BV " << test_point << " " << std::get<0>(results) << " " << std::get<1>(results)->get_length()/units::cm << std::endl;
 
-                            if (std::get<0>(results) <= dis_cut * 2.0) {
+                            if (empty_view_unique && std::get<0>(results) < 0) {
+                                num_unique[1]++;
+                            }
+                            else if (std::get<0>(results) <= dis_cut * 2.0) {
                                 if (map_cluster_num[1].find(std::get<1>(results)) == map_cluster_num[1].end()) {
                                     map_cluster_num[1][std::get<1>(results)] = 1;
                                 }
@@ -409,7 +475,10 @@ static void clustering_deghost(
 
                         // if (cluster->nchildren()==801 && j==0)  std::cout  << j << " AW " << test_point << " " << std::get<0>(results) << " " << std::get<1>(results)->get_length()/units::cm << std::endl;
 
-                        if (std::get<0>(results) <= dis_cut / 3.) {
+                        if (empty_view_unique && std::get<0>(results) < 0) {
+                            num_unique[2]++;
+                        }
+                        else if (std::get<0>(results) <= dis_cut / 3.) {
                             if (map_cluster_num[2].find(std::get<1>(results)) == map_cluster_num[2].end()) {
                                 map_cluster_num[2][std::get<1>(results)] = 1;
                             }
@@ -423,7 +492,10 @@ static void clustering_deghost(
 
                             // if (cluster->nchildren()==801 && j==0)  std::cout  << j << " BW " << test_point <<  " " <<std::get<0>(results) << " " << std::get<1>(results)->get_length()/units::cm << std::endl;
 
-                            if (std::get<0>(results) <= dis_cut * 2.0) {
+                            if (empty_view_unique && std::get<0>(results) < 0) {
+                                num_unique[2]++;
+                            }
+                            else if (std::get<0>(results) <= dis_cut * 2.0) {
                                 if (map_cluster_num[2].find(std::get<1>(results)) == map_cluster_num[2].end()) {
                                     map_cluster_num[2][std::get<1>(results)] = 1;
                                 }
@@ -732,7 +804,7 @@ static void clustering_deghost(
                     // global_point_cloud_legacy->add_points(live_clusters.at(i), 0);
                     global_point_cloud->add_points(make_points_cluster(live_clusters.at(i), wpid_params, true));
                     if (live_clusters.at(i)->get_length() > 30 * units::cm) {
-                        const auto& path_wcps = get_path_wcps(*live_clusters.at(i), dv, pcts, use_ctpc);
+                        const auto& path_wcps = get_path_wcps(*live_clusters.at(i), dv, pcts, use_ctpc, graph_name);
                         // global_skeleton_cloud->add_points(live_clusters.at(i), 1);
                         global_skeleton_cloud->add_points(make_points_cluster_skeleton(live_clusters.at(i), dv, wpid_params, path_wcps, true ));
                     }
@@ -743,7 +815,7 @@ static void clustering_deghost(
                 // global_point_cloud_legacy->add_points(live_clusters.at(i), 0);
                 global_point_cloud->add_points(make_points_cluster(live_clusters.at(i), wpid_params, true));
                 if (live_clusters.at(i)->get_length() > 30 * units::cm) {
-                    const auto& path_wcps = get_path_wcps(*live_clusters.at(i), dv, pcts, use_ctpc);
+                    const auto& path_wcps = get_path_wcps(*live_clusters.at(i), dv, pcts, use_ctpc, graph_name);
                     // global_skeleton_cloud->add_points(live_clusters.at(i), 1);
                     global_skeleton_cloud->add_points(make_points_cluster_skeleton(live_clusters.at(i), dv, wpid_params, path_wcps, true));
                 }

@@ -3,6 +3,11 @@
 Comparison of `clustering_separate.cxx` against the prototype
 `ToyClustering_separate.h`. Covers correctness, bugs, randomness, and efficiency.
 
+> SBND extension (not in the prototype): a two-track upstream-boundary tag
+> (`JudgeSeparateDec_SBND_boundary`, toggle `sbnd_boundary_tag`, default OFF) catches
+> beam-inclined crossing cosmics whose PCA looks single-track. See
+> [clustering-separate-sbnd-boundary-tag.md](../clustering-separate-sbnd-boundary-tag.md).
+
 Prototype functions examined:
 - `Clustering_separate` (lines 1827–2193, and 2358+)
 - `JudgeSeparateDec_1` (lines 11–34)
@@ -21,6 +26,7 @@ Prototype functions examined:
 | `scope_transform` retrieved but not applied after `Separate_2` | `clustering_separate` lines ~324, ~361 | Potential Bug | Medium |
 | Sort lacks stable tiebreaker for equal-length clusters | `clustering_separate` line ~70 | Randomness | Low |
 | `sqrt` in 30+ distance comparisons in `JudgeSeparateDec_2` | `JudgeSeparateDec_2` | Efficiency | Medium |
+| Hull point cap silently disables separation for clusters >10k points | `Cluster::get_hull` / `JudgeSeparateDec_2` | Bug | High (large overclusters never split) |
 
 ---
 
@@ -239,3 +245,28 @@ All can be squared.
   occurrences (approximately 30 sites, two threshold values: 25 cm and 15 cm)
 
 ### Step 4: Build and verify
+
+---
+
+## Hull point cap disables separation for large overclusters
+
+`JudgeSeparateDec_2` starts with `boundary_points = cluster->get_hull();` and returns
+`false` immediately if the hull is empty — leaving `independent_points` empty, which
+also disables the secondary `flag_proceed` path in `clustering_separate`.  But
+`Cluster::get_hull` (`clus/src/Facade_Cluster.cxx`) returns an **empty** hull whenever
+`npoints() > Constants::MaxHullPoints` (`= 10000`, `ClusteringConsts.h`), logging only a
+WARN.  Net effect: **a cluster with more than 10000 points is never separated**, even a
+genuine full-detector multi-track overcluster — exactly the case separation exists for.
+
+Observed on SBND data evt 1852, APA1 cluster 6 (14630 pts, 488 cm, two crossing cosmics):
+`get_hull` returned empty → `Dec_2` bailed (`dec2=0`, `nindep=0`) → `flag_proceed=0` →
+cluster left whole.  With the cap raised so the hull computes (`hull_size=49`), `Dec_2`
+returns true and `Separate_1` splits the blob into its vertical (11521 pts, narrow x) and
+diagonal (3176 pts, full-drift x) tracks.
+
+**Fix (configurable cap, default OFF):** `Cluster::get_hull(int max_points=-1)` takes a
+cap (`<0` ⇒ `Constants::MaxHullPoints`, i.e. bit-identical).  `ClusteringSeparate` reads a
+`max_hull_points` config (default `-1`) and threads it through `JudgeSeparateDec_2`.  The
+jsonnet builder `cm.separate(max_hull_points=-1)` exposes it; SBND sets
+`max_hull_points=100000` (`cfg/pgrapher/experiment/sbnd/clus.jsonnet`).  Every other
+detector keeps `-1` → 10000 → production byte-identical.

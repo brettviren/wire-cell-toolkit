@@ -22,17 +22,34 @@ base {
     // This section will be overwritten in simparams.jsonnet
     det : {
 
-        // See:  wirecell-util wire-volumes protodune-wires-larsoft-v3.json.bz2
-        // to help with defining these parameters.
+        // See:  wirecell-util wire-volumes protodunevd-wires-larsoft-v6.json.bz2
+        // to help with defining these parameters.  (v6 = default wire file, see
+        // files.wires below and pdvd/docs/qlmatch/pdvd-crp-anode-plane-geometry.md)
 
         // between center lines
         local apa_cpa = 341.55*wc.cm,
-        local cpa_thick = 50.8*wc.mm,
+        // GDML CathodeBlock (protodunevd_v4_refactored.gdml); corrected 2026-07
+        // from the legacy 50.8 mm (= DocDB 203 / ProtoDUNE-SP nominal, which no
+        // PDVD GDML uses).  Drift-facing surface -> |x| = 3.0 cm, drift distance
+        // cpa_plane = 338.55 cm ~ GDML CRMActive 338.5.  See
+        // pdvd/docs/pdvd-tpc-geometry-fiducial.md.
+        local cpa_thick = 60.0*wc.mm,
         local apa_w2w = 85.725*wc.mm,
         local plane_gap = 4.76*wc.mm,
         local apa_g2g = 114.3*wc.mm, 
 
-        local apa_plane = 0.5*apa_g2g, // pick it to be at the grid wires
+        // FV / sensitive-volume anode edge.  2026-07-13: moved to the PHYSICAL
+        // CRP shield plane, the drift-facing boundary of the active LAr.  The
+        // confirmed CRP stack (W collection fixed) is W -3.2mm-> V -10mm-> U
+        // -3.2mm-> Shield, so the shield sits 16.4 mm below W (toward the drift
+        // volume); the 16.4 mm W..shield is PCB stack, not active drift region.
+        // anode = +-(341.55 - 1.64) = +-339.91 cm.  Supersedes the 2026-07-12
+        // U-plane choice (2 x 0.2 mm = +-341.51 cm), which used the v5 wire
+        // file's LArSoft 0.2 mm-step convention.  Drives DetectorVolumes::
+        // inner_bounds -> QLMatching FV/u-coordinate + boundary flags and the
+        // inner_bounds-based clustering.  NOT byte-identical.  See
+        // pdvd/docs/qlmatch/pdvd-crp-anode-plane-geometry.md.
+        local apa_plane = 16.4*wc.mm, // W -> shield plane (3.2 + 10 + 3.2 mm)
 
         // The "response" plane is where the field response functions
         // start.  Garfield calcualtions start somewhere relative to
@@ -101,6 +118,39 @@ base {
             tail: wc.point(-3.15, -3.42, 0, wc.m),
             head: wc.point(3.13, 3.42, 3.04, wc.m),
         }
+    },
+
+    lar: super.lar {
+        // Calibrated from PDVD data: anode->cathode crossing tracks' reconstructed
+        // drift x-span (both drift volumes, 142 events) vs the collection-plane ->
+        // cathode-surface distance gives v = v_reco * D / S.  The cathode surface
+        // moved from 2.54 -> 3.0 cm (cpa_thick 50.8 -> 60 mm, GDML), so D:
+        // 339.01 -> 338.55 cm and v rescales 1.57 -> 1.568 (v proportional to D).
+        // Consistent with the Walkowiak nominal at the PDVD field.  See
+        // pdvd/docs/clus-workflow.md (drift-velocity calibration).
+        drift_speed: 1.568 * wc.mm / wc.us,  // was 1.57 (D=339.01); 1.6 orig default
+
+        // Adopted PDVD production drift field, DL/DT and lifetime (owner decision
+        // 2026-09-03, doc pdvd/29).  E = 0.45 kV/cm (450 V/cm) is set directly (it
+        // is also what pgrapher/experiment/protodunevd/pr.jsonnet's
+        // pdvd_box_recomb.Efield and pdvd_track_fitting.json's DL/DT now use).
+        // DL/DT are the physical PDVD transport coefficients from the BNL
+        // LAr-properties parameterisation (lar.bnl.gov/properties;
+        // pdvd/stm/pdvd_transport.py: diffusion(0.45, T=87.3)), NOT derived from
+        // drift_speed above -- drift_speed was left unchanged by this update and
+        // is currently NOT the value that inverts to E = 0.45 kV/cm under the
+        // same parameterisation (see doc pdvd/29 for the flagged inconsistency).
+        // Neither DL/DT nor lifetime has a production consumer via this `lar`
+        // block today (real-data reconstruction reads its own copy of DL/DT from
+        // pdvd_track_fitting.json, and no PDVD lifetime-attenuation correction is
+        // wired up yet); these are recorded here as the single physical source of
+        // truth for whoever adds that correction.  PDVD's own simulation
+        // (simparams.jsonnet) is unaffected -- it still drifts with the sim pair
+        // DL=4.0/DT=8.8 and lifetime=1000 ms (effectively off), by design (MC
+        // consistency, not physical PDVD values).
+        DL: 4.1307 * wc.cm2 / wc.s,
+        DT: 7.9135 * wc.cm2 / wc.s,
+        lifetime: 20 * wc.ms,
     },
 
     daq: super.daq {
@@ -177,7 +227,22 @@ base {
     },
 
     files: {
-        wires: "protodunevd-wires-larsoft-v3.json.bz2",
+        // v6 = v5 with the U/V induction planes moved to their PHYSICAL CRP
+        // spacing (W kept fixed at |x|=341.55 cm): V at W-3.2 mm (341.23),
+        // U at W-13.2 mm (340.23), vs the v5 LArSoft 0.2 mm-step convention.
+        // See pdvd/docs/qlmatch/pdvd-crp-anode-plane-geometry.md.  NOT
+        // byte-identical to v5 reco (sigproc/imaging induction-plane geometry).
+        //
+        // v7-uvwfit (2026-09-03, owner decision, doc pdvd/29) = v6 with a
+        // refit U/V/W wire geometry from a colleague's fit, superseding v6 as
+        // the PDVD production default.  On the 039252 evt 2 Michel/STM sample
+        // it partially improves the Steiner terminal-charge AND-gate pass rate
+        // (17.4%->20.2% at the 4000e floor, 42.7%->48.2% at 500e; doc
+        // pdvd/28 sec 7) by making individual per-point charge lookups more
+        // accurate, though it does not reduce the underlying three-plane
+        // wire-crossing ambiguity.  NOT byte-identical to v6 reco (sigproc/
+        // imaging induction-plane geometry, same as the v5->v6 change above).
+        wires: "protodunevd-wires-larsoft-v7-uvwfit.json.bz2",
         strip_length: "PDVD_strip_length.json.bz2",
 
         fields: [

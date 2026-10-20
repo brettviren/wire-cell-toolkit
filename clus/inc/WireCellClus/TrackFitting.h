@@ -6,10 +6,14 @@
 #include "WireCellClus/PRGraph.h"
 #include "WireCellClus/PRShower.h"
 #include "WireCellClus/NeutrinoTaggerInfo.h"
+#include "WireCellClus/PRVertexScoreboard.h"
+#include "WireCellClus/PRDlVtxDump.h"
 
 #include <Eigen/IterativeLinearSolvers>
 #include <unordered_map>
 #include <unordered_set>
+#include <array>
+#include <cstdint>
 
 
 namespace WireCell::Clus {
@@ -73,7 +77,278 @@ namespace WireCell::Clus {
             double skip_angle_cut_3 = 45;
             double skip_dis_cut = 0.5*units::cm;
 
-            double default_dQ_dx = 5000; 
+            // doc pr/28 S17: on an isochronous cluster (small blob-center drift-x
+            // extent relative to its y/z footprint, the iso_band_like measure --
+            // clustering_neutrino.cxx) the multi-track charge veto's revert
+            // (skip_trajectory_point's `p = ps_point`) has no distance-based safety
+            // margin -- see porting_dictionary.md.  C++ default -1 = off: the revert
+            // is unconditional, matching the prototype (trajectory_fit.h:745-750)
+            // and the toolkit's own pre-S17 behaviour (23bd6783).  When >= 0, WCT
+            // internal length units (units::cm=10, so 20 cm = 200.0 -- the JSON
+            // loader in TaggerCheckNeutrino/TaggerCheckSTM does no unit conversion,
+            // same as every other skip_* knob here), abstain from the revert (keep
+            // the fitted point) for any point whose segment's cluster has
+            // blob-center drift-x extent below this cut.
+            double skip_revert_iso_xext_cut = -1;
+
+            // doc pr/49: cross-cluster projection-ghost filter on the 2D
+            // charge association (18255-57441: a physically unrelated
+            // cluster's charge aliases with the fitted track in the V view
+            // only and detours the fit).  C++ default -1 = off: legacy path,
+            // byte-identical.  When >= 0, a candidate 2D cell whose charge is
+            // live (flag 1), which is NOT covered by the fitted cluster's OWN
+            // blobs but IS covered by an OUT-OF-SCOPE cluster's (per-plane
+            // exact wire interval x slice interval from
+            // Cluster::time_blob_map()) is down-weighted in the fit.
+            // "Out-of-scope" (round 3, owner decision 2026-08-08): a cluster
+            // with NO segment in the current fit -- clusters fitted together
+            // in the same PR graph are aware of each other and their shared
+            // projections are legitimate, so they never count as foreign
+            // (see m_cov_fit_scope).  Cells covered by nobody (own-track
+            // charge just past the tiled envelope, dead-channel single-view
+            // charge with no 3D image) are kept at full weight, so events
+            // with no out-of-scope overlap are untouched.  The value is the
+            // wire/slice tolerance in cells (0 = strict; the 57441
+            // contamination sits ONE cell away, so tolerance >= 1 re-admits
+            // it).  Dead-derived cells (flag 0), rescue-injected anchors and
+            // end/vertex points (flag_end_point) are exempt.
+            double fit_blob_coverage = -1;
+
+            // doc pr/49: OPTIONAL 3D gate on the foreign test above -- when
+            // > 0, an out-of-scope cluster's claim only triggers the
+            // deweight if that cluster is FARTHER than this from the 3D
+            // point being fit.  Round 3 default 0 = DISABLED (scope-only,
+            // owner decision 2026-08-08: any out-of-scope claim deweights
+            // regardless of distance; graph-scope membership replaced the 15
+            // cm far-gate as the "not in the fitting range" criterion).
+            // WCT internal length units (units::cm = 10; the JSON loader
+            // does no unit conversion).  Inert while fit_blob_coverage < 0.
+            double fit_blob_coverage_ghost_dis = 0;
+
+            // doc pr/49: the least-squares weight multiplier applied in
+            // fit_point to foreign-ghost cells (owner: "deweight the foreign
+            // charge in the fitting, but not disable them completely" -- a
+            // dead-channel region can leave good single-view charge with no
+            // 3D image that the fit must still use).  1.0 would keep full
+            // weight (filter becomes a no-op); 0 would be a hard drop.
+            // Inert while fit_blob_coverage < 0.
+            double fit_blob_coverage_weight = 0.1;
+
+            // doc pdvd/101 -- position least-squares WEIGHT POWER.  Each wire
+            // row of fit_point / trajectory_fit is scaled by s = q/err * div
+            // factor * quality factors, so its weight is s^2; with a flat
+            // charge_err that is q^2, and on a coarse pitch (PDVD U/V 7.65 mm)
+            // the brightest wire wins and the fitted point snaps to its centre.
+            // When != 2 the row scale becomes |s|^(fit_weight_pow/2), i.e. the
+            // weight is |s|^fit_weight_pow.  2 (default) skips the line =>
+            // byte-identical.
+            double fit_weight_pow = 2;
+
+            // doc pdvd/101 -- centre form_point_association's per-plane wire
+            // window on the CONTINUOUS wire coordinate of the point instead of
+            // its rounded wire index.  The rounded centre puts the window
+            // edges on the wire lattice, so a point half-way between two wires
+            // collects one side's wires.  Non-zero = on; 0 (default) =>
+            // byte-identical.  (A double for the set_parameter plumbing.)
+            double assoc_cont_center = 0;
+
+            // doc pdvd/111 -- SEED RE-CENTRING before the first trajectory_fit
+            // pass.  The fit only refines a point inside its association window
+            // (~1.1 cm on pass 1, ~0.5 cm on pass 2) and the area smoothing
+            // reverts a point that moves away from its neighbours, so a seed
+            // (the Steiner Dijkstra path, filled by organize_orig_path) that runs
+            // 1-5 cm off the track's charge ridge -- a straight chord across the
+            // Steiner cloud at a bend, a path along the cloud's edge -- stays
+            // there.  When > 0, every organize_orig_path point is moved
+            // TRANSVERSELY to the local path direction by a Gaussian-kernel
+            // mean shift (width seed_recenter_sigma, mm) over the cluster's own
+            // 3-D points weighted by blob charge per point, restricted to a slab
+            // of half the pass-1 spacing along the path; at most
+            // seed_recenter_iter shifts; a point whose total move would exceed
+            // seed_recenter_max_move (mm) keeps its seed position.  0 (default)
+            // => not called => byte-identical.
+            double seed_recenter_sigma = 0;
+            double seed_recenter_iter = 5;
+            double seed_recenter_max_move = 30;
+
+            // doc sbnd_xin/docs/pr/67 -- LOG-ONLY probe (0 = off = no lines =
+            // byte-identical).  examine_end_ps_vec is the primary END trimmer:
+            // it pops points off the front and back of a trajectory while
+            // Grouping::is_good_point(p_raw, apa, face, 0.2 cm, 0, 0) is false.
+            // That makes it the direct mechanism behind the owner's second
+            // hypothesis for the pr/67 cases -- "it is also possible that we
+            // have the situation covered, but then the track trajectory was
+            // removed somehow".  Today it removes points silently, so a tip
+            // that was fitted and then amputated looks identical to one that
+            // was never reached.  Reported as a double for the existing
+            // set_parameter(name, value) plumbing.
+            double traj_cover_probe = 0;
+
+            // doc pdvd/32 round 3 -- per-plane pitch floor for the trajectory
+            // END TRIM's good-point test, as a fraction of the wire pitch.
+            // examine_end_ps_vec pops a fitted point unless all three planes
+            // have a ctpc hit within 0.2 cm; the ctpc is an exact
+            // (drift-step x pitch) lattice, so at PDVD's 0.765 cm U/V pitch
+            // that radius spans 0.52 of a pitch and 82.5 % of interior
+            // trajectory points fail a test they pass 62.4 % of the time at
+            // SBND's 0.300 cm.  Passed through as is_good_point's pitch_frac,
+            // i.e. applied as max(0.2 cm, frac*pitch) per plane, so it can
+            // only loosen.  0 (default) => byte-identical.  0.6 is the largest
+            // round value that leaves SBND and uBooNE untouched
+            // (0.6*0.300 = 0.180 cm < 0.200 cm).
+            double good_point_pitch_frac = 0;
+
+            // doc pdvd/38 -- GAP-AWARE end trim.  A LENGTH in WCT internal
+            // units (mm); 0 (default) = off = byte-identical legacy.
+            // examine_end_ps_vec pops points off each end while the strict
+            // three-plane good-point test fails and BREAKS at the first point
+            // that passes -- a tip test that never examines the interior.  With
+            // this > 0 the trim additionally asks, at that surviving tip,
+            // whether the tip is ATTACHED: Clus::scan_tip_island
+            // (WireCellClus/EndTrimGap.h) measures the supported stretch at the
+            // tip, the unsupported run inward of it, and the supported body
+            // beyond that run; the stretch is dropped only when the run is
+            // longer than this value and the island is the SMALLEST of the
+            // three (shorter than the gap and shorter than the body).  Those
+            // comparisons carry the physics: a real track end lying beyond a
+            // dead-channel region reads as a long gap to this test -- which has
+            // no bad-plane allowance -- but its supported stretch is tens of cm
+            // and outweighs what is left beyond, so it is kept; a 1-2 point
+            // island holding a 54-66 cm chord is not.  Iterates, so a path
+            // ending in several islands loses them one at a time.
+            // Only useful WITH ctpc_aniso_metric: doc pdvd/36 sec 10.1 measured
+            // the isotropic test failing 82 % of points that sit on real
+            // charge, so under it failing runs are everywhere and no threshold
+            // separates a gap from a track; under the metric the on-charge pass
+            // rate is 0.91, on-charge failing runs are 1-6 points (0.6-3.6 cm)
+            // and the cluster-109 chord is a 90-point, 54 cm run.
+            // NOTE the physics this can get wrong: a long failing run is also
+            // what a genuine DEAD-CHANNEL region looks like, and this test is
+            // the strict three-plane one with no bad-plane allowance.  Measure
+            // that (doc 38 sweep) before choosing an operating point.
+            double end_trim_gap_len = 0;
+
+            // doc sbnd_xin/docs/pr/107 -- dQ/dx-fit point retention (prototype
+            // parity).  do_multi_tracking runs a THIRD form_map_graph pass
+            // right before dQ_dx_multi_fit that the prototype does not have
+            // (pr/28 T4: PR::Fit::reset() clears the fit indices, the
+            // prototype's reset_fit_prop() is a resize that keeps them).
+            // That pass re-applies form_map_graph's "store the point only if
+            // its U+V+W quantity > 0" rule to the FINAL trajectory, so with
+            // fit_exclusion on every interior point whose cells were all
+            // stripped by update_association (cells equidistant from two
+            // prongs -- the last ~1 cm before a multi-prong junction) is
+            // DELETED from the trajectory before the dQ/dx fit, from the
+            // segment's fit point cloud and from the DL vertex net's input.
+            // The prototype fits dQ/dx on every trajectory point (its dQ/dx
+            // fit, like the toolkit's, never reads the association maps).
+            // > 0: the pre-dQ/dx pass keeps every point (zero-quantity
+            // points get an index and an empty association, exactly what the
+            // prototype's resize leaves).  Trajectory rounds 1-2 are
+            // untouched.  0 = legacy drop = byte-identical.  Reported as a
+            // double for the set_parameter(name, value) plumbing.
+            double dqdx_fit_keep_all_points = 0;
+
+            // doc pdvd/45 -- the exclusion tournament (update_association) builds
+            // each candidate 2-D cell's test point from (time, wire) with the
+            // GEOMETRIC offset_t, i.e. in the raw t0 = 0 drift frame, but the
+            // per-segment "fit"/"main" clouds it queries hold the fitted points
+            // in the cluster's t0-CORRECTED frame (SCECorrection::backward adds
+            // dirx * t0 * v_drift to x).  Every distance is therefore off by
+            // v_drift * cluster_t0: 1-3 mm on an SBND beam candidate (t0 ~ 1 us),
+            // 0.6-6 m on a PDVD cosmic (t0 relative to trigger of ms), where the
+            // segment whose cloud reaches farthest in x wins every cell of the
+            // cluster and the others lose all charge (039252/2: 61 % of the PR
+            // trajectory points dropped, SBND 1 %).  The prototype is
+            // self-consistent by construction (its update_association derives
+            // offset_t from the cluster's OWN first point,
+            // PR3DCluster_multi_track_fitting.h:1043-1046).
+            // > 0: form_map_graph measures, per fit point and (apa, face), the
+            // offset between the geometric time->x inversion and the corrected
+            // frame (the point run through the cells' own backward(t0) +
+            // convert_3Dpoint_time_ch, minus itself -- so a time-origin difference
+            // between the two conversions, e.g. PDVD's trigger offset, is covered
+            // too) and update_association subtracts it from the test point's raw
+            // x before the cloud query.  0 = legacy = byte-identical.
+            // Reported as a double for the set_parameter(name, value) plumbing.
+            double excl_t0_frame = 0;
+
+            // doc pdvd/81 -- keep the multi-track dQ/dx fit's RESPONSE for the
+            // fitted cluster: the whitened sparse matrices R (U,V,W), the
+            // solution pos_3D and the 2-D row keys with their un-whitening
+            // scale, so a caller can form the prediction of a SUBSET of the
+            // trajectory rows (e.g. the stopping muon's chain alone) as
+            // scale * R * (pos_3D masked).  CheckSTM_Michel reads it for the
+            // charge-based Michel energy.  0 = OFF = nothing stored, no code
+            // path touched (TrackFitting.cxx is shared with SBND / uBooNE).
+            // Reported as a double for the set_parameter(name, value) plumbing.
+            double keep_dqdx_response = 0;
+
+            // wcp-porting-img icarus/docs/04 -- electron-lifetime correction of
+            // the FITTED charge.  0 = OFF = no code path touched (legacy,
+            // byte-identical; SBND/uBooNE/PDHD/PDVD never set it).  When > 0 it
+            // is the lifetime tau in WCT internal time units (units::ms = 1e6;
+            // the JSON loaders do no unit conversion, as for every knob here),
+            // and every point fitted by dQ_dx_fit / dQ_dx_multi_fit gets
+            //     dQ *= exp(t_d / tau),  t_d = |x - x_anode(apa, face)| / v(apa, face)
+            // -- the same drift distance the fitter's diffusion model uses, in
+            // the T0-corrected frame.  Only points of clusters with a matched
+            // flash (Cluster::get_matched_flash()) are corrected: an unmatched
+            // cluster's x is not its drift position.  dQ_dx_fill's placeholder
+            // values are never corrected.  This is the pre-applied correction
+            // segment_cal_kine_dQdx asks for (PRSegmentFunctions.cxx NOTE).
+            double electron_lifetime = 0;
+
+            // wcp-porting-img wcfm/docs/25 -- also correct clusters WITHOUT a
+            // matched flash (light-less simulation, e.g. DUNE FD-HD where every
+            // cluster has cluster_t0 = 0, the true t0, so its T0-corrected x IS
+            // its drift position).  0 = OFF = the flash requirement above holds
+            // (legacy, byte-identical).  Only read when electron_lifetime > 0.
+            // Reported as a double for the set_parameter(name, value) plumbing.
+            double electron_lifetime_allow_unmatched = 0;
+
+            // doc pdvd/45 sec 13 -- do_single_tracking's 2nd-pass projection loop
+            // looks up wpid_offsets/wpid_slopes for the (apa, face) that
+            // contained_by() returns and dereferenced a MISSING entry (a volume
+            // with no wire planes: PDVD apa 2 face 0 at y ~ 1 cm), writing
+            // run-to-run garbage into pu/pv/pw/pt.  > 0 skips such a point, as
+            // trajectory_fit's loop already does.  0 = legacy = byte-identical.
+            double proj_skip_unmapped_face = 0;
+
+            // doc pdhd/11 (comment corrected doc pdvd/61 sec 9 item 1: the
+            // low_dis_limit named below is the local variable AS ALREADY
+            // HALVED by do_single_tracking's own pass-2 reassignment
+            // (TrackFitting.cxx ~:10088, m_params.low_dis_limit/2.), not the
+            // config default -- so with the shipped 12.0 mm default the gap
+            // threshold below is 1.6 * 6.0 mm = 9.6 mm = 0.96 cm, not 1.92 cm)
+            // -- the FINAL organize_ps_path (do_single_tracking's
+            // third call, low_dis_limit / end_point_limit 0) straight-line-fills
+            // every gap >= 1.6 * low_dis_limit, and nothing between it and the
+            // PR::Fit construction charge-tests the points it inserts: no
+            // form_map, no examine_point_association, no skip_trajectory_point.
+            // So a point form_map had ALREADY dropped for carrying no charge on
+            // any plane is re-created by interpolation and reaches stm_fit,
+            // T_rec_charge and the dQ/dx fit.  On a sparse Steiner seed that is
+            // most of the trajectory: PDHD 028084/9 cluster 126's rough path is
+            // a SINGLE 592 cm edge and 62 % of its 1030 final points are
+            // inserted here, 33 % of them more than 10 cm from any charge in
+            // the event.  > 0 re-applies form_map's own keep rule (a point
+            // survives iff qU + qV + qW > 0) to the final set.  0 = legacy =
+            // byte-identical.
+            double traj_final_fill_charge_test = 0;
+
+            // doc pdvd/44 -- acceptance window of cal_gaus_integral in sigmas:
+            // a (time, wire) bin farther than gaus_nsigma * sigma from a
+            // sub-point's centre receives nothing from it (no renormalisation).
+            // Was the bare literal 4 at all nine call sites; 4.0 reproduces
+            // that bit for bit (int 4 promoted to double).  Only bites when
+            // nsigma * sigma_T < 1 wire, i.e. PDVD's induction planes under
+            // the pre-doc-44 constants (doc 42 sec 8.5 bounds it at 5.6 % of
+            // the first-neighbour share).  Read from the runtime parameter
+            // JSON via set_parameter("gaus_nsigma", v).
+            double gaus_nsigma = 4.0;
+
+            double default_dQ_dx = 5000;
 
             double end_point_factor=0.6;
             double mid_point_factor=0.9;
@@ -98,6 +373,50 @@ namespace WireCell::Clus {
             double lambda= 0.0005;
 
             double div_sigma = 0.6*units::cm;            
+
+            // doc 30 round 3 -- restrict the fitted 2-D charge DISPLAY product
+            // to the neighbourhood of the cells the fit actually predicts.
+            //
+            // fill_fitted_charge_2d() stores one FittedCharge2D per cell of the
+            // fit's whole charge map, whether or not the fit predicts anything
+            // there (pred_charge just stays 0).  Measured on PDHD 029107/18:
+            // ~362 k cells per call, 103 calls per event, 2.4 % of them carrying
+            // a prediction -- a 40x over-storage that is the largest single
+            // carrier of both the PR job's peak RSS and ~20 % of its CPU
+            // (doc 30 sec 12.1/12.4).
+            //
+            // C++ default -1 = OFF: every cell is stored, byte-identical to the
+            // pre-round-3 product.  When >= 0, a cell is stored only if it lies
+            // within proj_pad_wire wires AND proj_pad_time SLICES of a cell
+            // whose RAW prediction (R*pos_3D, i.e. BEFORE the
+            // charge > 0 && flag != 0 gate that zeroes pred_charge) is nonzero,
+            // in the same (apa, face, plane).  The raw prediction is the seed
+            // rather than pred_charge because pred_charge is forced to 0 by the
+            // charge > 0 && flag != 0 gate, so seeding on it would drop any cell
+            // the fit predicts on a dead or below-threshold channel.  MEASURED
+            // (doc 30 sec 13.3): on PDHD 029107/18 and 028084/2 the two sets are
+            // identical (seed = predicted = 902722), because the fit excludes
+            // dead rows from R -- so this is a trap removed at zero cost, not a
+            // difference observed.  pad 0 = predicted cells only.
+            //
+            // The product this trims is DIAGNOSTIC ONLY -- PrDisplayDump.cxx's
+            // dump_proj comment states it, and the consumer census in doc 30
+            // sec 13.1 lists every reader: the five *MagnifyTrackingVisitor
+            // T_proj_data writers, PrDisplayDump::dump_proj (the calib JSON
+            // "proj" block) and TaggerCheckSTM's stm_fit hand-off.  No tagger
+            // verdict, Bee layer or pctree tensor reads it.  It is still a knob
+            // and still defaults OFF: turning it on changes T_proj_data and the
+            // calib "proj" block, which are gated products.
+            //
+            // TrackFitting.cxx is shared by SBND and uBooNE, so the guarantee
+            // that no detector's behaviour moves is "no *_track_fitting.json
+            // carries proj_pad_wire" -- as of this commit, none does.
+            double proj_pad_wire = -1;
+            // Time pad in SLICES (not ticks): converted per (apa, face) with
+            // Grouping::get_nticks_per_slice(), the same map PrDisplayDump and
+            // the Magnify writers use to turn a stored time back into a slice.
+            // Read only while proj_pad_wire >= 0.
+            double proj_pad_time = 0;
         };
  
         /**
@@ -105,7 +424,14 @@ namespace WireCell::Clus {
          * @param fitting_type The type of fitting to perform (single or multiple tracks)
          */
         explicit TrackFitting(FittingType fitting_type = FittingType::Single);   
-        virtual ~TrackFitting() = default;
+        virtual ~TrackFitting();
+
+        /// doc pdvd/28 M3: drop the fit-side scratch (charge maps, 2D<->3D
+        /// association, global readout->blob map, per-cluster caches) of a
+        /// fitter that is only read from now on.  Every consumer getter
+        /// (graph, segments, fitted 2D charge, showers, tagger/kine info,
+        /// scoreboard, pi0 maps) keeps its data; a later fit reloads.
+        void release_fit_scratch();
 
         /**
          * Set the fitting type
@@ -168,6 +494,25 @@ namespace WireCell::Clus {
         void set_showers(PR::IndexedShowerSet showers) { m_showers = std::move(showers); }
         const PR::IndexedShowerSet& get_showers() const { return m_showers; }
 
+        /// doc sbnd_xin/docs/pr/40 round 9 B2 -- clusters connected to the
+        /// main cluster by an nv_bridge_track bridge segment.  Written by
+        /// PatternAlgorithms::nv_bridge_track (cleared at each
+        /// shower_clustering_with_nv entry); read by fill_bee_pf_tree's
+        /// pf_track_bridged_clusters gate.  Empty when the bridge knob is
+        /// off => downstream predicates are byte-identical to legacy.
+        void clear_bridged_cluster_ids() { m_bridged_cluster_ids.clear(); }
+        void add_bridged_cluster_id(int id) { m_bridged_cluster_ids.insert(id); }
+        const std::set<int>& get_bridged_cluster_ids() const { return m_bridged_cluster_ids; }
+
+        /// doc sbnd_xin/docs/pr/92 -- stray satellite showers dropped from the
+        /// kinematics tree by fill_kine_tree's kine_drop_stray_satellites gate
+        /// (shower ids, PR::Shower::get_shower_id()).  Stashed unconditionally
+        /// per event by TaggerCheckNeutrino (replace semantics: empty when the
+        /// knob is off or no vertex was found, so no cross-event carryover);
+        /// read by fill_bee_pf_tree's pf_drop_stray_satellites gate.
+        void set_dropped_satellite_shower_ids(std::set<int> ids) { m_dropped_satellite_shower_ids = std::move(ids); }
+        const std::set<int>& get_dropped_satellite_shower_ids() const { return m_dropped_satellite_shower_ids; }
+
         /// Store / retrieve pi0 identification results from TaggerCheckNeutrino.
         void set_pi0_data(PR::IndexedShowerSet pi0_showers,
                           PR::ShowerIntMap map_shower_pio_id,
@@ -193,7 +538,49 @@ namespace WireCell::Clus {
         const PR::TaggerInfo& get_tagger_info() const { return m_tagger_info; }
         PR::TaggerInfo& get_tagger_info_mutable() { return m_tagger_info; }
 
+        /// Store / retrieve the per-event vertex scoreboard (doc
+        /// sbnd_xin/docs/pr/75).  Stashed by TaggerCheckNeutrino beside
+        /// set_tagger_info, i.e. AFTER snap_main_vertex_to_kink and the final
+        /// improve_vertex, and read by PrDisplayDump.  Empty (filled==false)
+        /// unless the `vertex_scoreboard` knob was on -- read that as "no
+        /// scoreboard taken", never as "no candidates".
+        void set_vertex_scoreboard(PR::VertexScoreboard vsb) { m_vertex_scoreboard = std::move(vsb); }
+        const PR::VertexScoreboard& get_vertex_scoreboard() const { return m_vertex_scoreboard; }
+
+        /// The candidate's recorded DL-vertex network calls (ai-helper issue 35,
+        /// TaggerCheckNeutrino dl_vtx_dump): OFF pass first, then production.
+        /// Empty unless the knob was on.  Cleared at the per-event reset.
+        void set_dlvtx_calls(std::vector<PR::DlVtxCall> calls) { m_dlvtx_calls = std::move(calls); }
+        const std::vector<PR::DlVtxCall>& get_dlvtx_calls() const { return m_dlvtx_calls; }
+
         void clear_graph();
+
+        /// Drop every piece of state that belongs to one event.
+        ///
+        /// A visitor that owns a TrackFitting as a member (TaggerCheckSTM,
+        /// TaggerCheckNeutrino) keeps that fitter for the whole process, but
+        /// almost everything the fitter caches -- m_grouping, the cluster and
+        /// blob sets, global_rb_map, the charge maps -- points into the
+        /// per-event Points tree that MultiAlgBlobClustering::operator() builds
+        /// as a local and destroys when the event ends.  Streaming a second
+        /// event through the same process without this call is a use-after-free
+        /// (SBND mcp1k 48367 then 48895: SIGSEGV in form_point_association).
+        ///
+        /// Call it once per event, at the top of visit() -- never per
+        /// neutrino candidate.  Within one event the candidate loop
+        /// deliberately reuses the member fitter for candidate 0 and builds a
+        /// fresh one for the rest; this call adds freshness ACROSS events
+        /// without removing it WITHIN one.
+        ///
+        /// Inert in a one-event process: at the first visit() there is nothing
+        /// to drop, so the legacy per-event job is byte-identical.
+        ///
+        /// doc 76 round 3: it must drop the state that gives a WRONG ANSWER as
+        /// well as the state that CRASHES.  The ident-keyed memo
+        /// m_cluster_xext_cache is the one that moved a physics number -- see
+        /// the comment in the body.  Set WCT_TF_RESET_CENSUS=1 to have it log
+        /// what the previous event actually left behind.
+        void reset_for_new_event();
 
         void add_cluster(std::shared_ptr<Facade::Cluster> cluster);
 
@@ -216,6 +603,9 @@ namespace WireCell::Clus {
          * @return Vector of organized 3D points
          */
         std::vector<WireCell::Point> organize_orig_path(std::shared_ptr<PR::Segment> segment, double low_dis_limit=1.2*units::cm, double end_point_limit=0.6*units::cm);
+
+        // doc pdvd/111: the seed_recenter_sigma step (see Parameters); no-op when the knob is 0.
+        void recenter_seed_path(std::shared_ptr<PR::Segment> segment, std::vector<WireCell::Point>& pts, double half_slab) const;
 
         std::vector<WireCell::Point> examine_end_ps_vec(std::shared_ptr<PR::Segment> segment, const std::vector<WireCell::Point>& pts, bool flag_start, bool flag_end);
 
@@ -292,8 +682,18 @@ namespace WireCell::Clus {
         /// Per-plane data for 3D points (exactly matches prototype)
         struct PlaneData {
             std::set<Coord2D> associated_2d_points;
+            // doc pr/49 (fit_blob_coverage knob): subset of
+            // associated_2d_points classified as foreign-ghost cells (live,
+            // outside the fitted cluster's own blob coverage, inside an
+            // out-of-scope cluster's -- round 3: one with no segment in the
+            // current fit).  They stay in the fit -- a
+            // dead-channel region can leave good single-view charge with no
+            // 3D image, which the fit must still use -- but fit_point scales
+            // their least-squares weight by fit_blob_coverage_weight.
+            // Empty on the legacy path (knob off).
+            std::set<Coord2D> deweighted_2d_points;
             double quantity;
-            
+
             PlaneData() : quantity(0.0) {}
         };
 
@@ -354,11 +754,56 @@ namespace WireCell::Clus {
             double charge_err;    // original measurement uncertainty
             double pred_charge;   // predicted charge (un-whitened, same units as charge)
             int flag;             // 0=dead, 1=live, 2=bad
-            std::set<Facade::Cluster*> clusters;
+            /// Clusters owning this cell.  Ident-ordered, not pointer-ordered:
+            /// the only current consumer (PrDisplayDump::dump_proj) sorts the
+            /// ids itself, so this changes no output today -- it removes the
+            /// trap for the next consumer that iterates it directly.
+            std::set<Facade::Cluster*, PR::ClusterPtrCmp> clusters;
         };
 
         using WireTime = std::pair<int, int>;            // (wire_index, time_slice)
         using APAFacePlane = std::tuple<int, int, int>;   // (apa, face, plane);
+
+        /// doc pr/109 §8: one captured snapshot of m_fitted_charge_2d, for one
+        /// cluster's dQ/dx fit.  Kept per fit (not merged) so a writer can emit
+        /// the prediction that THIS cluster's fit produced -- see
+        /// m_cluster_fitted_charge_2d for why the merged map cannot.
+        struct ClusterFitted2D {
+            Facade::Cluster* cluster{nullptr};
+            int ident{-1};
+            /// doc pdvd/42: the STM tagger fits one cluster up to twice
+            /// (forward/backward pass) and each pass is its own fit with its
+            /// own prediction.  -1 = a PR-stage snapshot (one fit per cluster,
+            /// the pr/109 semantics); >= 0 = the STM pass this snapshot
+            /// belongs to, so a writer can emit it under block ident*10+pass
+            /// instead of duplicating one cluster's cells under every pass.
+            std::map<APAFacePlane, std::map<WireTime, FittedCharge2D>> cells;
+            int pass{-1};   // declared LAST so the PR-stage {cluster, ident, cells} initializer keeps compiling
+        };
+
+        /// doc pdvd/81: one 2-D row of a stored dQ/dx multi-fit response.  `scale`
+        /// is the row's whitening denominator total_err (the same expression the
+        /// fit divides the data by) for a live measured row, 0 otherwise -- the
+        /// prediction in electrons is scale * (R * pos_3D)(row).
+        struct DqdxResponseRow {
+            explicit DqdxResponseRow(const CoordReadout& k) : key(k) {}
+            CoordReadout key;
+            double charge{0}, charge_err{0}, scale{0};
+            int flag{0};
+            std::vector<Coord2D> coords;   // the (face, wire) cells the readout row maps to, set order
+        };
+        /// doc pdvd/81: the multi-fit response of ONE cluster's LAST dQ_dx_multi_fit
+        /// (Parameters::keep_dqdx_response).  Row i of R[p] is rows[p][i]; column k
+        /// is trajectory row k (PR::Fit::index of every segment/vertex fit the
+        /// fit wrote back).  Erased at the next dQ_dx_multi_fit entry for the
+        /// same cluster, so an early-returning fit never leaves a stale pairing.
+        struct DqdxResponse {
+            Facade::Cluster* cluster{nullptr};
+            int ident{-1};
+            std::array<Eigen::SparseMatrix<double>, 3> R;
+            Eigen::VectorXd pos_3D;
+            std::array<std::vector<DqdxResponseRow>, 3> rows;
+        };
 
         // Fill fitted 2D charge results after dQ/dx fitting
         void fill_fitted_charge_2d(
@@ -369,19 +814,111 @@ namespace WireCell::Clus {
             double rel_uncer_ind, double rel_uncer_col,
             double add_uncer_ind, double add_uncer_col);
 
+        /// doc pdvd/28 round 2 (T2): one row of the single-track dQ/dx fit's
+        /// 2D-measurement table -- a charge_source entry with its wires as the
+        /// [c0,c1) range of a shared Coord2D vector (Coord2D order, unique),
+        /// i.e. exactly the std::set<Coord2D> the map-based code held per row.
+        struct DqdxRow {
+            CoordReadout key;
+            ChargeMeasurement meas;
+            uint32_t c0, c1;
+        };
+        /// Build the per-plane (U,V,W) row tables in CoordReadout order from an
+        /// unordered charge source -- the order the std::map-based code produced.
+        /// Rows whose channel has no wires are dropped, rows whose last wire
+        /// is not on plane 0/1/2 are dropped (the switch stored nothing).
+        void build_dqdx_rows(const std::unordered_map<CoordReadout, ChargeMeasurement, CoordReadoutHash>& charge_source,
+                             std::array<std::vector<DqdxRow>, 3>& plane_rows,
+                             std::vector<Coord2D>& coords) const;
+        /// Row-table flavour of fill_fitted_charge_2d: identical product map.
+        void fill_fitted_charge_2d(const std::array<std::vector<DqdxRow>, 3>& plane_rows,
+                                   const std::vector<Coord2D>& coords,
+                                   const Eigen::VectorXd& pred_u, const Eigen::VectorXd& pred_v, const Eigen::VectorXd& pred_w,
+                                   double rel_uncer_ind, double rel_uncer_col,
+                                   double add_uncer_ind, double add_uncer_col);
+        /// Shared tail of both fill_fitted_charge_2d flavours: the per-cluster snapshot.
+        void record_cluster_fitted_charge_2d();
+
         /// Merge every per-cluster snapshot captured inside fill_fitted_charge_2d
         /// into m_fitted_charge_2d so the flat map covers every cluster fit this
         /// event.  Call once per event after all do_multi_tracking() calls are done
         /// (e.g. at the end of TaggerCheckNeutrino::visit, before set_track_fitting).
         void assemble_fitted_charge_2d();
 
+        /// Merge an externally-accumulated fitted-charge map into
+        /// m_fitted_charge_2d (last-writer-wins on overlap, same semantics as
+        /// assemble_fitted_charge_2d).  Used by TaggerCheckSTM's save_stm_fit
+        /// dump to hand per-pass snapshots to a fresh holder fitter that
+        /// downstream writers (SbndMagnifyTrackingVisitor) read from the
+        /// grouping's named "stm" slot.
+        void merge_fitted_charge_2d(const std::map<APAFacePlane, std::map<WireTime, FittedCharge2D>>& other);
+
         // point associations
         void form_point_association(std::shared_ptr<PR::Segment> segment, WireCell::Point &p, PlaneData& temp_2dut, PlaneData& temp_2dvt, PlaneData& temp_2dwt, double dis_cut, int nlevel, double time_tick_cut );
 
         void examine_point_association(std::shared_ptr<PR::Segment> segment, WireCell::Point &p, PlaneData& temp_2dut, PlaneData& temp_2dvt, PlaneData& temp_2dwt, bool flag_end_point = false, double charge_cut = 2000);
+
+        /// doc pr/49 (fit_blob_coverage knob): true iff any of the cluster's
+        /// OWN blobs covers (wire, time) in the given plane -- wire in the
+        /// blob's half-open per-plane interval [min-tol, max+tol) and time
+        /// (tick) in [slice_index_min-tol_ticks, slice_index_max+tol_ticks).
+        /// Interval search over Cluster::time_blob_map() keys, so it accepts
+        /// both blob-aligned times and the floor-quantized ticks of the
+        /// Steiner/fallback candidate branches without an alignment
+        /// assumption.  Order-invariant existential test (OR over blobs), so
+        /// iterating the pointer-keyed BlobSet cannot affect the result.
+        bool is_cell_covered_by_own_blobs(const Facade::Cluster* cluster, int apa, int face,
+                                          int plane, int wire, int time,
+                                          int tol_cells, int nticks_per_slice) const;
+
+        /// doc pr/49 (round 3, scope-aware): true iff some OUT-OF-SCOPE
+        /// cluster covers the cell per the same test.  Out-of-scope = not
+        /// `cluster` itself AND not in m_cov_fit_scope (clusters owning a
+        /// segment in the current fit -- "fitted together" clusters are
+        /// aware of each other and their shared projections are legitimate,
+        /// so they never count as foreign).  ghost_dis > 0 additionally
+        /// requires `other->get_closest_dis(p) > ghost_dis` (optional extra
+        /// gate; round-3 default 0 = scope-only).  A cell covered by nobody
+        /// (own-track charge spilling just past the tiled envelope, or
+        /// dead-channel single-view charge with no 3D image) is kept at
+        /// full weight.  Order-invariant OR over clusters and blobs.
+        /// `claimant` (optional, doc pr/50 diagnostics) receives the first
+        /// covering out-of-scope cluster; the result is unchanged.
+        bool is_cell_covered_by_foreign_blobs(const Facade::Grouping* grouping,
+                                              const Facade::Cluster* cluster,
+                                              const WireCell::Point& p, double ghost_dis,
+                                              int apa, int face,
+                                              int plane, int wire, int time,
+                                              int tol_cells, int nticks_per_slice,
+                                              const Facade::Cluster** claimant = nullptr) const;
+
+        /// doc pr/49 round 3: rebuild m_cov_fit_scope = clusters owning a
+        /// segment in the current fit.  Walks m_graph's edges when a graph
+        /// is present (fresh walk, NOT the stale m_cluster_edges -- the
+        /// single-tracking path never rebuilds that map) and adds `seg`'s
+        /// cluster (the one segment being fitted on the form_map path;
+        /// nullptr on the form_map_graph path, where the graph supplies
+        /// everything).  Called once per form_map/form_map_graph invocation,
+        /// only while the fit_blob_coverage knob is on.  doc pr/50: the same
+        /// walk also refreshes m_cov_vtx_info (graph vertex positions +
+        /// degrees) for the deweight sentinel diagnostics.
+        void rebuild_cov_fit_scope(const std::shared_ptr<PR::Segment>& seg);
+        /// doc pr/98 perf: the keep/strip decision depends only on (cell,
+        /// segment) -- never on the fit point -- and every segment cloud is
+        /// static while ONE segment's fit points are processed (its own
+        /// set_fit_associate_vec runs after its loop; other segments' ran
+        /// before or run after).  Consecutive fit points re-claim the same
+        /// cells, so form_map_graph passes a per-segment decision cache.
+        /// nullptr disables caching (identical decisions either way).
+        /// Keyed by the packed (apa,face,plane,wire,time) identity of a
+        /// Coord2D (see exclusion_cache_key in TrackFitting.cxx) -- an
+        /// unordered_map on one integer beats std::map's Coord2D
+        /// operator< chain in the pr/98 profile.
+        using ExclusionDecisionCache = std::unordered_map<uint64_t, bool>;
         void update_association(std::shared_ptr<PR::Segment> segment,
                                 const std::vector<std::shared_ptr<PR::Segment>>& all_segments,
-                                PlaneData& temp_2dut, PlaneData& temp_2dvt, PlaneData& temp_2dwt);
+                                PlaneData& temp_2dut, PlaneData& temp_2dvt, PlaneData& temp_2dwt,
+                                ExclusionDecisionCache* decision_cache = nullptr);
 
         void form_map(std::vector<std::pair<WireCell::Point, std::shared_ptr<PR::Segment>>>& ptss, double end_point_factor=0.6, double mid_point_factor=0.9, int nlevel=3, double time_tick_cut=20, double charge_cut=2000);
         void form_map_graph(bool flag_exclusion, double end_point_factor=0.6, double mid_point_factor=0.9, int nlevel=3, double time_tick_cut=20, double charge_cut=2000);
@@ -392,8 +929,11 @@ namespace WireCell::Clus {
         void multi_trajectory_fit(int charge_div_method = 1, double div_sigma = 0.6*units::cm);
 
         // examine trajectory ...
-        std::vector<WireCell::Point> examine_segment_trajectory(std::shared_ptr<PR::Segment> segment, std::vector<WireCell::Point>& final_ps_vec, std::vector<WireCell::Point>& init_ps_vec);
-        bool skip_trajectory_point(WireCell::Point& p, std::pair<int,int>& apa_face, int i, std::vector<std::pair<WireCell::Point, std::shared_ptr<PR::Segment>>>& pss_vec,  std::vector<std::pair<WireCell::Point, std::shared_ptr<PR::Segment>>>& fine_tracking_path); 
+        // doc pr/28 T3: init_indices carries the GLOBAL m_3d_to_2d key of each
+        // point (prototype's init_indices, multi_track_fitting.h:429).  The
+        // per-segment loop position is NOT that key in the multi-track path.
+        std::vector<WireCell::Point> examine_segment_trajectory(std::shared_ptr<PR::Segment> segment, std::vector<WireCell::Point>& final_ps_vec, std::vector<WireCell::Point>& init_ps_vec, const std::vector<int>& init_indices);
+        bool skip_trajectory_point(WireCell::Point& p, std::pair<int,int>& apa_face, int i, int index, std::vector<std::pair<WireCell::Point, std::shared_ptr<PR::Segment>>>& pss_vec,  std::vector<std::pair<WireCell::Point, std::shared_ptr<PR::Segment>>>& fine_tracking_path);
 
         // prepare for dQ/dx fitting
         double cal_gaus_integral(int tbin, int wbin, double t_center, double t_sigma, 
@@ -403,6 +943,20 @@ namespace WireCell::Clus {
 
         void update_dQ_dx_data();
         void recover_original_charge_data();
+
+        // icarus/docs/04: Parameters::electron_lifetime applied to one fitted
+        // point of `cluster` at `p` in (apa, face).  Returns the factor (1 when
+        // the knob is off, the cluster has no matched flash, or (apa, face) is
+        // not a live face) and counts the point as corrected or skipped.
+        double electron_lifetime_at(const Facade::Cluster* cluster, const WireCell::Point& p, int apa, int face);
+        // wcfm/docs/25: the same correction for a cluster without a matched
+        // flash (Parameters::electron_lifetime_allow_unmatched on).
+        double electron_lifetime_unmatched_at(const WireCell::Point& p, int apa, int face);
+        size_t m_lifetime_ncorr{0};
+        size_t m_lifetime_nskip{0};
+        // Log and zero the census (knob on only): at each event reset and at
+        // destruction, so the last event of a job is reported too.
+        void flush_lifetime_census();
 
         /**
          * Calculate compact matrix analysis for wire plane sharing
@@ -428,6 +982,13 @@ namespace WireCell::Clus {
         void dQ_dx_multi_fit(double dis_end_point_ext=0.45*units::cm, bool flag_dQ_dx_fit_reg=true);
 
         void do_single_tracking(std::shared_ptr<PR::Segment> segment, bool flag_dQ_dx_fit_reg= true, bool flag_dQ_dx_fit= true, bool flag_force_load_data = false, bool flag_hack = false, Facade::Cluster* cluster_filter = nullptr);
+
+        // doc pdhd/11: label carried into the WCT_STM_PATH_DEBUG trajectory trace
+        // so a dumped stage can be attributed to a cluster / pass.  Log-only: the
+        // string is read nowhere unless that environment variable is set, and it
+        // takes part in no decision, so it cannot change output.
+        void set_path_debug_tag(const std::string& tag) { m_path_debug_tag = tag; }
+        std::string m_path_debug_tag{"-"};
         void do_multi_tracking(bool flag_dQ_dx_fit_reg= true, bool flag_dQ_dx_fit= true, bool flag_force_load_data = false, bool flag_exclusion =false, bool flag_hack = false, Facade::Cluster* cluster_filter = nullptr);
 
 
@@ -469,7 +1030,9 @@ namespace WireCell::Clus {
          * @param channel_number Channel identifier
          * @return Vector of wire information (face, plane, wire_index)
          */
-        std::vector<std::tuple<int, int, int>> get_wires_for_channel(int apa, int channel_number) const;
+        /// doc pdvd/28 round 2: memoised per (apa, channel); the reference is
+        /// stable until reset_for_new_event() clears the memo with the grouping.
+        const std::vector<std::tuple<int, int, int>>& get_wires_for_channel(int apa, int channel_number) const;
 
         // map_apa_ch_plane_wires: (apa,channel) -> vector of (face, plane, wire)
         void collect_2D_charge(std::map<CoordReadout, ChargeMeasurement>& charge_2d_u, std::map<CoordReadout, ChargeMeasurement>& charge_2d_v, std::map<CoordReadout, ChargeMeasurement>& charge_2d_w, std::map<std::pair<int, int>, std::vector<std::tuple<int, int, int>>>& map_apa_ch_plane_wires);
@@ -538,6 +1101,30 @@ namespace WireCell::Clus {
         std::vector<double> get_pw() const { return pw; }
         std::vector<double> get_pt() const { return pt; }
         std::vector<std::pair<int,int>> get_paf() const {return paf;}
+
+        /// Which dx rule applies to trajectory point i of n in dQ_dx_fit, given
+        /// the per-point (apa, face) list: 0 = first point of an (apa,face) run
+        /// (extrapolate backward from i+1), 1 = last point of a run (extrapolate
+        /// forward from i-1), 2 = interior point, 3 = isolated.  A run boundary
+        /// at the very LAST point is a "last" point, not a "first" one: the
+        /// former predicate read i+1 there and threw std::out_of_range
+        /// (doc pdvd/25 M3: PDVD trajectories cross 16 (anode,face) volumes).
+        /// Identical to the former branch order whenever i+1 exists.
+        static int dqdx_path_point_role(int i, int n, const std::vector<std::pair<int, int>>& paf);
+
+        /// icarus/docs/04: the electron-lifetime charge factor exp(t_d/tau),
+        /// t_d = |drift_distance| / drift_speed.  1 when tau <= 0 (knob off) or
+        /// the drift speed is not positive.  Pure; see Parameters::electron_lifetime.
+        static double electron_lifetime_factor(double drift_distance, double drift_speed, double lifetime);
+
+        /// doc pdvd/81: un-whitened prediction of a SUBSET of trajectory rows:
+        /// out(i) = row_scale[i] * sum_k R(i,k) * pos(k) * (col_mask[k] != 0).
+        /// Pure; col_mask shorter than pos.size() reads as 0 beyond its end,
+        /// row_scale shorter than R.rows() reads as 0 beyond its end.
+        static Eigen::VectorXd masked_response_prediction(const Eigen::SparseMatrix<double>& R,
+                                                          const Eigen::VectorXd& pos,
+                                                          const std::vector<char>& col_mask,
+                                                          const std::vector<double>& row_scale);
         std::vector<double> get_reduced_chi2() const { return reduced_chi2; }
 
         // Measured 2D charge data access
@@ -545,6 +1132,40 @@ namespace WireCell::Clus {
 
         // Fitted 2D charge data organized by (apa, face, plane) -> (wire, time)
         const std::map<APAFacePlane, std::map<WireTime, FittedCharge2D>>& get_fitted_charge_2d() const { return m_fitted_charge_2d; }
+
+        /// Restrict the next fit (and the snapshot it captures) to one
+        /// cluster.  do_multi_tracking()/do_single_tracking() set this from
+        /// their cluster_filter argument; exposed so a test can drive
+        /// fill_fitted_charge_2d() the way a real fit does.
+        void set_cluster_filter(Facade::Cluster* cluster) { m_cluster_filter = cluster; }
+
+        /// doc pr/109 §8: the per-cluster snapshots, in capture order.  Unlike
+        /// get_fitted_charge_2d() these are NOT merged, so pred_charge is the
+        /// value the named cluster's own fit produced.
+        const std::vector<ClusterFitted2D>& get_cluster_fitted_charge_2d() const { return m_cluster_fitted_charge_2d; }
+
+        /// doc pdvd/81: the stored multi-fit response of `cluster` (nullptr when
+        /// keep_dqdx_response was off, the cluster was never multi-fitted with
+        /// a cluster filter, or its last fit returned early).
+        const DqdxResponse* get_dqdx_response(const Facade::Cluster* cluster) const;
+        void clear_dqdx_responses() { m_dqdx_responses.clear(); }
+
+        /// doc pdvd/42: append a snapshot captured elsewhere (the STM tagger's
+        /// per-pass copy of its private fitter's map) so a holder TrackFitting
+        /// that never fitted anything can still answer
+        /// get_cluster_fitted_charge_2d().  Additive: capture order is kept,
+        /// nothing is merged or sorted, the merged map is untouched.
+        void add_fitted_charge_2d_snapshot(Facade::Cluster* cluster, int ident, int pass,
+                                           const std::map<APAFacePlane, std::map<WireTime, FittedCharge2D>>& cells);
+
+        /// doc 30 (memory): the same hand-off, taking ownership.  A caller whose
+        /// map is dead on the next line (TaggerCheckSTM's m_acc_pass_snapshots,
+        /// cleared three lines after the hand-off loop) passes std::move and the
+        /// snapshot is never duplicated.  Stores exactly the bytes the const&
+        /// overload stores -- same order, same values -- so the two are
+        /// output-interchangeable; only the copy is skipped.
+        void add_fitted_charge_2d_snapshot(Facade::Cluster* cluster, int ident, int pass,
+                                           std::map<APAFacePlane, std::map<WireTime, FittedCharge2D>>&& cells);
 
         /**
          * Get geometry information for wire plane offsets
@@ -559,8 +1180,21 @@ namespace WireCell::Clus {
         const std::map<WirePlaneId, std::tuple<double, std::pair<double, double>, std::pair<double, double>, std::pair<double, double>>>& get_wpid_slopes() const { return wpid_slopes; }
 
     private:
+        // doc pr/98: test seam.  Lets the update_association doctest inject
+        // synthetic wpid_offsets/wpid_slopes without a detector-volumes
+        // fixture (BuildGeometry needs live IDetectorVolumes).  Declared
+        // here only; defined in clus/test/doctest_update_association.cxx.
+        friend struct TrackFittingTestHarness;
+
          // Core parameters - centralized storage
         Parameters m_params;
+
+        // doc pr/28 S17: memoized cluster ident() -> blob-center drift-x extent
+        // (cm), for skip_revert_iso_xext_cut.  Lookup/insert only, never
+        // iterated -- no ordering hazard (CLAUDE.md only forbids ITERATING
+        // pointer-keyed containers; this is int-keyed regardless).  Lives for
+        // this TrackFitting instance (one multi-track fitting pass).
+        std::unordered_map<int, double> m_cluster_xext_cache;
 
         // Helper method to get parameter value or default
         double get_param_or_default(double param_value, double default_value) const {
@@ -573,11 +1207,113 @@ namespace WireCell::Clus {
         IPCTransformSet::pointer m_pcts{nullptr};          // PC Transform Set
         
         // cluster and grouping, CTPC is from m_grouping ...
+        // Ordered by cluster id (not pointer): prepare_data() iterates these and
+        // FP-accumulates shared dead-channel charge, so iteration order must be
+        // content-stable across runs.
         Facade::Grouping* m_grouping{nullptr};
-        std::set<Facade::Cluster*> m_clusters;
-        std::set<Facade::Cluster*> m_loaded_clusters;  ///< Clusters whose charge data has been loaded into m_charge_data
+        std::set<Facade::Cluster*, PR::ClusterPtrCmp> m_clusters;
+        std::set<Facade::Cluster*, PR::ClusterPtrCmp> m_loaded_clusters;  ///< Clusters whose charge data has been loaded into m_charge_data
         bool m_charge_data_dirty{true};                ///< True when m_clusters has clusters not yet in m_charge_data
         Facade::Cluster* m_cluster_filter{nullptr};    ///< If non-null, restrict fitting to segments of this cluster
+        // doc pr/107: set by do_multi_tracking around its pre-dQ/dx
+        // form_map_graph call only (never on the trajectory rounds); while
+        // true form_map_graph stores zero-quantity interior points instead
+        // of dropping them.  Always false while the knob is 0.
+        bool m_keep_zero_quantity_points{false};
+        // doc pdvd/45: per-(apa,face) drift-frame offset (WCT mm) between the x
+        // update_association reconstructs from a cell's time (geometric offset_t /
+        // slope_t) and the t0-corrected frame of the segment clouds, keyed by
+        // WirePlaneId(kAllLayers, face, apa).ident().  Filled by form_map_graph for
+        // the fit point being associated while excl_t0_frame > 0 (the point run
+        // through the same backward(t0) + convert_3Dpoint_time_ch the cells came
+        // from, minus the point itself), read by update_association, cleared
+        // afterwards.  Empty while the knob is 0, so the legacy path never looks
+        // anything up.
+        std::map<int, double> m_excl_x_shift;
+        // doc pr/108 stage dump (debug only, env WCT_TRAJ_DUMP=<path>; unset => no
+        // code path): per trajectory round, every interior point's association
+        // counts before/after exclusion, live-plane quantities, kept flag, and
+        // the fitted positions after each round.  Mirrors WCP_TRAJ_DUMP in the
+        // prototype so the two can be diffed stage by stage.
+        FILE* m_traj_dump{nullptr};
+        int   m_traj_dump_call{0};
+        int   m_traj_dump_stage{0};
+        void  traj_dump_fits(const char* tag);
+
+        // doc pr/109 sec 9 exclusion-decision dump (debug only, env
+        // WCT_EXCL_DUMP=<path>; unset => no code path).  update_association's
+        // keep rule is "strictly closest of all siblings, or within 0.3 cm",
+        // but it discards the two distances the decision turns on and
+        // early-breaks out of the competitor scan as soon as one competitor
+        // ties or beats the segment.  With the dump on, the scan runs to
+        // completion so the TRUE nearest-competitor distance is recorded --
+        // the decision is unchanged, because
+        //     drop  <=>  exists other with dis <= min_dis_track
+        //           <=>  min-over-others <= min_dis_track,
+        // which is what the full scan evaluates.  One line per fresh
+        // (segment, cell) decision; cache hits are not re-dumped, so each
+        // decision appears exactly once.  Lets the recovery curve of a
+        // proposed tie margin or a larger keep floor be computed offline,
+        // from one run per detector, without building either knob.
+        FILE* m_excl_dump{nullptr};
+        WireCell::Point m_excl_dump_pt;   // the fit point whose association is being trimmed
+        bool  exclusion_keep_dump(const std::shared_ptr<PR::Segment>& segment,
+                                  const std::vector<std::shared_ptr<PR::Segment>>& all_segments,
+                                  const WireCell::Point& test_point, const Coord2D& coord,
+                                  int apa, int face, int plane, double min_dis_track);
+
+        // doc pr/49 round 3 (fit_blob_coverage knob): clusters owning a
+        // segment in the current fit -- the "fitting scope" whose members
+        // never count as foreign in is_cell_covered_by_foreign_blobs.
+        // Rebuilt by rebuild_cov_fit_scope() at the top of each
+        // form_map/form_map_graph call while the knob is on; membership-only
+        // (.count()), never iterated, so pointer keying cannot affect
+        // determinism.  NOT m_clusters: that set is polluted by
+        // preload_clusters() with charge-cache-only clusters that own no
+        // segment.
+        std::set<const Facade::Cluster*> m_cov_fit_scope;
+
+        // doc pdvd/28 T1 (PDVD PR perf round 1): per-grouping coverage index
+        // for is_cell_covered_by_foreign_blobs.  For every (apa,face), the
+        // grouping's clusters owning at least one blob there, in
+        // grouping->children() order, with the bounding box of those blobs
+        // in (slice index, u/v/w wire index).  The box is a NECESSARY
+        // condition of the per-blob predicate is_cell_covered_by_own_blobs,
+        // so walking the index, skipping by box and re-applying the
+        // unchanged predicate visits a superset of the covering clusters in
+        // the original order: same first claimant, same OR.  Validity: a
+        // (cluster pointer, nblobs) signature of children() is re-checked at
+        // every rebuild_cov_fit_scope() (top of each fit pass; clusters are
+        // never mutated inside a pass) and grouping + child count at every
+        // use; reset_for_new_event() drops it.  Never iterated by pointer
+        // (children() order only), so determinism is unaffected.
+        struct CovBox {
+            const Facade::Cluster* cluster = nullptr;
+            int smin = 0, smax = 0;        // min slice_index_min .. max slice_index_max
+            int wmin[3] = {0, 0, 0};       // per-plane min wire_index_min
+            int wmax[3] = {0, 0, 0};       // per-plane max wire_index_max
+        };
+        struct CovIndex {
+            const Facade::Grouping* grouping = nullptr;
+            std::vector<std::pair<const Facade::Cluster*, size_t>> signature;
+            std::map<std::pair<int, int>, std::vector<CovBox>> by_face;  // (apa,face) -> children order
+        };
+        mutable CovIndex m_cov_index;
+        void ensure_cov_index(const Facade::Grouping* grouping) const;
+        // WCT_TF_COVERAGE_CENSUS=1: log-only counters (calls, index entries
+        // visited, box survivors, covering clusters), printed at each index
+        // rebuild and at destruction.  Unset => no counting, no log line.
+        mutable size_t m_cov_census[4] = {0, 0, 0, 0};
+
+        // doc pr/50 (172230-class near-vertex robustness): graph vertex
+        // positions (fit point when valid, else wcpt) and degrees at the
+        // last rebuild_cov_fit_scope() call, in ordered_nodes order.  Used
+        // by the deweight sentinel to report each firing's distance to the
+        // nearest pattern vertex (and that vertex's degree) -- the census
+        // evidence for classifying near-vertex vs far-ghost deweights.
+        // Refreshed only while the fit_blob_coverage knob is on; read-only
+        // positional data, never iterated by pointer.
+        std::vector<std::pair<WireCell::Point, int>> m_cov_vtx_info;
 
         // Option 1: per-cluster edge descriptor cache to avoid full graph traversal
         std::unordered_map<Facade::Cluster*, std::vector<PR::edge_descriptor>> m_cluster_edges;
@@ -600,6 +1336,10 @@ namespace WireCell::Clus {
         // Neutrino pattern-recognition results (set by TaggerCheckNeutrino)
         PR::VertexPtr        m_main_vertex{nullptr};
         PR::IndexedShowerSet m_showers;
+        // doc sbnd_xin/docs/pr/40 round 9 B2 -- see the accessor comment.
+        std::set<int>        m_bridged_cluster_ids;
+        // doc sbnd_xin/docs/pr/92 -- see the accessor comment.
+        std::set<int>        m_dropped_satellite_shower_ids;
 
         // Pi0 identification results (set by TaggerCheckNeutrino via set_pi0_data)
         PR::IndexedShowerSet                      m_pi0_showers;
@@ -610,6 +1350,10 @@ namespace WireCell::Clus {
         // Kinematics and tagger features (set by TaggerCheckNeutrino)
         PR::KineInfo   m_kine_info{};
         PR::TaggerInfo m_tagger_info{};
+        // doc sbnd_xin/docs/pr/75 -- diagnostic only, empty unless the
+        // vertex_scoreboard knob was on.
+        PR::VertexScoreboard m_vertex_scoreboard{};
+        std::vector<PR::DlVtxCall> m_dlvtx_calls;   // ai-helper issue 35
 
         // =====================================================================
         // HYBRID CACHE IMPLEMENTATION
@@ -651,17 +1395,37 @@ namespace WireCell::Clus {
         // Global (apa, time, channel) to blobs
         std::unordered_map<CoordReadout, std::unordered_set<Facade::Blob*>, CoordReadoutHash> global_rb_map;
 
+        // doc pdvd/28 round 2: memo of get_wires_for_channel(), keyed (apa<<32 ^ channel).
+        // Geometry is fixed for the fitter's lifetime; cleared in reset_for_new_event().
+        mutable std::unordered_map<long long, std::vector<std::tuple<int, int, int>>> m_channel_wires_memo;
+        mutable const Facade::Grouping* m_channel_wires_memo_grouping{nullptr};   ///< grouping the memo was filled under
+
         // Fitted 2D charge organized by (apa, face, plane) -> (wire, time)
         std::map<APAFacePlane, std::map<WireTime, FittedCharge2D>> m_fitted_charge_2d;
 
         /// Per-cluster snapshots of m_fitted_charge_2d captured at the end of
         /// every fill_fitted_charge_2d() call when m_cluster_filter is set.
-        /// Overwriting the same key on each refill gives "latest fit wins per
-        /// cluster", correctly handling re-fits during pattern recognition.
+        /// Refitting the same cluster replaces its entry in place, so this is
+        /// still "latest fit wins per cluster" across pattern recognition.
         /// Merged into m_fitted_charge_2d by assemble_fitted_charge_2d().
-        std::map<Facade::Cluster*,
-                 std::map<APAFacePlane, std::map<WireTime, FittedCharge2D>>>
-            m_cluster_fitted_charge_2d;
+        ///
+        /// doc pr/109 §8: this was a std::map keyed by Facade::Cluster* and
+        /// ORDERED BY IDENT (PR::ClusterPtrCmp).  Ident order was needed --
+        /// the merge is last-writer-wins on shared cells and a pointer-ordered
+        /// walk made pred_charge run-dependent (10.2% of cells moved between
+        /// two `setarch -R` runs of SBND evt 388, doc pr/28 §4.3, §14) -- but
+        /// ident order also made two live clusters that share an ident compare
+        /// EQUAL, so the earlier snapshot was silently discarded.  That fired
+        /// on uBooNE 5384-6528 and cost the main cluster its entire prediction
+        /// (T_proj_data cid 19: 2141 cells, Σpred = 0).  A vector in capture
+        /// order keeps both; assemble_fitted_charge_2d() still walks them in
+        /// (ident, capture index) order, so the merged map is unchanged
+        /// wherever no collision occurs.
+        std::vector<ClusterFitted2D> m_cluster_fitted_charge_2d;
+
+        /// doc pdvd/81: per-cluster multi-fit responses, capture order (see
+        /// DqdxResponse).  Empty unless Parameters::keep_dqdx_response > 0.
+        std::vector<DqdxResponse> m_dqdx_responses;
 
         // global geometry
 
@@ -692,6 +1456,15 @@ namespace WireCell::Clus {
         std::vector<double> pt;
         std::vector<std::pair<int, int>> paf;
         std::vector<double> reduced_chi2;
+        // doc pdvd/56 T4: per-plane dead-channel flags, populated by
+        // dQ_dx_fit only (the single-segment path CheckSTM_Michel/
+        // TaggerCheckSTM actually call); dQ_dx_multi_fit keeps its own
+        // function-local reg_flag_u/v/w, unrelated to these.  Sized/zeroed by
+        // dQ_dx_fill too so do_single_tracking's Fit-build loop always sees a
+        // consistent (possibly empty) vector; see the bounds guard there.
+        std::vector<int> reg_flag_u;
+        std::vector<int> reg_flag_v;
+        std::vector<int> reg_flag_w;
     };
 
 } // namespace WireCell::Clus

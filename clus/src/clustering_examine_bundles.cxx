@@ -7,6 +7,10 @@
 #include "WireCellUtil/NamedFactory.h"
 #include "WireCellAux/Logger.h"
 
+#include <cstdlib>   // std::getenv  (WCT_FLASHT0_DEBUG instrumentation, removable)
+#include <unordered_map>
+#include <unordered_set>
+
 
 class ClusteringExamineBundles;
 WIRECELL_FACTORY(ClusteringExamineBundles, ClusteringExamineBundles,
@@ -26,6 +30,10 @@ static void clustering_examine_bundles(
         const Tree::Scope& scope,
         const bool use_ctpc,
         const std::string& graph_name,
+        const bool use_flash_t0,
+        const double flash_t0_window,
+        const bool flags_from_longest,
+        const bool save_bundle_main_provenance,
         WireCell::Log::logptr_t log);
 
 class ClusteringExamineBundles : public IConfigurable, public Clus::IEnsembleVisitor, public Aux::Logger, private NeedDV, private NeedPCTS, private NeedScope {
@@ -43,16 +51,60 @@ public:
         // If false, then DV and PCTS are not needed.
         use_ctpc_ = get<bool>(config, "use_ctpc", use_ctpc_);
         graph_name_ = get<std::string>(config, "graph_name", graph_name_);
+        use_flash_t0_ = get<bool>(config, "use_flash_t0", use_flash_t0_);
+        flash_t0_window_ = get<double>(config, "flash_t0_window", flash_t0_window_);
+        // Default false = historical (arbitrary donor) flag behavior on the
+        // flash-time merge.  See merge_clusters() in ClusteringFuncs.h.
+        flags_from_longest_ = get<bool>(config, "flags_from_longest", flags_from_longest_);
+        // Default false = the array is never created, so the "perblob" key set
+        // is unchanged and every detector's output is byte-identical.  See
+        // merge_clusters()'s orig_wasmain_aname (doc pr/20 Part I P1).
+        save_bundle_main_provenance_ =
+            get<bool>(config, "save_bundle_main_provenance", save_bundle_main_provenance_);
+    }
+
+    // Round-trip this class's own knobs.  Previously absent, so the inherited
+    // empty default_configuration() left every one of them invisible to a
+    // config dump and discoverable only by reading this file.
+    //
+    // Output-neutral by construction: configure() reads each key with
+    // get<T>(config, key, member_), which returns member_ when the key is
+    // absent.  Emitting the key WITH member_'s value therefore makes get()
+    // return exactly what it returned before, for every caller, whether or not
+    // the jsonnet overrides it.  (Gated on the SBND 48-event PR chain; see
+    // sbnd_xin/docs/70.)
+    //
+    // Deliberately NOT emitting the NeedDV / NeedPCTS / NeedScope keys: those
+    // belong to the mixins, which apply their own defaults when the key is
+    // absent, and duplicating them here would be a second source of truth.
+    virtual WireCell::Configuration default_configuration() const {
+        WireCell::Configuration cfg;
+        cfg["use_ctpc"] = use_ctpc_;
+        cfg["graph_name"] = graph_name_;
+        cfg["use_flash_t0"] = use_flash_t0_;
+        cfg["flash_t0_window"] = flash_t0_window_;
+        // false = historical (arbitrary donor) flag behavior on the flash-time merge
+        cfg["flags_from_longest"] = flags_from_longest_;
+        // false = the provenance array is never created, so the "perblob" key
+        // set is unchanged and every detector's output is byte-identical
+        cfg["save_bundle_main_provenance"] = save_bundle_main_provenance_;
+        return cfg;
     }
 
     void visit(Ensemble& ensemble) const {
         auto& live = *ensemble.with_name("live").at(0);
-        clustering_examine_bundles(live, m_dv, m_pcts, m_scope, use_ctpc_, graph_name_, log);
+        clustering_examine_bundles(live, m_dv, m_pcts, m_scope, use_ctpc_, graph_name_,
+                                   use_flash_t0_, flash_t0_window_, flags_from_longest_,
+                                   save_bundle_main_provenance_, log);
     }
 
 private:
     bool use_ctpc_{true};
     std::string graph_name_{"relaxed"};
+    bool use_flash_t0_{false};
+    double flash_t0_window_{80*units::ns};
+    bool flags_from_longest_{false};
+    bool save_bundle_main_provenance_{false};
 };
 
 
@@ -75,9 +127,132 @@ static void clustering_examine_bundles(
     const Tree::Scope& scope,
     const bool use_ctpc,
     const std::string& graph_name,
+    const bool use_flash_t0,
+    const double flash_t0_window,
+    const bool flags_from_longest,
+    const bool save_bundle_main_provenance,
     WireCell::Log::logptr_t log)
 {
     // std::cout << "Test Examine Bundles" << std::endl;
+
+    // Flash-aware pre-step: collapse each matched-flash-time group of clusters
+    // into a single cluster, so the per-cluster labeling below partitions one
+    // cluster per flash group (main sub-component = -1), like clustering_isolated
+    // but grouped by flash time instead of geometry.  merge_clusters() (see
+    // ClusteringFuncs.cxx) carries the longest contributing member's flash onto
+    // the merged cluster.  With use_flash_t0=false this is skipped entirely.
+    if (use_flash_t0) {
+        auto pre_clusters = live_grouping.children();
+        auto flash_t0_group = assign_flash_t0_groups(pre_clusters, flash_t0_window);
+
+        cluster_connectivity_graph_t g;
+        std::unordered_map<int, int> ilive2desc;
+        std::unordered_map<const Cluster*, int> map_cluster_index;
+        for (size_t ilive = 0; ilive < pre_clusters.size(); ++ilive) {
+            auto live = pre_clusters[ilive];
+            map_cluster_index[live] = ilive;
+            ilive2desc[ilive] = boost::add_vertex(ilive, g);
+        }
+        // Iso-band veto, GROUP level (doc pr/66; see cluster_has_band_veto_role's
+        // header comment for why this stage needs more than the pairwise edge
+        // veto merge_clusters() applies everywhere else).  This stage's edges
+        // are gated ONLY on shared flash time -- no geometric distance check at
+        // all -- so a third, unmarked cluster sharing a flash group can bridge
+        // a marked band and a marked non-band cluster into one connected
+        // component even with the direct edge between them dropped.  Exclude
+        // every non-band-marked cluster from EVERY edge in a flash-time group
+        // that also contains a band-marked cluster: it sits out this round's
+        // collapse (remains its own cluster / associated fragment) rather than
+        // being reachable via any path.  Fail-open: no marked cluster anywhere
+        // (the knob-off, common case) => no group ever qualifies => this costs
+        // one cheap scan and excludes nothing => byte-identical.
+        std::set<int> groups_with_band;
+        for (auto c : pre_clusters) {
+            if (cluster_has_band_veto_role(c, band_veto_band)) {
+                groups_with_band.insert(flash_t0_group.at(c));
+            }
+        }
+        // membership only, never iterated -- ok as pointer-keyed (CLAUDE.md
+        // determinism rule targets iteration order, not lookup).
+        std::unordered_set<const Cluster*> excluded_nonband;
+        if (!groups_with_band.empty()) {
+            for (auto c : pre_clusters) {
+                if (groups_with_band.count(flash_t0_group.at(c)) &&
+                    cluster_has_band_veto_role(c, band_veto_nonband)) {
+                    excluded_nonband.insert(c);
+                }
+            }
+            if (!excluded_nonband.empty()) {
+                log->info("nu_band_veto: group exclusion, {} band-marked flash group(s), "
+                          "{} non-band-marked cluster(s) sat out of the flash-t0 collapse",
+                          groups_with_band.size(), excluded_nonband.size());
+            }
+        }
+        // Edge between every pair of in-scope clusters sharing a flash-time group.
+        // Unmatched clusters get unique singleton groups, so they are never linked.
+        for (size_t i = 0; i < pre_clusters.size(); ++i) {
+            auto c1 = pre_clusters[i];
+            if (!c1->get_scope_filter(scope)) continue;
+            if (excluded_nonband.count(c1)) continue;
+            for (size_t j = i + 1; j < pre_clusters.size(); ++j) {
+                auto c2 = pre_clusters[j];
+                if (!c2->get_scope_filter(scope)) continue;
+                if (excluded_nonband.count(c2)) continue;
+                if (flash_t0_group.at(c1) != flash_t0_group.at(c2)) continue;
+                boost::add_edge(ilive2desc[map_cluster_index[c1]],
+                                ilive2desc[map_cluster_index[c2]], g);
+            }
+        }
+
+        // Diagnostic: how many in-scope matched clusters fall into how many
+        // distinct flash-time groups (each multi-member group is merged into one).
+        std::set<int> matched_groups;
+        int n_matched_inscope = 0;
+        for (auto c : pre_clusters) {
+            if (c->get_scope_filter(scope) && c->get_scalar<int>("flash", -1) >= 0) {
+                ++n_matched_inscope;
+                matched_groups.insert(flash_t0_group.at(c));
+            }
+        }
+        log->debug("flash-t0 merge: {} in-scope matched clusters -> {} flash-time groups",
+                   n_matched_inscope, matched_groups.size());
+
+        // doc pr/94 Phase 5b root-cause trace: dump the pre-merge identity of
+        // every in-scope, independently-matched cluster so a specific merged
+        // group's members can be inspected by ident/flash/gid/t0.  Diagnostic
+        // only; gated so it costs nothing and changes nothing when off.
+        if (std::getenv("WCT_FLASHT0_DEBUG")) {
+            for (auto c : pre_clusters) {
+                if (!c->get_scope_filter(scope)) continue;
+                const int flash = c->get_scalar<int>("flash", -1);
+                const int gid = c->get_scalar<int>("matched_flash_gid", -1);
+                log->info("flash-t0 debug: cluster {} flash={} matched_flash_gid={} "
+                          "cluster_t0={:.6f} us L={:.2f} cm main={} group={} nblobs={}",
+                          c->ident(), flash, gid, c->get_cluster_t0() / units::us,
+                          c->get_length() / units::cm, c->get_flag(Flags::main_cluster),
+                          flash_t0_group.at(c), c->nchildren());
+            }
+        }
+
+        // Save, per blob, the original (pre-merge) cluster ident of each
+        // flash-group member into a "real_cluster_id" array in the "perblob" PC,
+        // and a marker of the REPRESENTATIVE member (the flash/flags donor)
+        // into "real_cluster_main".
+        // The Bee writer reads the ids so the merged group's far-apart members
+        // keep their distinct original ids (colors); TaggerCheckTGM
+        // main_component_mode="real" reads the main flags so the TGM verdict can
+        // follow the pre-merge main cluster.  Only here, under use_flash_t0
+        // (all-APA), so per-APA / other-detector output is bit-identical.
+        // "real_cluster_was_main" (opt-in) additionally records, per blob,
+        // whether the member it came from carried flag_main_cluster on the way
+        // in -- the fact this merge destroys and that nothing downstream can
+        // otherwise recover (doc pr/20 Part I P1).  Note it is NOT
+        // "real_cluster_main": that one marks the single representative member,
+        // this one marks every member that was a matched bundle main.
+        merge_clusters(g, live_grouping, "", "perblob", "real_cluster_id", flags_from_longest,
+                       "real_cluster_main",
+                       save_bundle_main_provenance ? "real_cluster_was_main" : "");
+    }
 
     std::vector<Cluster *> live_clusters = live_grouping.children();
 

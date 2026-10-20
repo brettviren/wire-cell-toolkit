@@ -16,6 +16,7 @@
 #include "WireCellIface/IDetectorVolumes.h"
 
 #include "WireCellClus/Facade_Mixins.h"
+#include "WireCellClus/Facade_Flash.h"
 #include "WireCellClus/Facade_Blob.h"
 #include "WireCellClus/Facade_ClusterCache.h"
 #include "WireCellClus/IPCTransform.h"
@@ -42,6 +43,20 @@ namespace WireCell::Clus::Facade {
         virtual ~Cluster() {}
 
         void invalidate_cache() {clear_cache();}
+
+        // Blob children changed: the memoized default-scope view (and its
+        // validity-flag pointer) may have been erased by Points::on_remove —
+        // drop the memo before any reuse.  See m_sv3d_memo.
+        virtual bool on_remove(const std::vector<node_type*>& path) {
+            m_sv3d_memo = nullptr;
+            m_sv3d_valid = nullptr;
+            return NaryTree::FacadeParent<Blob, points_t>::on_remove(path);
+        }
+        virtual bool on_insert(const std::vector<node_type*>& path) {
+            m_sv3d_memo = nullptr;
+            m_sv3d_valid = nullptr;
+            return NaryTree::FacadeParent<Blob, points_t>::on_insert(path);
+        }
 
         // return raw pc information ...
         void set_default_scope(const Tree::Scope& scope);
@@ -355,7 +370,12 @@ namespace WireCell::Clus::Facade {
         // given point.
         //
         // Note: radius must provide a LINEAR distance measure.
-        using const_blob_point_map_t = std::map<const Blob*, geo_point_t>;
+        // Keyed with the content-based BlobLess: consumers iterate this map
+        // and accumulate floating-point sums (calc_ave_pos, calc_dir), so the
+        // iteration order must not depend on heap pointer values or the
+        // results become allocator-dependent (one hough-bin tie then flips a
+        // connect1 merge decision).
+        using const_blob_point_map_t = std::map<const Blob*, geo_point_t, BlobLess>;
         const_blob_point_map_t get_closest_blob(const geo_point_t& point, double radius) const;
         const_blob_point_map_t get_closest_blob(const geo_point_t& point, int N) const;
 
@@ -560,7 +580,12 @@ namespace WireCell::Clus::Facade {
         /// 
         /// - "ctpc" :: likely used for Djikstra's shortest paths
         /// - "relaxed" :: likely used for connected blobs
-        /// 
+        /// - "relaxed_strict" :: stricter relaxed fork (doc pr/53 sec 16),
+        ///   selected only by ClusteringProtectBundle
+        /// - "relaxed_strict_img" :: relaxed_strict + S5 3D-image-support
+        ///   OR-kill (doc pr/53 round 7 sec 18), selected only by
+        ///   ClusteringProtectBundle
+        ///
         /// If the flavor is not in this known set, KeyError is
         /// thrown.
         ///
@@ -603,7 +628,10 @@ namespace WireCell::Clus::Facade {
         using wire_indices_t = std::vector<std::vector<int_t>>;
         const wire_indices_t& wire_indices() const;
 
-        std::vector<geo_point_t> get_hull() const;
+        // max_points caps the number of points the quickhull is run on; a cluster
+        // with more points than the cap returns an empty hull (the cap guards cost).
+        // Pass max_points < 0 (the default) to use Constants::MaxHullPoints.
+        std::vector<geo_point_t> get_hull(int max_points = -1) const;
 
         // Return PCA calculated on blob children sample points
         // PCA has attributes: {center,axis,values}
@@ -637,57 +665,78 @@ namespace WireCell::Clus::Facade {
         /// @note p_test will be updated
         bool judge_vertex(geo_point_t& p_test, const IDetectorVolumes::pointer dv, const double asy_cut = 1. / 3., const double occupied_cut = 0.85);
 
-        class Flash {
-            friend class Cluster;
-            bool m_valid{false};
-            double m_time{0}, m_value{0};
-            int m_ident{-1}, m_type{-1};
-            std::vector<double> m_times, m_values, m_errors;
-        public:
-
-            /// A "false" means there was not "flash" PC array and all values
-            /// are invalid.  A "true" does not guarantee all values are valid.
-            explicit operator bool() const { return m_valid;}
-
-            /// Any "singular" methods are about the flash itself.
-
-            /// Get the time of the flash.  
-            double time() const { return m_time; }
-
-            /// Get the measurement of the flash
-            double value() const {return m_value; }
-
-            /// The ID of the flash
-            int ident() const { return m_ident; }
-
-            /// The type of the flash.
-            int type() const { return m_type; }
-
-            /// Any "plural" methods return per-optical-detector quantities.
-            /// They will be empty() if the "light" and "flashlight" arrays are
-            /// missing.  These vectors have the same size.
-
-            // keep these return-by-value.
-
-            /// Times of individual optical detector readouts.
-            std::vector<double> times() const { return m_times; }
-            /// Measurement values from optical detectors.
-            std::vector<double> values() const { return m_values; }
-            /// Measurement uncertainty from optical detectors.
-            std::vector<double> errors() const { return m_errors; }
-        };
-        // Return a flash.  If there is none, it will hold default values.
+        // The flash facade was promoted to a standalone Facade::Flash (see
+        // WireCellClus/Facade_Flash.h) so the Grouping can also enumerate flashes.
+        // This alias keeps Cluster::Flash valid for back-compat.
+        using Flash = ::WireCell::Clus::Facade::Flash;
+        // Return this cluster's matched flash.  If there is none, it will hold
+        // default values (operator bool() == false).  Delegates to
+        // Grouping::flash_at() for the matched flash index ("flash" scalar).
+        //
+        // CAVEAT, multi-APA detectors.  The "flash" scalar is the row id of the
+        // flash within the PER-INPUT flash tensor QLMatching matched against,
+        // but the canonical "flash"/"light"/"flashlight" PCs are NOT merge-safe:
+        // the multi-input merge (QLMatching::operator(), or the standalone
+        // PointTreeMerging it replaces) keeps only the PRIMARY input's PCs and
+        // DROPS every other input's -- only names in root_pcs_to_merge survive.
+        // A cluster matched on any non-primary input therefore resolves against
+        // a list that is not its own: an out-of-range index yields an invalid
+        // Flash (it used to read raw memory), but an in-range one silently
+        // yields a DIFFERENT, real flash.  In SBND production that is 24024 of
+        // 50699 matched clusters.
+        //
+        // The archive-local test for "did I resolve the right row" is
+        //     flash.time() == cluster->get_cluster_t0()
+        // -- QLMatching sets cluster_t0 from the flash the cluster actually
+        // matched, and that survives even when the flash's PC row does not.
+        // Full measurement: sbnd_xin/docs/99.
+        //
+        // Prefer get_matched_flash() below, which is immune to all of this.
         Flash get_flash() const;
+
+        // Return this cluster's matched flash, resolved by the globally-unique
+        // "matched_flash_gid" scalar against the merge-safe "opflash" PC rather
+        // than by the per-input "flash" row index.  This is the correct read for
+        // a merged multi-input grouping: unlike get_flash() it resolves the
+        // flash the cluster ACTUALLY matched, whichever input matched it.
+        // Measured on SBND production: 20156/20156 clusters correct (by the
+        // flash.time() == cluster_t0 test), against 50.7% for get_flash().
+        //
+        // Invalid Flash (operator bool() == false) when the cluster carries no
+        // matched flash, when the grouping has no "opflash" PC, or when the gid
+        // resolves to no row -- see Grouping::flash_by_gid(), whose header also
+        // carries the gid-uniqueness precondition.
+        //
+        // Differences from get_flash() on a row it resolves correctly: ident()
+        // is the GID (globally unique, joins to "opflash") and not the per-input
+        // row id; type() is 0; errors() are 0 and cov_idents()/covs() are empty
+        // ("opflash" carries no saturation or coverage columns).  time() and
+        // value() are bit-identical.
+        Flash get_matched_flash() const;
 
         /// Helper function to check if a point is spatially related to a reference cluster using time_blob_map
         /// Implements the same filtering logic as prototype's old_time_mcells_map checking
         /// @param point_index Index of point in current cluster
         /// @param ref_time_blob_map Reference cluster's time-indexed blob map
+        /// @param flag_nearby_timeslice Also try the two adjacent slices
+        /// @param wire_tol Wire-index slack, in wires, applied to every ref blob
+        ///        bound (see check_wire_ranges_match).  0 = exact containment.
+        /// @param slice_stride Key distance to the adjacent slice, in the SAME
+        ///        unit as the time_blob_map key -- which is TICKS, not slices
+        ///        (Blob cache slice_index_min is documented "unit: tick").  The
+        ///        default 1 is a tick, so on any detector with more than one
+        ///        tick per slice the flag_nearby_timeslice branch cannot match
+        ///        anything: no blob starts one tick off the slice grid.  Pass
+        ///        the face's nticks-per-slice to make it live.  Kept at 1 by
+        ///        default so existing callers are bit-for-bit unchanged; see
+        ///        doc pr/29 D12.
         /// @return True if point's wire indices fall within reference cluster's spatial regions
         bool is_point_spatially_related_to_time_blobs(
-            size_t point_index, 
+            size_t point_index,
             const time_blob_map_t& ref_time_blob_map,
-            bool flag_nearby_timeslice
+            bool flag_nearby_timeslice,
+            int wire_tol = 0,
+            int slice_stride = 1
        ) const;
 
        private:
@@ -704,6 +753,15 @@ namespace WireCell::Clus::Facade {
         std::map<size_t, bool> m_map_scope_filter={{m_scope_3d_raw.hash(), true}};
         std::map<size_t, std::string> m_map_scope_transform={{m_scope_3d_raw.hash(), "Unity"}};
 
+        // Memoized default-scope view: sv3d() is called per point query in
+        // the clustering hot loops and each scoped_view() resolution hashes
+        // and string-compares the Scope.  The view pointer is stable across
+        // node inserts (only its validity flag drops, restored by re-calling
+        // scoped_view()); node removal erases the view, so on_insert and
+        // on_remove reset the memo (as does set_default_scope).
+        mutable const Tree::ScopedView<double>* m_sv3d_memo{nullptr};
+        mutable const bool* m_sv3d_valid{nullptr};
+
         // We handle graph algorithms special as the GA's use graphs that are
         // held in their own cache in the Mixins::Graphs base.
         mutable std::map<std::string, WireCell::Clus::Graphs::Weighted::GraphAlgorithms> m_galgs;
@@ -711,10 +769,25 @@ namespace WireCell::Clus::Facade {
         
 
         /// Helper function to check wire range overlap between a point and a reference blob
+        ///
+        /// Toolkit blob wire ranges are HALF-OPEN [min, max) -- max is one past
+        /// the last wire -- while the WCP prototype's are inclusive [low, high]
+        /// with high == max-1 (CLAUDE.md M7).  So the tolerance-free test here,
+        /// `>= min && < max`, already IS the prototype's `>= low && <= high`;
+        /// it must not be "fixed" to `<= max`.
+        ///
         /// @param point_index Index of point in current cluster
         /// @param ref_blob Reference blob to check against
+        /// @param wire_tol Slack in WIRES, applied symmetrically: the accepted
+        ///        band becomes [min - wire_tol, max + wire_tol).  Under the
+        ///        half-open convention the prototype's `<= high + 1` translates
+        ///        to `< max + 1`, NOT to `<= max + 1` -- the latter is two wires
+        ///        loose on the high side and one on the low, an asymmetry that
+        ///        does not show up in a diff.  0 (the default) = exact
+        ///        containment, i.e. every existing caller unchanged.
         /// @return True if point's wire indices fall within reference blob's wire ranges
-        bool check_wire_ranges_match(size_t point_index, const Blob* ref_blob) const;
+        bool check_wire_ranges_match(size_t point_index, const Blob* ref_blob,
+                                     int wire_tol = 0) const;
 
         /// @brief Get live wire indices for a given plane across all blobs in cluster, grouped by (apa, face)
         /// @param plane Wire plane index (0=U, 1=V, 2=W)

@@ -1,5 +1,6 @@
 #include "WireCellUtil/Logging.h"
 #include "WireCellUtil/String.h"
+#include "WireCellUtil/SharedFileSink.h"
 
 
 #include "spdlog/sinks/basic_file_sink.h"
@@ -28,8 +29,13 @@ static Log::logptr_t wct_base_logger()
     std::vector<spdlog::sink_ptr> sv;
     base_logger = std::make_shared<spdlog::logger>(name, sv.begin(), sv.end());
     spdlog::register_logger(base_logger);
-    base_logger->debug("create default logger \"wct\"");
-    spdlog::set_default_logger(base_logger);
+    base_logger->debug("create base logger \"wct\"");
+    // NOTE: we deliberately do NOT call spdlog::set_default_logger() here.
+    // WCT is often loaded as a plugin into a host application (eg art, Phlex)
+    // that owns the process-global default logger.  Repointing the default to
+    // this (initially sinkless) logger would silence the host's bare
+    // spdlog::info()/debug()/... calls.  WCT logs through its own named loggers
+    // (see Log::logger()), so it has no need to commandeer the default.
 
     return base_logger;
 }
@@ -72,7 +78,14 @@ static sink_makers_t common_sink_makers;
 // }
 void Log::add_file(std::string filename, std::string level)
 {
-    file_sink<spdlog::sinks::basic_file_sink_mt> m{level, filename};
+    // SharedFileSink, not basic_file_sink_mt.  logger(name, share_sinks=false)
+    // re-runs this maker per logger so each can hold its own pattern, and with
+    // basic_file_sink that also gave each its own FILE* -- N components then
+    // left N independent 4096-byte buffers appending to one file, splicing one
+    // component's stale buffer into the middle of another's line.  SharedFileSink
+    // keeps the per-instance formatter (so the emitted line is unchanged) and
+    // shares one handle per path.  See util/test/doctest_logging.cxx.
+    file_sink<Log::SharedFileSink> m{level, filename};
     wct_base_logger()->sinks().push_back(m());
     common_sink_makers.push_back(m);
 }

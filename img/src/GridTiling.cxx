@@ -55,14 +55,43 @@ bool Img::GridTiling::operator()(const input_pointer& slice, output_pointer& out
     out = nullptr;
     if (!slice) {
         m_blobs_seen = 0;
+        m_last_frame_ident = -1;
         log->debug("EOS");
         return true;  // eos
+    }
+
+    // Restart the blob ident sequence at every frame (event) boundary.  In a
+    // one-event process this fires once, on the first slice, when the counter
+    // is already 0 -- so the legacy path is byte-identical.  In a multi-event
+    // process it is what makes each event's blob idents match what that event
+    // gets when run alone.  See the note on m_last_frame_ident in the header.
+    {
+        const auto iframe = slice->frame();
+        const int fident = iframe ? iframe->ident() : -1;
+        if (fident != m_last_frame_ident) {
+            m_blobs_seen = 0;
+            m_last_frame_ident = fident;
+        }
     }
 
     const auto anodeid = m_anode->ident();
     const auto faceid = m_face->which(); // per-Anode face index
 
-    auto chvs = slice->activity();
+    // A non-sensitive face has an empty sensitive volume (e.g. a PDHD APA side
+    // facing the cryostat wall: declared `null` in the geometry, so AnodePlane
+    // leaves its sensitive BoundingBox uninitialized).  There is no drift
+    // volume there, so any blob tiled on it is geometrically spurious.  The
+    // active fork already yields nothing (no charge), but the dead/masked fork
+    // tiles dead channels purely geometrically and would emit phantom dead
+    // blobs that later corrupt clustering.  Emit an empty blob set instead.
+    if (m_face->sensitive().empty()) {
+        log->trace("anode={} face={} slice={} non-sensitive face, no blobs",
+                   anodeid, faceid, slice->ident());
+        out = make_empty(slice);
+        return true;
+    }
+
+    const auto& chvs = slice->activity();
 
     if (chvs.empty()) {
         log->trace("anode={} face={} slice={}, time={} ms no activity",
@@ -82,14 +111,14 @@ bool Img::GridTiling::operator()(const input_pointer& slice, output_pointer& out
     measures[0].push_back(1);  // assume first two layers in RayGrid::Coordinates
     measures[1].push_back(1);  // are for horiz/vert bounds
 
-    const int nactivities = slice->activity().size();
+    const int nactivities = chvs.size();
     int total_activity = 0;
     if (nactivities < m_face->nplanes()) {
         SPDLOG_LOGGER_TRACE(log, "anode={} face={} slice={} too few activities n={} / nplanes={}", anodeid, faceid, slice->ident(), nactivities, m_face->nplanes());
         return true;
     }
 
-    for (const auto& chv : slice->activity()) {
+    for (const auto& chv : chvs) {
         for (const auto& wire : chv.first->wires()) {
             auto wpid = wire->planeid();
             if (wpid.face() != faceid) {

@@ -2,10 +2,15 @@
 #include "SteinerGrapher.h"
 
 #include "WireCellClus/Graphs.h"
+#include <algorithm>
 #include <chrono>
+#include <unordered_set>
 #include "WireCellUtil/PointTree.h"
 #include "WireCellUtil/NamedFactory.h"
 #include "WireCellClus/ClusteringFuncs.h"
+#include "WireCellClus/SteinerBlankPlane.h"
+#include "WireCellClus/SteinerBaseWeight.h"
+#include "WireCellUtil/Exceptions.h"
 
 
 WIRECELL_FACTORY(CreateSteinerGraph, WireCell::Clus::Steiner::CreateSteinerGraph,
@@ -35,9 +40,91 @@ void Steiner::CreateSteinerGraph::configure(const WireCell::Configuration& cfg)
     NeedPCTS::configure(cfg);
 
     m_perf = get(cfg, "perf", m_perf);
+    m_require_beam_flash = get(cfg, "require_beam_flash", m_require_beam_flash);
+    m_beam_window_only = get(cfg, "beam_window_only", m_beam_window_only);
+    m_beam_window_low = get(cfg, "beam_window_low", m_beam_window_low);
+    m_beam_window_high = get(cfg, "beam_window_high", m_beam_window_high);
+    // doc pdvd/39.  Absent key => empty => every cluster => byte-identical.
+    if (cfg.isMember("skip_flags")) {
+        m_skip_flags.clear();
+        for (const auto& f : cfg["skip_flags"]) {
+            m_skip_flags.push_back(f.asString());
+        }
+    }
+    if (m_beam_window_only && !(m_beam_window_low < m_beam_window_high)) {
+        log->warn("configure: beam_window_only set but the window is empty "
+                  "([{}, {}) us) -- gate disabled, every cluster processed",
+                  m_beam_window_low/units::us, m_beam_window_high/units::us);
+    }
     m_grapher_config.dv = m_dv;
     m_grapher_config.pcts = m_pcts;
     m_grapher_config.perf = m_perf; // propagate perf flag into Grapher instances
+    // doc pr/29 D1 / D12 -- Steiner terminal filter fidelity.  Both default to
+    // the historical toolkit behaviour, so a config without these keys compiles
+    // and runs bit-for-bit as before.
+    m_grapher_config.terminal_wire_tol =
+        get(cfg, "terminal_wire_tol", m_grapher_config.terminal_wire_tol);
+    m_grapher_config.terminal_adjacent_slice =
+        get(cfg, "terminal_adjacent_slice", m_grapher_config.terminal_adjacent_slice);
+    if (m_grapher_config.terminal_wire_tol < 0) {
+        log->warn("configure: terminal_wire_tol {} is negative -- that SHRINKS the "
+                  "reference band; clamping to 0", m_grapher_config.terminal_wire_tol);
+        m_grapher_config.terminal_wire_tol = 0;
+    }
+    // doc pr/29 D2 -- forward create_steiner_tree's disable_dead_mix_cell to
+    // the edge-weight charge path.  Default false = the historical dropped
+    // argument, so an unchanged config is bit-for-bit as before.
+    m_grapher_config.edge_charge_forward_dead_mix =
+        get(cfg, "edge_charge_forward_dead_mix", m_grapher_config.edge_charge_forward_dead_mix);
+    // doc pdvd/25 M3: Steiner-terminal per-point charge floor (C++ default 4000 =
+    // the prototype constant => byte-identical when the key is absent).
+    m_grapher_config.terminal_charge_threshold =
+        get(cfg, "terminal_charge_threshold", m_grapher_config.terminal_charge_threshold);
+    // doc pdvd/37 R1: cross-blob minimum-separation thinning of the terminal
+    // set, in the WCT system of units.  C++ default 0 = no thinning, so a
+    // config without the key runs bit-for-bit as before.
+    m_grapher_config.terminal_min_separation =
+        get(cfg, "terminal_min_separation", m_grapher_config.terminal_min_separation);
+    if (m_grapher_config.terminal_min_separation < 0) {
+        log->warn("configure: terminal_min_separation {} cm is negative -- thinning "
+                  "disabled", m_grapher_config.terminal_min_separation / units::cm);
+        m_grapher_config.terminal_min_separation = 0;
+    }
+    // doc pdvd/114: blank-plane admission policy for the Steiner terminal
+    // candidates (SteinerBlankPlane.h).  C++ default "wcp" = no policy, so a
+    // config without the key runs bit-for-bit as before.  A typo is refused
+    // here rather than silently running the legacy path.
+    m_grapher_config.terminal_blank_plane_mode =
+        get<std::string>(cfg, "terminal_blank_plane_mode", m_grapher_config.terminal_blank_plane_mode);
+    {
+        Steiner::BlankPlaneMode bpm;
+        if (!Steiner::parse_blank_plane_mode(m_grapher_config.terminal_blank_plane_mode, bpm)) {
+            raise<ValueError>("CreateSteinerGraph: unknown terminal_blank_plane_mode '%s' "
+                              "(wcp | prefer3 | nearby | prefer3+nearby)",
+                              m_grapher_config.terminal_blank_plane_mode.c_str());
+        }
+    }
+    m_grapher_config.terminal_blank_plane_radius =
+        get(cfg, "terminal_blank_plane_radius", m_grapher_config.terminal_blank_plane_radius);
+    // doc pdvd/115: charge-aware pricing of the Steiner BASE graph before the
+    // Voronoi step (SteinerBaseWeight.h).  C++ default 0 = no pricing, so a
+    // config without the key runs bit-for-bit as before.  A negative alpha
+    // and an unknown scope are refused rather than silently mapped.
+    m_grapher_config.base_weight_blank_alpha =
+        get(cfg, "base_weight_blank_alpha", m_grapher_config.base_weight_blank_alpha);
+    if (m_grapher_config.base_weight_blank_alpha < 0) {
+        raise<ValueError>("CreateSteinerGraph: base_weight_blank_alpha %g is negative (0 = off)",
+                          m_grapher_config.base_weight_blank_alpha);
+    }
+    m_grapher_config.base_weight_scope =
+        get<std::string>(cfg, "base_weight_scope", m_grapher_config.base_weight_scope);
+    {
+        Steiner::BaseWeightScope bws;
+        if (!Steiner::parse_base_weight_scope(m_grapher_config.base_weight_scope, bws)) {
+            raise<ValueError>("CreateSteinerGraph: unknown base_weight_scope '%s' (tree | tree+path)",
+                              m_grapher_config.base_weight_scope.c_str());
+        }
+    }
     const std::string retiler_tn = get<std::string>(cfg, "retiler", "RetileCluster");
     m_grapher_config.retile = Factory::find_tn<IPCTreeMutate>(retiler_tn);
 }
@@ -54,6 +141,47 @@ Configuration Steiner::CreateSteinerGraph::default_configuration() const
     cfg["replace"] = m_replace;
     // If true, print per-step timing to stdout.
     cfg["perf"] = m_perf;
+    // If true (uBooNE) only beam_flash-flagged clusters are processed; false
+    // (post-QL-matching detectors without that flag) processes every
+    // scope-passing cluster, mains recognized by their main_cluster flag.
+    cfg["require_beam_flash"] = m_require_beam_flash;
+    // If true, process only the beam-coincident bundle: clusters whose
+    // matched flash time (cluster_t0) is in [beam_window_low,
+    // beam_window_high) plus the companions sharing their matched_flash_gid.
+    // Default false = every cluster, i.e. legacy behavior; the window is also
+    // ignored when low >= high.
+    cfg["beam_window_only"] = m_beam_window_only;
+    cfg["beam_window_low"] = m_beam_window_low;
+    cfg["beam_window_high"] = m_beam_window_high;
+    // doc pdvd/39: cluster flags that skip the build entirely (e.g. ["TGM"]).
+    // Empty = every cluster, i.e. legacy behavior.
+    cfg["skip_flags"] = Json::arrayValue;
+    for (const auto& f : m_skip_flags) cfg["skip_flags"].append(f);
+    // doc pr/29 D1: wire slack, in wires, for the Steiner terminal filter ONLY
+    // (the prototype uses 1 there and 0 in get_extreme_wcps).  0 = legacy.
+    cfg["terminal_wire_tol"] = m_grapher_config.terminal_wire_tol;
+    cfg["terminal_charge_threshold"] = m_grapher_config.terminal_charge_threshold;
+    // doc pdvd/37 R1: minimum spacing enforced across blob boundaries on the
+    // terminal set, before the extreme points are added.  0 = legacy (none).
+    cfg["terminal_min_separation"] = m_grapher_config.terminal_min_separation;
+    // doc pr/29 D12: step the terminal filter's adjacent-slice lookup by the
+    // face's ticks-per-slice instead of by 1.  The map is tick-keyed, so the
+    // legacy step of 1 never matches and the fallback is dead.  false = legacy.
+    cfg["terminal_adjacent_slice"] = m_grapher_config.terminal_adjacent_slice;
+    // doc pr/29 D2: honour the caller's disable_dead_mix_cell when weighting
+    // steiner edges (the prototype does; the toolkit dropped the argument and
+    // always used true).  false = legacy.
+    cfg["edge_charge_forward_dead_mix"] = m_grapher_config.edge_charge_forward_dead_mix;
+    // doc pdvd/114: blank-plane admission policy for the terminal candidates
+    // ("wcp" | "prefer3" | "nearby" | "prefer3+nearby") and the nearby radius.
+    // "wcp" / 0 = legacy.
+    cfg["terminal_blank_plane_mode"] = m_grapher_config.terminal_blank_plane_mode;
+    cfg["terminal_blank_plane_radius"] = m_grapher_config.terminal_blank_plane_radius;
+    // doc pdvd/115: pricing of the base graph before the Voronoi step, per
+    // zero-charge plane at the edge endpoints (0 = legacy, none), and whether
+    // the priced length also enters the reduced graph ("tree" | "tree+path").
+    cfg["base_weight_blank_alpha"] = m_grapher_config.base_weight_blank_alpha;
+    cfg["base_weight_scope"] = m_grapher_config.base_weight_scope;
 
     return cfg;
 }
@@ -72,19 +200,89 @@ void Steiner::CreateSteinerGraph::visit(Ensemble& ensemble) const
     std::vector<Cluster*> filtered_clusters;
 
     Cluster* main_cluster = nullptr;
+    size_t n_skipped_by_flag = 0;
 
     for (auto* cluster : grouping.children()) {
-        // check scope 
+        // check scope
         auto& default_scope = cluster->get_default_scope();
         auto& raw_scope = cluster->get_raw_scope();
         // if scope is not raw, apply filter ...
         if (default_scope.hash()!=raw_scope.hash() && (!cluster->get_scope_filter(default_scope)) ) continue;
 
-        if (cluster->get_flag(Flags::beam_flash)){
-            filtered_clusters.push_back(cluster);
-            if (cluster->get_flag(Flags::main_cluster)) {
-                main_cluster = cluster;
+        // doc pdvd/39: drop clusters an earlier visitor already tagged.  The
+        // surviving vector stays a subsequence of the ungated one, so the
+        // processing order of the kept clusters is unchanged.  Empty
+        // m_skip_flags (the default) never enters the loop body.
+        {
+            bool skip = false;
+            for (const auto& f : m_skip_flags) {
+                if (cluster->get_flag(f)) { skip = true; break; }
             }
+            if (skip) { ++n_skipped_by_flag; continue; }
+        }
+
+        if (m_require_beam_flash) {
+            if (cluster->get_flag(Flags::beam_flash)){
+                filtered_clusters.push_back(cluster);
+                if (cluster->get_flag(Flags::main_cluster)) {
+                    main_cluster = cluster;
+                }
+            }
+        }
+        else {
+            filtered_clusters.push_back(cluster);
+        }
+    }
+
+    if (!m_skip_flags.empty()) {
+        std::string flags_str;
+        for (const auto& f : m_skip_flags) {
+            if (!flags_str.empty()) flags_str += ",";
+            flags_str += f;
+        }
+        SPDLOG_LOGGER_INFO(log, "CreateSteinerGraph: skip_flags [{}]: skipped {} cluster(s), {} remain",
+                           flags_str, n_skipped_by_flag, filtered_clusters.size());
+    }
+
+    // Beam-window gate: keep only the beam-coincident bundle(s) -- the main
+    // clusters whose matched flash time (cluster_t0) lies in [low, high) plus
+    // the companions sharing their matched_flash_gid (the same pairing rule
+    // TaggerCheckSTM uses).  The downstream taggers carry the same gate, so
+    // the clusters dropped here are exactly the ones no tagger evaluates.
+    // The surviving vector is a subsequence of the ungated one, so the
+    // processing order of the kept clusters is unchanged; the gid set is keyed
+    // by int, never by pointer.
+    if (m_beam_window_only && m_beam_window_low < m_beam_window_high) {
+        auto in_window = [this](const Cluster* c) {
+            const double t0 = c->get_cluster_t0();
+            return t0 >= m_beam_window_low && t0 < m_beam_window_high;
+        };
+        std::unordered_set<int> beam_gids;
+        size_t n_main_in = 0;
+        for (auto* cluster : filtered_clusters) {
+            if (!cluster->get_flag(Flags::main_cluster)) continue;
+            if (!in_window(cluster)) continue;
+            ++n_main_in;
+            const int gid = cluster->get_scalar<int>("matched_flash_gid", -1);
+            if (gid >= 0) beam_gids.insert(gid);
+        }
+        std::vector<Cluster*> beam_clusters;
+        for (auto* cluster : filtered_clusters) {
+            const int gid = cluster->get_scalar<int>("matched_flash_gid", -1);
+            const bool companion = !cluster->get_flag(Flags::main_cluster)
+                && gid >= 0 && beam_gids.count(gid) > 0;
+            if (in_window(cluster) || companion) beam_clusters.push_back(cluster);
+        }
+        SPDLOG_LOGGER_INFO(log, "CreateSteinerGraph: beam_window_only [{:.3f}, {:.3f}) us: kept {} of {} cluster(s) ({} in-window main(s), {} flash group(s))",
+                           m_beam_window_low/units::us, m_beam_window_high/units::us,
+                           beam_clusters.size(), filtered_clusters.size(), n_main_in, beam_gids.size());
+        filtered_clusters.swap(beam_clusters);
+        // In require_beam_flash mode the single main is tracked separately; it
+        // must not survive the swap if the gate dropped it.
+        if (main_cluster
+            && std::find(filtered_clusters.begin(), filtered_clusters.end(), main_cluster)
+               == filtered_clusters.end()) {
+            main_cluster = nullptr;
         }
     }
 
@@ -104,12 +302,34 @@ void Steiner::CreateSteinerGraph::visit(Ensemble& ensemble) const
             ? std::string("main ") + std::to_string(src->ident())
             : std::string("assoc ") + std::to_string(src->get_cluster_id());
 
+        // replace=false (doc pr/23 second pass): keep an existing
+        // steiner_graph untouched.  Rebuilding would give_graph()
+        // (erase+emplace) the store node and dangle every GraphAlgorithms
+        // handed out since it was built -- the tagger-stage STM fit caches
+        // one, and the dangling reference aborts the neutrino PR
+        // (garbage num_vertices, SBND evts 54095/163543).  m_replace
+        // defaults true = the historical always-rebuild path, so configs
+        // without the key are byte-identical.
+        if (!m_replace && src->has_graph("steiner_graph")) {
+            SPDLOG_LOGGER_TRACE(log, "CreateSteinerGraph: [{}] keeping existing steiner_graph (replace=false)", tag);
+            return true;
+        }
+
         t0 = Clock::now();
         auto new_node = m_grapher_config.retile->mutate(*src->node());
         auto new_cluster_1 = new_node->value.facade<Cluster>();
         auto& new_cluster = grouping.make_child();
         new_cluster.take_children(*new_cluster_1);
         new_cluster.from(*src);
+        // doc pdvd/25 M3: an EMPTY retiled cluster (PDVD run 039252 evt 4)
+        // cannot be path-found (get_two_boundary_wcps / closest point on zero
+        // points); treat it like the no-steiner_graph case below.
+        if (new_cluster.npoints() == 0) {
+            SPDLOG_LOGGER_WARN(log, "CreateSteinerGraph: retiled cluster for {} has no points, skipping", tag);
+            auto* empty_ptr = &new_cluster;
+            grouping.destroy_child(empty_ptr, true);
+            return false;
+        }
         if (m_perf) SPDLOG_LOGGER_TRACE(log, "CreateSteinerGraph timing: [{}] retile->mutate took {} ms", tag, MS(Clock::now() - t0).count());
 
         t0 = Clock::now();
@@ -160,6 +380,17 @@ void Steiner::CreateSteinerGraph::visit(Ensemble& ensemble) const
         }
 
         const auto& steiner_point_cloud = sg.get_point_cloud("steiner_pc");
+        // A degenerate cluster can yield an EMPTY steiner point cloud (zero
+        // points; SBND MC evt 11).  Transferring it would hang a
+        // schema-deviant "steiner_pc" local PC on the real cluster, which the
+        // pctree serializer rejects (Dataset::append: missing keys) -- treat
+        // it like the no-steiner_graph case above: skip the transfer, leaving
+        // the cluster without steiner products (all consumers guard on that).
+        if (steiner_point_cloud.size_major() == 0) {
+            SPDLOG_LOGGER_WARN(log, "CreateSteinerGraph: empty steiner_pc for {}, skipping transfer", tag);
+            grouping.destroy_child(new_cluster_ptr, true);
+            return false;
+        }
         const auto& steiner_graph       = sg.get_graph("steiner_graph");
         auto& flag_terminals = sg.get_flag_steiner_terminal();
         size_t num_true_terminals = std::count(flag_terminals.begin(), flag_terminals.end(), true);
@@ -174,10 +405,17 @@ void Steiner::CreateSteinerGraph::visit(Ensemble& ensemble) const
         if (m_perf) SPDLOG_LOGGER_TRACE(log, "CreateSteinerGraph timing: [{}] transfer_pc/graph took {} ms", tag, MS(Clock::now() - t0).count());
 
         if (is_main) {
-            // Extra probe done only for the main cluster.
-            (void)src->get_two_boundary_steiner_graph_idx("steiner_graph", "steiner_pc", false);
-            auto kd_results = src->kd_steiner_knn(1, pair_points.first);
-            (void)src->kd_steiner_points(kd_results);
+            // Extra probe done only for the main cluster.  Non-fatal: a main
+            // cluster yielding an EMPTY steiner point cloud (SBND MC evt 11)
+            // has nothing to probe -- warn and continue rather than letting
+            // the empty-cloud throw kill the job.
+            try {
+                (void)src->get_two_boundary_steiner_graph_idx("steiner_graph", "steiner_pc", false);
+                auto kd_results = src->kd_steiner_knn(1, pair_points.first);
+                (void)src->kd_steiner_points(kd_results);
+            } catch (const std::exception& e) {
+                SPDLOG_LOGGER_WARN(log, "CreateSteinerGraph [{}]: boundary probe skipped: {}", tag, e.what());
+            }
         }
 
         t0 = Clock::now();
@@ -187,14 +425,23 @@ void Steiner::CreateSteinerGraph::visit(Ensemble& ensemble) const
     };
 
     if (m_grapher_config.retile) {
-        if (main_cluster != nullptr) {
-            process_cluster_steiner(main_cluster, /*is_main=*/true);
-        }
+        if (m_require_beam_flash) {
+            if (main_cluster != nullptr) {
+                process_cluster_steiner(main_cluster, /*is_main=*/true);
+            }
 
-        // Associated (non-main) beam_flash clusters.
-        for (auto* cluster : filtered_clusters) {
-            if (cluster == main_cluster) continue;
-            process_cluster_steiner(cluster, /*is_main=*/false);
+            // Associated (non-main) beam_flash clusters.
+            for (auto* cluster : filtered_clusters) {
+                if (cluster == main_cluster) continue;
+                process_cluster_steiner(cluster, /*is_main=*/false);
+            }
+        }
+        else {
+            // One matched main cluster per flash bundle: each gets the main
+            // treatment; associated/unflagged clusters the light one.
+            for (auto* cluster : filtered_clusters) {
+                process_cluster_steiner(cluster, cluster->get_flag(Flags::main_cluster));
+            }
         }
     }
 

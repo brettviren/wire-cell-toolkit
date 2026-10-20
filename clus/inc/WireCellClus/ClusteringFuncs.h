@@ -29,6 +29,7 @@
 
 #include <string>
 #include <fstream>
+#include <set>
 
 namespace WireCell::Clus::Facade {
     using namespace WireCell::PointCloud::Tree;
@@ -68,12 +69,29 @@ namespace WireCell::Clus::Facade {
         inline const std::string main_cluster = "main_cluster";
 
         // associated cluster
-        inline const std::string associated_cluster = "associated_cluster"; 
+        inline const std::string associated_cluster = "associated_cluster";
+
+        /// Set by ClusteringUnmergeBundle (restore_demoted_mains) on a split-off
+        /// part that WAS a matched Q/L bundle main before the flash-time merge
+        /// demoted it (doc pr/20 Part I P2).  Deliberately NOT main_cluster:
+        /// nu_skip_cosmic_bundle builds its bundle-level veto set from
+        /// main_cluster (TaggerCheckNeutrino.cxx), so restoring that flag would
+        /// make the neutrino's survival contingent on the unrelated
+        /// nu_skip_cosmic_bundle_min_length guard.  The cosmic taggers opt in to
+        /// this flag explicitly (evaluate_demoted_mains); nothing else reads it.
+        inline const std::string demoted_main = "demoted_main";
 
         /// This flag is set by ClusteringTaggerCheckSTM algorithm when specific STM conditions are met
         inline const std::string STM = "STM";
 
         inline const std::string TGM = "TGM";
+
+        /// Set by TaggerCheckFC when cluster_fc_check() finds the main cluster
+        /// fully contained inside the fiducial volume.  Tagger-computed sibling
+        /// of STM/TGM above -- NOT the same as the lowercase "fully_contained"
+        /// flag, which is an imported uBooNE verdict copied out of a
+        /// tagger_info point cloud by ClusteringTaggerFlagTransfer.
+        inline const std::string FC = "FC";
 
     }
 
@@ -112,12 +130,179 @@ namespace WireCell::Clus::Facade {
     // Pointers to the newly created cluster node facades are returned.  These
     // are loaned.  As usual, the cluster node owns the facade and these nodes
     // are in turn owned by the grouping node.
-    std::vector<Cluster*> merge_clusters(cluster_connectivity_graph_t& g, // 
+    // When orig_id_aname is non-empty, each merged cluster also gets a per-blob
+    // int array (stored under orig_id_aname in PC "pcname") holding the original
+    // ident() of the sub-cluster each blob came from, so a downstream consumer
+    // (e.g. the Bee writer) can recover the pre-merge cluster identity of every
+    // blob.  This is independent of the aname/parent_id ("perblob") array above.
+    //
+    // SCOPE INVARIANT -- the recorded ids are meaningful only WITHIN one
+    // cluster.  Equal values in two DIFFERENT clusters name different objects
+    // and must never be joined on.  MultiAlgBlobClustering re-runs
+    // Grouping::enumerate_idents() after every visitor, so the ident() values
+    // captured here belong to the numbering epoch in force at THIS call, while
+    // the save-time fill-in for a cluster that was never merged writes the
+    // ident of the LATEST epoch.  Both epochs are dense 1..N and nothing in the
+    // array says which one a row belongs to, so the two overlap: measured 31%
+    // of distinct "real_cluster_id" values name two clusters on the SBND d52ron
+    // 30-event set (all of them recorded-vs-fill-in; recorded-vs-recorded
+    // cannot collide, since idents are unique at the instant of this call).
+    // See sbnd_xin/docs/53_unmerge-vs-cathode-crossers.md.  Set
+    // MultiAlgBlobClustering's "real_cluster_id_global" to re-stamp the array
+    // into one globally unique epoch at save time.
+    // flags_from_longest (default false = historical behavior): Cluster::from()
+    // is called once per member and flags_from() copies the donor's flag VALUES
+    // (including zeros), so the merged cluster's flags are those of whichever
+    // member happened to be visited last -- arbitrary.  A cluster that was the
+    // matched main of its bundle can therefore lose flag_main_cluster to a tiny
+    // co-merged fragment.  With this true, the flags are re-applied after the
+    // merge from the same representative member that donates the flash (the
+    // longest flash-bearing one; longest overall when no member has a flash),
+    // mirroring the cluster_t0/flash/matched_flash_gid fixup below so that the
+    // merged cluster's flags and flash describe one coherent donor.
+    // orig_main_aname: when set (with orig_id_aname and pcname), additionally
+    // save a per-blob marker (1/0) of the merged cluster's REPRESENTATIVE
+    // member -- the flash/flags donor, i.e. the one main the merged cluster
+    // reports -- so its points stay identifiable inside the merged cluster
+    // (read back by TaggerCheckTGM main_component_mode="real").  The
+    // "main_cluster" flag cannot serve: a flash group can merge several
+    // bundles, each of whose mains carries it.
+    // Independently of all of the above, a fixed registry of provenance PAIRS
+    // (currently just "assoc_cluster_id"/"assoc_cluster_main") is CARRIED across
+    // the merge whenever the members have them: the main array is concatenated
+    // verbatim and the id array is rebased per member into a fresh dense range,
+    // with a member lacking the arrays contributing one fresh id and main=1.
+    // See the long comment at the top of merge_clusters() for why each of those
+    // three choices is what it is; doc 52 4b has the full argument.  Absent
+    // arrays => no-op, so this costs nothing when the writer knob is off.
+    // orig_wasmain_aname: when set (with pcname), save a per-blob marker (1/0)
+    // of whether the member each blob came from carried flag_main_cluster
+    // BEFORE the merge.  Read it against orig_main_aname above, which it is one
+    // word away from in the name and different in what it marks:
+    //
+    //   real_cluster_main      1 on the rows of the ONE representative member
+    //                          (the flash/flags donor) -- "which member does the
+    //                          merged cluster now speak for".
+    //   real_cluster_was_main  1 on the rows of EVERY member that was a matched
+    //                          bundle main -- "which members lost that status to
+    //                          this merge".  A flash group can merge several
+    //                          bundles, each of them a main of its own bundle,
+    //                          so this is 1 on more rows than the other whenever
+    //                          the merge demoted anybody (doc pr/20 Part I P1).
+    //
+    // Independent of orig_id_aname (unlike orig_main_aname, which needs it for
+    // the representative-ident comparison): the flag is read off each member
+    // directly.  Empty name => array never created => no key-set change => every
+    // caller stays byte-identical.
+    std::vector<Cluster*> merge_clusters(cluster_connectivity_graph_t& g, //
                                          Grouping& grouping,
                                          const std::string& aname="",
-                                         const std::string& pcname="perblob");
+                                         const std::string& pcname="perblob",
+                                         const std::string& orig_id_aname="",
+                                         bool flags_from_longest=false,
+                                         const std::string& orig_main_aname="",
+                                         const std::string& orig_wasmain_aname="");
 
-    
+    // Role values written into the "nu_band_veto_role" per-blob array by
+    // ClusteringNeutrino's protect_iso_band_xext veto (record_band_veto knob,
+    // doc pr/66): 0 = unmarked, band_veto_band = this blob's cluster was
+    // refused as the isochronous-band side of a pair, band_veto_nonband = it
+    // was refused as the drift-spanning non-band side.  iso_band_like() is an
+    // intrinsic property of a cluster, so a cluster's role is fixed for the
+    // whole event -- a second refusal involving the same cluster can only
+    // re-assert the same value, never conflict.
+    enum { band_veto_none = 0, band_veto_band = 1, band_veto_nonband = 2 };
+
+    // Does the "nu_band_veto_role" provenance forbid merging clusters `a` and
+    // `b`?  True iff one carries at least one band_veto_band row and the other
+    // at least one band_veto_nonband row (either orientation).  Returns FALSE
+    // (no opinion) whenever either cluster lacks the array or its length
+    // disagrees with nchildren() -- so a build/config that never writes the
+    // array (the knob-off, non-SBND, or pre-this-change case) can never reach
+    // a veto.  Fail open, the same discipline merge_clusters' carry and
+    // clustering_switch_scope's carve already use for provenance arrays.
+    //
+    // Used by merge_clusters() itself (edges between vetoed pairs are dropped
+    // before connected_components, covering every merge stage in the codebase
+    // -- including ClusteringExtendLoop's inner clustering_extend() calls,
+    // which have no configuration surface of their own) and, separately, by
+    // clustering_cathode_bundle_rescue.cxx's three candidate-selection loops
+    // (which cannot go through merge_clusters' edge filter: each round there
+    // aborts the whole rescue with a warning if its one edge fails to produce
+    // exactly one merged cluster, so the veto must apply before that edge is
+    // ever built).
+    bool band_veto_forbids(const Cluster* a, const Cluster* b,
+                           const std::string& pcname = "perblob");
+
+    // Does cluster `c` carry at least one blob with "nu_band_veto_role" ==
+    // `role`?  Fail-open false on any absent/mismatched array, same contract
+    // as band_veto_forbids().  Exposed for ClusteringExamineBundles' flash-
+    // time pre-merge (doc pr/66): that stage's edges are gated ONLY on shared
+    // flash time, with no geometric distance check at all, so a third,
+    // unmarked cluster sharing the flash group can bridge a band and a
+    // non-band cluster into one connected component even though the direct
+    // edge between them is dropped by band_veto_forbids() inside
+    // merge_clusters().  A pairwise edge veto cannot see or prevent this
+    // transitive bridge; only a GROUP-level exclusion can, which is why this
+    // predicate is exposed rather than kept file-local like band_veto_forbids'
+    // implementation detail.
+    bool cluster_has_band_veto_role(const Cluster* c, int role,
+                                    const std::string& pcname = "perblob");
+
+    // Assign each cluster an integer "flash-time group" id.  Clusters whose
+    // matched flash time (cluster_t0) differ by less than `window` share a group
+    // id.  A cluster without a valid matched flash (scalar "flash" < 0) gets a
+    // unique singleton id so it can never share a group with another cluster.
+    // Every cluster in `clusters` is present as a key in the returned map.  This
+    // is used by the combined-stage (post QL-matching) clustering functions to
+    // restrict merging to clusters coincident in flash time.
+    std::map<const Cluster*, int> assign_flash_t0_groups(
+        const std::vector<Cluster*>& clusters, double window);
+
+    // Diagnostic-only (env WCT_PROV_CHECK=1, else a fast no-op returning 0):
+    // validate the per-blob provenance arrays of every cluster child of the
+    // given grouping NODE -- per-key row counts vs blob count, and spatial
+    // compactness of each assoc_cluster_main==0 group -- logging any violation
+    // under logger "clus.provchk" tagged with `tag`.  Returns the number of
+    // problems found.  Takes the raw node (not the facade) so it can run
+    // where facades are not set up (PointTreeMerging, serialization
+    // round-trips).  See clus/src/prov_check.cxx and doc 52 §11.
+    size_t check_perblob_provenance(
+        const WireCell::PointCloud::Tree::Points::node_t& groot,
+        const std::string& tag);
+
+    // Restore the "perblob" row-i == child-i invariant after a
+    // separate-then-merge-back (or total take-back) round trip.  The round
+    // trip permutes the blob children -- kept (cc<0) blobs stay in place,
+    // split-off groups are re-appended at the END in ascending group-id order
+    // (both FacadeParent::merge() and an ascending-key take_children loop do
+    // this) -- while the cluster's node-local per-blob Dataset keeps its
+    // original row order.  This applies the SAME permutation to the whole
+    // Dataset (all arrays at once, via Dataset::subset), exactly as
+    // QLMatching::recompose_cluster_groups() does (doc 52 §12.4).  `cc` is
+    // the per-blob group array that was given to separate(), in PRE-split
+    // children order.  Fail-open no-op (returns false) unless the Dataset
+    // exists and both its major size and the cluster's current child count
+    // equal cc.size() -- so at any pipeline stage where the array was never
+    // written this is byte-identical to not calling it.
+    bool realign_perblob_after_regroup(Cluster& cluster,
+                                       const std::vector<int>& cc,
+                                       const std::string& pcname = "perblob");
+
+    // Make the grouping's "cluster_scalar" PCs serializable when
+    // separate(tag_family=true) tagged only some clusters with "sep_family".
+    // TensorDM::as_tensors appends same-named local PCs in child order and
+    // Dataset::append throws when the FIRST cluster_scalar carries a key a
+    // later one lacks ("missing keys in append: 1 missing: sep_family"); in
+    // the opposite order it silently drops the key.  This fills sep_family =
+    // 0 ("no family", what connect1 reads for an absent key) into every later
+    // cluster_scalar lacking it, and ONLY when the first cluster_scalar has
+    // the key -- exactly the inputs that throw today -- so every input that
+    // serializes today is untouched.  Returns the number of clusters filled
+    // (wcp-porting-img wcfm/docs/13).
+    size_t fill_sep_family_before_serialize(Grouping& grouping);
+
+
 
     /**
      * Extract geometry information from a grouping
@@ -128,6 +313,20 @@ namespace WireCell::Clus::Facade {
     std::tuple<geo_point_t, double, double, double> extract_geometry_params(
         const Grouping& grouping,
         IDetectorVolumes::pointer dv);
+
+    /**
+     * Validate that a set of wpids forms ONE drift volume: x-aligned APAs
+     * (identical drift-x fiducial metadata) viewed through the SAME face.
+     * allow_mixed_faces waives the same-face requirement (NOT the identical
+     * FV_x one) for detectors where both faces of an anode share one drift
+     * volume (PDVD: faces = y-halves of a CRP).  Raises ValueError naming
+     * `who` on violation.
+     */
+    void validate_drift_group(
+        const std::set<WirePlaneId>& wpids,
+        IDetectorVolumes::pointer dv,
+        bool allow_mixed_faces,
+        const std::string& who);
 
     std::vector<std::pair<geo_point_t, const Blob*>> get_strategic_points(const Cluster& cluster);
 
@@ -148,17 +347,99 @@ namespace WireCell::Clus::Facade {
 
 
 
+    // Fiducial-volume bounds selected for the scope (set of drift volumes) that a
+    // clustering pass operates on.  Populated by select_scope_fv().  All values are
+    // in WireCell internal units.
+    struct ScopeFV {
+        double xmin{0}, xmax{0}, ymin{0}, ymax{0}, zmin{0}, zmax{0};
+        double xmin_margin{0}, xmax_margin{0}, ymin_margin{0}, ymax_margin{0}, zmin_margin{0}, zmax_margin{0};
+        geo_point_t vertical_dir{0, 1, 0}, beam_dir{0, 0, 1};
+    };
+
+    // Select the fiducial volume appropriate to the scope `dv` was configured for.
+    // The scope is taken from the dv's configured drift volumes (dv->wpident_faces()),
+    // NOT from which TPCs happen to have live activity in a given event:
+    //   - dv spans >1 APA (or none)  -> the global "overall" (cryostat) FV.  This
+    //     reproduces the legacy dv->metadata(WirePlaneId(0)) reads bit-for-bit, so
+    //     all-APA stages are unchanged regardless of per-event activity.
+    //   - dv spans a single APA      -> the union (outermost envelope) of that APA's
+    //     configured per-(APA,face) FV blocks (full APA even if a face is quiet).
+    // Any FV field missing from a per-face block falls back to the "overall" value.
+    // vertical_dir / beam_dir are detector-global and are always read from "overall".
+    //
+    // common_face_x (default false, bit-identical): in the multi-APA branch, when
+    // ALL configured faces carry identical FV_xmin/FV_xmax metadata (a drift-side
+    // group: several APAs imaging one common drift side, e.g. PDHD group02 or a
+    // PDVD CRP drift group), use that common x-range (and its margins) instead of
+    // the cryostat overall x.  This makes the no-T0 "out-of-time" apparent-x test
+    // reflect the group's drift volume rather than the union of both drift sides.
+    //
+    // Faces whose block carries FV_xmin == FV_xmax are excluded from that
+    // agreement test.  Such a block belongs to an INSENSITIVE face -- jsonnet
+    // declares the face `null` but Gen::AnodePlane constructs it anyway
+    // (gen/src/AnodePlane.cxx:160-163) and DetectorVolumes registers every
+    // geometry face.  A zero-width x block encloses no volume, so it can never
+    // contain a point and cannot speak for a drift volume; letting it vote only
+    // ever vetoes the test.  On PDHD the wall-face blocks (FV_xmin == FV_xmax ==
+    // the anode plane) always disagreed with the sensitive face, so
+    // common_face_x could never succeed and the drift-side x-range it exists to
+    // select was silently replaced by the cryostat-wide overall x -- i.e.
+    // separate(drift_side_fv_x=true) was inert on PDHD from ee054213 until this
+    // fix.  PDHD is the only detector with such blocks (pdhd/clus.jsonnet:89-94);
+    // protodunevd, sbnd and dune-vd declare none, so this is a no-op there.
+    // See doc pdhd/11 sec 5.2.
+    ScopeFV select_scope_fv(IDetectorVolumes::pointer dv, bool common_face_x = false);
+
+    // Shrink a ScopeFV's y and z bounds by `inset_yz` on every side, leaving x,
+    // every *_margin and the direction vectors alone.  inset_yz <= 0 returns the
+    // input unchanged, which is what makes the knob that uses this bit-identical
+    // when off.
+    //
+    // Why it exists: JudgeSeparateDec_2 decides whether a cluster reaches a
+    // detector surface by testing its extreme points against `FV_* +/- margin`.
+    // On a detector whose configured FV is inset from the physical wall by only
+    // ~1 cm that test effectively asks for a point ON the wall, so a track that
+    // stops a few cm short is not counted and a two-track overcluster never
+    // shows the two independent surfaces the judge needs.  PDHD and PDVD fix
+    // this by insetting FV_ymin/ymax/zmin/zmax ~15 cm in the DetectorVolumes
+    // metadata (clus/docs/clustering-separate-fv.md); that block is shared with
+    // clustering_neutrino and the containment taggers, so this function lets a
+    // single pass take the same inset without moving anything else.
+    ScopeFV inset_scope_fv(const ScopeFV& fv, double inset_yz);
+
     // These Judge*() functions are used by multiple clustering methods.  They
     // are defined in clustering_separate.cxx.
 
     // time_slice_length is length span for a slice
-    bool JudgeSeparateDec_1(const Cluster* cluster, const geo_point_t& drift_dir, const double length);
+    // guard_main_angle (deg): the long/thin/drift-aligned protection guard
+    // (toolkit addition e28db401; not in the prototype) additionally requires
+    // the cluster MAIN axis within this angle of the drift axis.  Default <0
+    // keeps the guard unconditional (bit-identical).  The guard's angle1 tests
+    // the 2nd axis against perp-to-drift, which wide isochronous complexes
+    // satisfy trivially -- without the main-axis requirement it vetoes exactly
+    // the multi-track over-clusters separation exists for.
+    bool JudgeSeparateDec_1(const Cluster* cluster, const geo_point_t& drift_dir, const double length,
+                            double guard_main_angle = -1);
     /// @attention contains hard-coded distance cuts
     /// @param boundary_points return the boundary points
     /// @param independent_points return the independent points
-    bool JudgeSeparateDec_2(const Cluster* cluster, IDetectorVolumes::pointer dv, const geo_point_t& drift_dir,
+    /// @param fv scope-appropriate fiducial volume (see select_scope_fv)
+    /// @param max_hull_points cap passed to Cluster::get_hull (<0 = use Constants::MaxHullPoints)
+    /// @param far_point_x_cut drift-x deviation that promotes a boundary point to a
+    ///        "far" point in the two-endpoint test.  Default 140 cm reproduces the
+    ///        prototype expression `fabs(dir_3.x()/units::cm) > 14*units::cm` (the
+    ///        cm-number compared against 14*cm internal = 140), which is effectively
+    ///        dead; detectors may set the evidently intended 14 cm.
+    /// @param far_point_mid_dis cap on the distance from the midpoint of the two
+    ///        endpoints to the cluster, above which far points are discarded
+    ///        (default 25 cm = prototype).  Two forking/diverging tracks can hold
+    ///        their endpoint-midpoint in empty space between the prongs; detectors
+    ///        may raise it to keep the far-point evidence for such topologies.
+    bool JudgeSeparateDec_2(const Cluster* cluster, const geo_point_t& drift_dir,
                                std::vector<geo_point_t>& boundary_points, std::vector<geo_point_t>& independent_points,
-                               const double cluster_length);
+                               const double cluster_length, const ScopeFV& fv, int max_hull_points = -1,
+                               double far_point_x_cut = 140 * units::cm,
+                               double far_point_mid_dis = 25 * units::cm);
     
 
 
@@ -217,7 +498,21 @@ namespace WireCell::Clus::Facade {
     /// Used by:
     ///   - TaggerCheckNeutrino to fill tagger_info.match_isFC
     ///   - TaggerCheckSTM to drive STM / TGM classification
-    FCCheckResult cluster_fc_check(Cluster& cluster, IDetectorVolumes::pointer dv);
+    ///   - TaggerCheckFC to set the "FC" cluster flag
+    ///
+    /// fiducial (optional, default nullptr): when null, the direct
+    /// inside/outside tests use the grouping's FiducialUtils
+    /// (DetectorVolumes = union of per-face sensitive volumes, no margin) --
+    /// the historical behavior, unchanged for every caller that omits it.
+    /// When given, those tests instead run against this IFiducial with
+    /// fv_tolerance applied (negative = inset), matching how TaggerCheckTGM
+    /// evaluates containment so the FC and TGM verdicts can be compared.
+    /// Only the DIRECT fiducial tests are redirected: the dead-region and
+    /// signal-processing checks keep using FiducialUtils' per-(apa,face)
+    /// logic, exactly as TaggerCheckTGM does.
+    FCCheckResult cluster_fc_check(Cluster& cluster, IDetectorVolumes::pointer dv,
+                                   IFiducial::pointer fiducial = nullptr,
+                                   const std::vector<double>& fv_tolerance = {});
 
 
 }  // namespace WireCell::Clus::Facade

@@ -15,9 +15,15 @@ using namespace WireCell::Clus;
 using namespace WireCell::Clus::Facade;
 using namespace WireCell::PointCloud::Tree;
 
-static void clustering_connect1(Grouping& live_grouping, 
+static void clustering_connect1(Grouping& live_grouping,
                                 IDetectorVolumes::pointer dv,
-                                const Tree::Scope& scope);
+                                const Tree::Scope& scope,
+                                bool use_flash_t0 = false,
+                                double flash_t0_window = 80*units::ns,
+                                double iso_max_dis = -1,
+                                bool allow_mixed_faces = false,
+                                bool respect_separate_family = false,
+                                bool deterministic_order = false);
 
 class ClusteringConnect1 : public IConfigurable, public Clus::IEnsembleVisitor, private NeedDV, private NeedScope {
 public:
@@ -27,16 +33,45 @@ public:
     void configure(const WireCell::Configuration& config) {
         NeedDV::configure(config);
         NeedScope::configure(config);
+
+        use_flash_t0_ = get(config, "use_flash_t0", false);
+        flash_t0_window_ = get(config, "flash_t0_window", 80*units::ns);
+        // SBND isochronous over-merge guard (default OFF / -1 == byte-identical):
+        // upper bound on the actual cluster-to-cluster closest-point distance for the
+        // isochronous-relaxed connection branch.  See clustering_connect1().
+        iso_max_dis_ = get(config, "iso_max_dis", -1.0);
+        // Waive the same-face requirement of the multi-wpid drift-group
+        // validation (PDVD: both faces of a CRP share one drift volume).
+        allow_mixed_faces_ = get(config, "allow_mixed_faces", false);
+        // Decline to re-merge two clusters that a same-stage ClusteringSeparate
+        // (tag_family) just deliberately split (default OFF => byte-identical).
+        respect_separate_family_ = get(config, "respect_separate_family", false);
+        // Sort the merge-candidate clusters with a content tie-break (length, then
+        // nchildren/npoints/geometry via sort_clusters) instead of length only. The
+        // length-only std::sort is not stable, so equal-length clusters keep their
+        // input (serialization/pointer) order, which shifts across rebuilds and flips
+        // a borderline merge -- the same cross-recompile non-determinism family as the
+        // BlobLess fix. Default OFF => byte-identical (legacy length-only sort).
+        deterministic_order_ = get(config, "deterministic_order", false);
     }
 
     void visit(Ensemble& ensemble) const {
         auto& live = *ensemble.with_name("live").at(0);
-        clustering_connect1(live, m_dv, m_scope);
+        clustering_connect1(live, m_dv, m_scope, use_flash_t0_, flash_t0_window_, iso_max_dis_,
+                            allow_mixed_faces_, respect_separate_family_, deterministic_order_);
     }
     virtual Configuration default_configuration() const {
         Configuration cfg;
         return cfg;
     }
+
+private:
+    bool use_flash_t0_{false};
+    double flash_t0_window_{80*units::ns};
+    double iso_max_dis_{-1};
+    bool allow_mixed_faces_{false};
+    bool respect_separate_family_{false};
+    bool deterministic_order_{false};
 };
 
 
@@ -51,34 +86,57 @@ public:
 #define LogDebug(x)
 #endif
 
-// This is for only one APA/face
+// This handles a single APA/face, or several wpids that form one drift volume
+// (a drift-side group): x-aligned APAs viewed through the SAME face, or both
+// faces when allow_mixed_faces (PDVD: faces = y-halves of a CRP).
 void clustering_connect1(
-    Grouping& live_grouping, 
+    Grouping& live_grouping,
     const IDetectorVolumes::pointer dv,
-    const Tree::Scope& scope)
+    const Tree::Scope& scope,
+    bool use_flash_t0,
+    double flash_t0_window,
+    double iso_max_dis,
+    bool allow_mixed_faces,
+    bool respect_separate_family,
+    bool deterministic_order)
 {
-    // Check that live_grouping has less than one wpid
+    // Multiple wpids are allowed only when they form one drift volume.
     if (live_grouping.wpids().size() > 1) {
-        for (const auto& wpid : live_grouping.wpids()) {
-            std::cout << "Live grouping wpid: " << wpid.name() << std::endl;
-        }
-        raise<ValueError>("Live %d > 1", live_grouping.wpids().size());
+        validate_drift_group(live_grouping.wpids(), dv, allow_mixed_faces, "clustering_connect1");
     }
-    // Example usage in clustering_parallel_prolong()
-    auto [drift_dir, angle_u, angle_v, angle_w] = extract_geometry_params(live_grouping, dv);
     geo_point_t drift_dir_abs(1,0,0);
 
-    int apa = (*live_grouping.wpids().begin()).apa();
-    int face = (*live_grouping.wpids().begin()).face();
-
-    std::map<int, std::pair<double, double>>& dead_u_index = live_grouping.get_dead_winds(apa, face, 0);
-    std::map<int, std::pair<double, double>>& dead_v_index = live_grouping.get_dead_winds(apa, face, 1);
-    std::map<int, std::pair<double, double>>& dead_w_index = live_grouping.get_dead_winds(apa, face, 2);
+    // With respect_separate_family, refuse to reconnect two clusters that the
+    // same-stage ClusteringSeparate (tag_family) deliberately split apart
+    // (PDHD 27980 evt 24: a fat 80 cm branch, pca eval1/eval0 = 0.31, was
+    // re-glued onto the 491 cm cosmic it had just been separated from).
+    // The veto applies only when at least one piece is FAT (eval1/eval0 >=
+    // 0.15): a pair of thin track pieces is connect1's legitimate dashed-line
+    // reconnection work (PDVD 39324 evt 340010: two ~200 cm halves of one
+    // cosmic, 26 cm apart, must reconnect), and family-internal rejoining of
+    // touching thin pieces is collinear_member_merge's job anyway.
+    auto family_veto = [respect_separate_family](const Cluster* c1, const Cluster* c2) {
+        if (!respect_separate_family || !c1 || !c2) return false;
+        const int f1 = c1->get_scalar<int>("sep_family", 0);
+        if (f1 == 0 || f1 != c2->get_scalar<int>("sep_family", 0)) return false;
+        const double FAT_RATIO = 0.15;
+        for (const Cluster* c : {c1, c2}) {
+            const auto& pca = c->get_pca();
+            if (pca.values.size() >= 2 && pca.values.at(0) > 0 &&
+                pca.values.at(1) / pca.values.at(0) >= FAT_RATIO)
+                return true;
+        }
+        return false;
+    };
 
     // Get all the wire plane IDs from the grouping
     const auto& wpids = live_grouping.wpids();
     // Key: WirePlaneId (one per APA/face), Value: drift_dir, angle_u, angle_v, angle_w
     std::map<WirePlaneId , std::tuple<geo_point_t, double, double, double>> wpid_params;
+    // Per-(apa, face) dead wire maps: apa -> face -> wire index -> (xmin, xmax)
+    std::map<int, std::map<int, std::map<int, std::pair<double, double>>>> af_dead_u_index;
+    std::map<int, std::map<int, std::map<int, std::pair<double, double>>>> af_dead_v_index;
+    std::map<int, std::map<int, std::map<int, std::pair<double, double>>>> af_dead_w_index;
 
     for (const auto& wpid : wpids) {
         int apa = wpid.apa();
@@ -104,6 +162,10 @@ void clustering_connect1(
         double angle_w = std::atan2(wire_dir_w.z(), wire_dir_w.y());
 
         wpid_params[wpid] = std::make_tuple(drift_dir, angle_u, angle_v, angle_w);
+
+        af_dead_u_index[apa][face] = live_grouping.get_dead_winds(apa, face, 0);
+        af_dead_v_index[apa][face] = live_grouping.get_dead_winds(apa, face, 1);
+        af_dead_w_index[apa][face] = live_grouping.get_dead_winds(apa, face, 2);
     }
 
 
@@ -127,9 +189,16 @@ void clustering_connect1(
     }
     // sort the clusters length ...
     std::vector<Cluster *> live_clusters = live_grouping.children();  // copy
-    std::sort(live_clusters.begin(), live_clusters.end(), [](const Cluster *cluster1, const Cluster *cluster2) {
-        return cluster1->get_length() > cluster2->get_length();
-    });
+    if (deterministic_order) {
+        // length-descending WITH the standard content tie-break (nchildren, npoints,
+        // wire/geometry, PCA) so equal-length clusters no longer order by the build-
+        // dependent input/pointer order.  Mirrors cathode_connect / close / extend.
+        sort_clusters(live_clusters);
+    } else {
+        std::sort(live_clusters.begin(), live_clusters.end(), [](const Cluster *cluster1, const Cluster *cluster2) {
+            return cluster1->get_length() > cluster2->get_length();
+        });
+    }
 
 
     // auto global_skeleton_cloud = std::make_shared<DynamicPointCloudLegacy>(angle_u, angle_v, angle_w);
@@ -150,20 +219,62 @@ void clustering_connect1(
         ilive2desc[ilive] = boost::add_vertex(ilive, g);
     }
 
+    // When flash-aware, only merge clusters coincident in matched flash time.
+    std::map<const Cluster*, int> flash_t0_group;
+    if (use_flash_t0) {
+        flash_t0_group = assign_flash_t0_groups(live_grouping.children(), flash_t0_window);
+    }
+
     std::map<const Cluster *, geo_point_t, ClusterLess> map_cluster_dir1;
     std::map<const Cluster *, geo_point_t, ClusterLess> map_cluster_dir2;
 
-    geo_point_t U_dir(0,cos(angle_u),sin(angle_u));
-    geo_point_t V_dir(0,cos(angle_v),sin(angle_v));
-    geo_point_t W_dir(0,cos(angle_w),sin(angle_w));
+    // Per-volume wire direction vectors for the prolonged test.
     // geo_point_t U_dir(0, cos(60. / 180. * 3.1415926), sin(60. / 180. * 3.1415926));
     // geo_point_t V_dir(0, cos(60. / 180. * 3.1415926), -sin(60. / 180. * 3.1415926));
     // geo_point_t W_dir(0, 1, 0);
+    std::map<WirePlaneId, std::array<geo_point_t, 3>> wpid_uvw_dirs;
+    for (const auto& [wpid, params] : wpid_params) {
+        const auto& [w_drift_dir, w_angle_u, w_angle_v, w_angle_w] = params;
+        wpid_uvw_dirs[wpid] = {geo_point_t(0, cos(w_angle_u), sin(w_angle_u)),
+                               geo_point_t(0, cos(w_angle_v), sin(w_angle_v)),
+                               geo_point_t(0, cos(w_angle_w), sin(w_angle_w))};
+    }
+
+    // Prolonged test against one volume's wire directions: the direction's
+    // transverse component aligns with the U, V or W wire direction (7.5 deg).
+    // Same operation order as the original single-face U -> V -> W chain.
+    auto eval_prol = [&drift_dir_abs](const geo_point_t& dir, const std::array<geo_point_t, 3>& uvw_dirs) {
+        geo_point_t tempV1(0, dir.y(), dir.z());
+        geo_point_t tempV5;
+        for (size_t pindex = 0; pindex < 3; ++pindex) {
+            double angle1 = tempV1.angle(uvw_dirs[pindex]);
+            tempV5.set(fabs(dir.x()), sqrt(pow(dir.y(), 2) + pow(dir.z(), 2)) * sin(angle1), 0);
+            angle1 = tempV5.angle(drift_dir_abs);
+            if (angle1 < 7.5 / 180. * 3.1415926) return true;
+        }
+        return false;
+    };
+
+    // A cluster is prolonged if its direction is prolonged in ANY volume its
+    // blobs occupy (single-volume groupings degenerate to the legacy test).
+    auto eval_prol_cluster = [&](const Cluster* cluster, const geo_point_t& dir) {
+        for (const auto& bwpid : cluster->wpids_blob_set()) {
+            auto it = wpid_uvw_dirs.find(bwpid);
+            if (it == wpid_uvw_dirs.end()) continue;
+            if (eval_prol(dir, it->second)) return true;
+        }
+        return false;
+    };
+
+    const bool multi_wpid = live_grouping.wpids().size() > 1;
 
     for (size_t i = 0; i != live_clusters.size(); i++) {
         const Cluster *cluster = live_clusters.at(i);
         if(!cluster->get_scope_filter(scope)) continue;
+        // A zero-point cluster would throw in get_two_extreme_points(); the
+        // assert alone is compiled out under NDEBUG, so skip for real.
         assert (cluster->npoints() > 0); // preempt segfault in get_two_extreme_points()
+        if (cluster->npoints() == 0) continue;
 
         // if (cluster->get_length()/units::cm>5){
         //     std::cout << "Connect 0: " << cluster->get_length()/units::cm << " " << cluster->get_pca().center << std::endl;
@@ -173,6 +284,16 @@ void clustering_connect1(
         // cluster->Create_point_cloud();
 
         std::pair<geo_point_t, geo_point_t> extreme_points = cluster->get_two_extreme_points();
+        // Volume seeds for the skeleton extrapolations: with a multi-volume
+        // grouping the extrapolated continuation starts from the endpoint's
+        // volume (make_points_linear_extrapolation then re-buckets points
+        // that cross into another volume).  Invalid wpids keep the legacy
+        // single-volume behavior.
+        WirePlaneId ep1_wpid(kUnknownLayer, -1, -1), ep2_wpid(kUnknownLayer, -1, -1);
+        if (multi_wpid) {
+            ep1_wpid = cluster->wpid(extreme_points.first);
+            ep2_wpid = cluster->wpid(extreme_points.second);
+        }
         geo_point_t main_dir(extreme_points.second.x() - extreme_points.first.x(),
                           extreme_points.second.y() - extreme_points.first.y(),
                           extreme_points.second.z() - extreme_points.first.z());
@@ -221,63 +342,14 @@ void clustering_connect1(
             flag_para_1 = true;
         }
         else {
-            geo_point_t tempV1(0, dir1.y(), dir1.z());
-            geo_point_t tempV5;
-            double angle1 = tempV1.angle(U_dir);
-            tempV5.set(fabs(dir1.x()), sqrt(pow(dir1.y(), 2) + pow(dir1.z(), 2)) * sin(angle1), 0);
-            angle1 = tempV5.angle(drift_dir_abs);
-
-            if (angle1 < 7.5 / 180. * 3.1415926) {
-                flag_prol_1 = true;
-            }
-            else {
-                angle1 = tempV1.angle(V_dir);
-                tempV5.set(fabs(dir1.x()), sqrt(pow(dir1.y(), 2) + pow(dir1.z(), 2)) * sin(angle1), 0);
-                angle1 = tempV5.angle(drift_dir_abs);
-
-                if (angle1 < 7.5 / 180. * 3.1415926) {
-                    flag_prol_1 = true;
-                }
-                else {
-                    angle1 = tempV1.angle(W_dir);
-                    tempV5.set(fabs(dir1.x()), sqrt(pow(dir1.y(), 2) + pow(dir1.z(), 2)) * sin(angle1), 0);
-                    angle1 = tempV5.angle(drift_dir_abs);
-
-                    if (angle1 < 7.5 / 180. * 3.1415926) {
-                        flag_prol_1 = true;
-                    }
-                }
-            }
+            flag_prol_1 = eval_prol_cluster(cluster, dir1);
         }
 
         if (fabs(dir2.angle(drift_dir_abs) - 3.1415926 / 2.) < 7.5 * 3.1415926 / 180.) {
             flag_para_2 = true;
         }
         else {
-            geo_point_t tempV2(0, dir2.y(), dir2.z());
-            geo_point_t tempV6;
-            double angle2 = tempV2.angle(U_dir);
-            tempV6.set(fabs(dir2.x()), sqrt(pow(dir2.y(), 2) + pow(dir2.z(), 2)) * sin(angle2), 0);
-            angle2 = tempV6.angle(drift_dir_abs);
-            if (angle2 < 7.5 / 180. * 3.1415926) {
-                flag_prol_2 = true;
-            }
-            else {
-                angle2 = tempV2.angle(V_dir);
-                tempV6.set(fabs(dir2.x()), sqrt(pow(dir2.y(), 2) + pow(dir2.z(), 2)) * sin(angle2), 0);
-                angle2 = tempV6.angle(drift_dir_abs);
-                if (angle2 < 7.5 / 180. * 3.1415926) {
-                    flag_prol_2 = true;
-                }
-                else {
-                    angle2 = tempV2.angle(W_dir);
-                    tempV6.set(fabs(dir2.x()), sqrt(pow(dir2.y(), 2) + pow(dir2.z(), 2)) * sin(angle2), 0);
-                    angle2 = tempV6.angle(drift_dir_abs);
-                    if (angle2 < 7.5 / 180. * 3.1415926) {
-                        flag_prol_2 = true;
-                    }
-                }
-            }
+            flag_prol_2 = eval_prol_cluster(cluster, dir2);
         }
 
         if ((flag_para_1 || flag_prol_1) && cluster->get_length() < 15 * units::cm) {
@@ -319,32 +391,32 @@ void clustering_connect1(
         if (i == 0) {
             if (flag_para_1 || flag_prol_1) {
                 // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle);
-                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params));
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params, ep1_wpid));
                 dir1 *= -1;
                 // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle);
-                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params));
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params, ep1_wpid));
             }
             else {
                 // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle);
-                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params, ep1_wpid));
                 dir1 *= -1;
                 // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle);
-                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params, ep1_wpid));
             }
 
             if (flag_para_2 || flag_prol_2) {
                 // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle);
-                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params));
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params, ep2_wpid));
                 dir2 *= -1;
                 // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle);
-                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params));
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params, ep2_wpid));
             }
             else {
                 // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle);
-                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params, ep2_wpid));
                 dir2 *= -1;
                 // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle);
-                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params, ep2_wpid));
             }
         }
         else {
@@ -362,24 +434,24 @@ void clustering_connect1(
                 // If the point falls in a dead wire region, use a fixed 2/3*loose_dis_cut threshold
                 // (prototype behaviour); otherwise use the per-extrapolation-point dist_cut stored
                 // in the skeleton cloud.  This avoids 3x code duplication across U/V/W planes.
-                const auto& skel_pts = global_skeleton_cloud->get_points();
                 auto process_plane = [&](int plane,
                                          const std::map<int, std::pair<double, double>>& dead_index,
                                          int wire_idx, double raw_x,
                                          const geo_point_t& test_point,
+                                         const WirePlaneId& test_wpid,
                                          int& num_unique_ref) {
                     auto dit = dead_index.find(wire_idx);
                     bool flag_dead = (dit != dead_index.end() &&
                                       raw_x >= dit->second.first &&
                                       raw_x <= dit->second.second);
                     auto results = global_skeleton_cloud->get_2d_points_info(
-                        test_point, loose_dis_cut, plane, face, apa);
+                        test_point, loose_dis_cut, plane, test_wpid.face(), test_wpid.apa());
                     bool flag_unique = true;
                     if (!results.empty()) {
                         std::set<const Cluster *, ClusterLess> tmp;
                         for (const auto& [dist, cl, gidx] : results) {
                             const double cut = flag_dead ? (loose_dis_cut / 3. * 2.)
-                                                         : skel_pts[gidx].dist_cut[plane];
+                                                         : global_skeleton_cloud->dist_cut(gidx, plane);
                             if (dist < cut) { flag_unique = false; tmp.insert(cl); }
                         }
                         for (const Cluster* cl : tmp) ++map_cluster_num[plane][cl];
@@ -391,9 +463,15 @@ void clustering_connect1(
                     const auto p3 = cluster->point3d(j);
                     const geo_point_t test_point(p3.x(), p3.y(), p3.z());
                     const double raw_x = cluster->point3d_raw(j).x();
-                    process_plane(0, dead_u_index, winds[0][j], raw_x, test_point, num_unique[0]);
-                    process_plane(1, dead_v_index, winds[1][j], raw_x, test_point, num_unique[1]);
-                    process_plane(2, dead_w_index, winds[2][j], raw_x, test_point, num_unique[2]);
+                    // Route each point through its own volume's dead maps and
+                    // per-(face, apa) 2D KD trees.
+                    const auto test_wpid = cluster->wire_plane_id(j);
+                    const auto& dead_u_index = af_dead_u_index.at(test_wpid.apa()).at(test_wpid.face());
+                    const auto& dead_v_index = af_dead_v_index.at(test_wpid.apa()).at(test_wpid.face());
+                    const auto& dead_w_index = af_dead_w_index.at(test_wpid.apa()).at(test_wpid.face());
+                    process_plane(0, dead_u_index, winds[0][j], raw_x, test_point, test_wpid, num_unique[0]);
+                    process_plane(1, dead_v_index, winds[1][j], raw_x, test_point, test_wpid, num_unique[1]);
+                    process_plane(2, dead_w_index, winds[2][j], raw_x, test_point, test_wpid, num_unique[2]);
                 } // loop over points
                 
 
@@ -477,8 +555,15 @@ void clustering_connect1(
                     //     std::cout << "Check: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << max_cluster->get_pca().center << " " << max_value[0] << " " << max_value[1] << " " << max_value[2] << " " << num_total_points << " " << num_unique[0] << " " << num_unique[1] << " " << num_unique[2] << " "  << std::endl;
                     // }
 
+                    // When flash-aware, do not connect `cluster` to a partner in a
+                    // different flash-time group: gate both merge blocks below.
+                    const bool flash_ok = !use_flash_t0 ||
+                        (max_cluster != nullptr &&
+                         flash_t0_group.at(cluster) == flash_t0_group.at(max_cluster));
+
                     // if overlap a lot merge
-                    if ((max_value[0] + max_value[1] + max_value[2]) >
+                    if (flash_ok &&
+                        (max_value[0] + max_value[1] + max_value[2]) >
                             0.75 * (num_total_points + num_total_points + num_total_points) &&
                         ((num_unique[1] + num_unique[0] + num_unique[2]) < 0.24 * num_total_points ||
                          ((num_unique[1] + num_unique[0] + num_unique[2]) < 0.45 * num_total_points &&
@@ -492,8 +577,9 @@ void clustering_connect1(
                             fabs(dir2.angle(map_cluster_dir2[max_cluster]) - 3.1415926 / 2.) >= 70 * 3.1415926 / 180.) {
                             flag_merge = true;
                             // to_be_merged_pairs.insert(std::make_pair(cluster, max_cluster));
-                            boost::add_edge(ilive2desc[map_cluster_index[cluster]],
-                                            ilive2desc[map_cluster_index[max_cluster]], g);
+                            if (!family_veto(cluster, max_cluster))
+                                boost::add_edge(ilive2desc[map_cluster_index[cluster]],
+                                                ilive2desc[map_cluster_index[max_cluster]], g);
                             // std::cout << "Connect 1 1: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << max_cluster->get_pca().center << std::endl;
                             // curr_cluster = max_cluster;
                         }
@@ -515,7 +601,7 @@ void clustering_connect1(
                         }
                     }
 
-                    if ((max_value[0] + max_value[1] + max_value[2]) > 300 && !flag_merge) {
+                    if (flash_ok && (max_value[0] + max_value[1] + max_value[2]) > 300 && !flag_merge) {
                         if (cluster->get_length() > 25 * units::cm ||
                             max_cluster->get_length() > 25 * units::cm) {
                             // if overlap significant, compare the PCA
@@ -544,16 +630,33 @@ void clustering_connect1(
                             //     std::cout << "Check 1: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << angle_diff << " " << dis/units::cm << " " << dis1/units::cm << " " << angle1_drift << " " << angle2_drift << std::endl;
                             // }
 
+                            // Isochronous-relaxed collinearity (both axes ~perp to drift):
+                            // tolerates angle_diff up to 30 deg and merges on the infinite-line
+                            // distance `dis`, which is near-zero for slightly-tilted axes whose
+                            // extrapolations cross even when the two clusters are physically
+                            // separated in drift.  SBND guard (iso_max_dis > 0): additionally
+                            // require the real cluster-to-cluster closest-point distance to be
+                            // within iso_max_dis.  Default -1 leaves the branch unchanged.
+                            bool iso_relax = (fabs(angle1_drift - 90) < 5 && fabs(angle2_drift - 90) < 5 &&
+                                              fabs(angle1_drift - 90) + fabs(angle2_drift - 90) < 6 &&
+                                              (angle_diff < 30 || angle_diff > 150));
+                            if (iso_relax && iso_max_dis > 0) {
+                                geo_point_t icp1, icp2;
+                                double icpd = WireCell::Clus::Facade::Find_Closest_Points(
+                                    *cluster, *max_cluster, cluster->get_length(),
+                                    max_cluster->get_length(), 1000 * units::cm, icp1, icp2);
+                                if (icpd > iso_max_dis) iso_relax = false;
+                            }
+
                             if ((angle_diff < 5 || angle_diff > 175 ||
-                                 fabs(angle1_drift - 90) < 5 && fabs(angle2_drift - 90) < 5 &&
-                                     fabs(angle1_drift - 90) + fabs(angle2_drift - 90) < 6 &&
-                                     (angle_diff < 30 || angle_diff > 150)) &&
+                                 iso_relax) &&
                                     dis < 1.5 * units::cm ||
                                 (angle_diff < 10 || angle_diff > 170) && dis < 0.9 * units::cm &&
                                     dis1 > (cluster->get_length() + max_cluster->get_length()) / 3.) {
                                 // to_be_merged_pairs.insert(std::make_pair(cluster, max_cluster));
-                                boost::add_edge(ilive2desc[map_cluster_index[cluster]],
-                                                ilive2desc[map_cluster_index[max_cluster]], g);
+                                if (!family_veto(cluster, max_cluster))
+                                    boost::add_edge(ilive2desc[map_cluster_index[cluster]],
+                                                    ilive2desc[map_cluster_index[max_cluster]], g);
 
                                 // std::cout << "Connect 1 2: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << max_cluster->get_pca().center << std::endl;
                                 // curr_cluster = max_cluster;
@@ -563,8 +666,9 @@ void clustering_connect1(
                                       (angle_diff < 10 || angle_diff > 170) && dis < 1.2 * units::cm) &&
                                      dis1 > (cluster->get_length() + max_cluster->get_length()) / 3.) {
                                 // to_be_merged_pairs.insert(std::make_pair(cluster, max_cluster));
-                                boost::add_edge(ilive2desc[map_cluster_index[cluster]],
-                                                ilive2desc[map_cluster_index[max_cluster]], g);
+                                if (!family_veto(cluster, max_cluster))
+                                    boost::add_edge(ilive2desc[map_cluster_index[cluster]],
+                                                    ilive2desc[map_cluster_index[max_cluster]], g);
 
                                 // std::cout << "Connect 1 3: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << max_cluster->get_pca().center << std::endl;
                                 flag_merge = true;
@@ -575,8 +679,9 @@ void clustering_connect1(
                                 (max_value[0] + max_value[1] + max_value[2]) >
                                     0.7 * (num_total_points + num_total_points + num_total_points)) {
                                 // to_be_merged_pairs.insert(std::make_pair(cluster, max_cluster));
-                                boost::add_edge(ilive2desc[map_cluster_index[cluster]],
-                                                ilive2desc[map_cluster_index[max_cluster]], g);
+                                if (!family_veto(cluster, max_cluster))
+                                    boost::add_edge(ilive2desc[map_cluster_index[cluster]],
+                                                    ilive2desc[map_cluster_index[max_cluster]], g);
                                 // std::cout << "Connect 1 4: " << cluster->get_length()/units::cm << " " << max_cluster->get_length()/units::cm << " " << cluster->get_pca().center << " " << max_cluster->get_pca().center << std::endl;
                                 flag_merge = true;
                             }
@@ -594,17 +699,17 @@ void clustering_connect1(
                 // add extension points in ...
                 if (flag_para_1 || flag_prol_1) {
                     // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle);
-                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params));
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params, ep1_wpid));
                     dir1 *= -1;
                     // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle);
-                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params));
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis * 3, 1.2 * units::cm, angle, dv, wpid_params, ep1_wpid));
                 }
                 else {
                     // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle);
-                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params, ep1_wpid));
                     dir1 *= -1;
                     // global_skeleton_cloud->add_points(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle);
-                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.first, dir1, extending_dis, 1.2 * units::cm, angle, dv, wpid_params, ep1_wpid));
                     
                 }
             }
@@ -612,17 +717,17 @@ void clustering_connect1(
             if (flag_add_dir2) {
                 if (flag_para_2 || flag_prol_2) {
                     // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle);
-                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params));
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params, ep2_wpid));
                     dir2 *= -1;
                     // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle);
-                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params));
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis * 3.0, 1.2 * units::cm, angle, dv, wpid_params, ep2_wpid));
                 }
                 else {
                     // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle);
-                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params, ep2_wpid));
                     dir2 *= -1;
                     // global_skeleton_cloud->add_points(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle);
-                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params));
+                    global_skeleton_cloud->add_points(make_points_linear_extrapolation(cluster, extreme_points.second, dir2, extending_dis, 1.2 * units::cm, angle, dv, wpid_params, ep2_wpid));
                 }
             }
         }  // not the first cluster ...
@@ -635,9 +740,13 @@ void clustering_connect1(
     auto new_clusters = merge_clusters(g, live_grouping);
     live_clusters.clear();
     live_clusters = live_grouping.children();  // copy
-    std::sort(live_clusters.begin(), live_clusters.end(), [](const Cluster *cluster1, const Cluster *cluster2) {
-        return cluster1->get_length() > cluster2->get_length();
-    });
+    if (deterministic_order) {
+        sort_clusters(live_clusters);  // content tie-break, as above (second pass)
+    } else {
+        std::sort(live_clusters.begin(), live_clusters.end(), [](const Cluster *cluster1, const Cluster *cluster2) {
+            return cluster1->get_length() > cluster2->get_length();
+        });
+    }
     cluster_connectivity_graph_t  g2;
     ilive2desc.clear();  // added live index to graph descriptor
     map_cluster_index.clear();
@@ -646,6 +755,13 @@ void clustering_connect1(
         size_t ilive = map_cluster_index.size();
         map_cluster_index[live] = ilive;
         ilive2desc[ilive] = boost::add_vertex(ilive, g2);
+    }
+
+    // Recompute the flash-time groups: the first merge above created new merged
+    // clusters (each carrying the longest contributing member's flash).
+    std::map<const Cluster*, int> flash_t0_group2;
+    if (use_flash_t0) {
+        flash_t0_group2 = assign_flash_t0_groups(live_grouping.children(), flash_t0_window);
     }
 
     // to_be_merged_pairs.clear(); // clear it for other usage ...
@@ -661,6 +777,7 @@ void clustering_connect1(
             if (!cluster_2->get_scope_filter(scope)) continue;
             if (cluster_2->get_length() < 3 * units::cm) continue;
             if (cluster_2 == cluster_1) continue;
+            if (use_flash_t0 && flash_t0_group2.at(cluster_1) != flash_t0_group2.at(cluster_2)) continue;
 
             const auto& pca2 = cluster_2->get_pca();
             if (cluster_1->get_length() > 25 * units::cm || cluster_2->get_length() > 25 * units::cm ||
@@ -693,8 +810,9 @@ void clustering_connect1(
                      (angle_diff > 80) && angle_diff1 > 80 && angle_diff2 > 80 && dis < 1.2 * units::cm) &&
                     dis1 > (cluster_2->get_length() + cluster_1->get_length()) / 3.) {
                     // to_be_merged_pairs.insert(std::make_pair(cluster_1, cluster_2));
-                    boost::add_edge(ilive2desc[map_cluster_index[cluster_1]],
-                                    ilive2desc[map_cluster_index[cluster_2]], g2);
+                    if (!family_veto(cluster_1, cluster_2))
+                        boost::add_edge(ilive2desc[map_cluster_index[cluster_1]],
+                                        ilive2desc[map_cluster_index[cluster_2]], g2);
                     // std::cout << "Connect 2: " << cluster_1->get_length()/units::cm << " " << cluster_2->get_length()/units::cm << " " << pca1.center << " " << pca2.center << std::endl;
                     // flag_merge = true;
                 }
@@ -705,8 +823,9 @@ void clustering_connect1(
                          cluster_1->get_length() > 15 * units::cm &&
                          cluster_2->get_length() + cluster_1->get_length() > 45 * units::cm) {
                     // to_be_merged_pairs.insert(std::make_pair(cluster_1, cluster_2));
-                    boost::add_edge(ilive2desc[map_cluster_index[cluster_1]],
-                                    ilive2desc[map_cluster_index[cluster_2]], g2);
+                    if (!family_veto(cluster_1, cluster_2))
+                        boost::add_edge(ilive2desc[map_cluster_index[cluster_1]],
+                                        ilive2desc[map_cluster_index[cluster_2]], g2);
                     // std::cout << "Connect 2: " << cluster_1->get_length()/units::cm << " " << cluster_2->get_length()/units::cm << " " << pca1.center << " " << pca2.center << std::endl;
                     // flag_merge = true;
                 }

@@ -37,6 +37,46 @@ namespace WireCell {
             Log::logptr_t log;
             std::string m_output_filename{"tracking_proj.root"};
             std::string m_grouping_name{"live"};
+            // doc sbnd_xin/docs/pr/36 §10.8 (F7 = P4): book the neutrino_type
+            // verdict-bitmask branch (prototype
+            // wire-cell-prod-nue-port.cxx:1486, neutrino_type/I).  Same
+            // config key as TaggerCheckNeutrino's computing knob.  C++
+            // default false => branch not booked => the T_tagger schema is
+            // byte-identical to the pre-knob tree.
+            bool m_neutrino_type_bitmask{false};
+            // doc pr/94 Phase 1: book the per-bundle identity + per-activity
+            // cosmic-flag branches (cluster_id/matched_flash_gid/nu_index,
+            // act_*).  C++ default false => branches not booked => T_tagger
+            // schema byte-identical to the pre-knob tree.  Nothing populates
+            // these fields yet (see NeutrinoTaggerInfo.h) -- this only wires
+            // the schema; TaggerCheckNeutrino filling them is a later phase.
+            bool m_nu_per_bundle{false};
+            // doc 80 round 3: book the five kine_mcs_* T_kine branches
+            // (MCS muon momentum, filled by TaggerCheckNeutrino's mcs_enable
+            // path).  C++ default false => branches not booked => T_kine
+            // schema byte-identical to the pre-knob tree.  The SBND config
+            // derives this and mcs_enable from ONE jsonnet argument so the
+            // computation gate and the branch gate can never disagree.
+            bool m_mcs_output{false};
+            // sbnd_xin/docs/109: book the selection-provenance branches
+            // TaggerCheckNeutrino's nu_provenance knob fills -- T_tagger
+            // run/subrun/event, sel_cluster_id, vertex_moved_cluster,
+            // has_vertex, flash_time_us/flash_pe/flash_tpc/flash_group,
+            // act_role, act_in_pr, act_is_final, match_isFC (sbnd_xin/docs/133:
+            // the BDT containment input, always filled, booked only here);
+            // T_kine run/subrun/event, has_vertex.
+            // C++ default false => branches not booked => schema
+            // byte-identical (this writer is shared with PDHD/PDVD).
+            bool m_nu_provenance{false};
+            // sbnd_xin/docs/128-129: particle links.  T_kine gains per-row
+            // identity (kine_particle_id/_is_shower/_cluster_id/_nseg/_pool,
+            // kine_main_vertex_id); a new T_segment tree gets one row per
+            // PR-graph segment per candidate (in_enu, kine_index, shower_id,
+            // ...); T_tagger gains act_n_seg/act_n_seg_in_enu/act_in_enu
+            // aligned to act_cluster_id (only where nu_per_bundle books the
+            // roster).  C++ default false => nothing booked => schema
+            // byte-identical (this writer is shared with PDHD/PDVD/uBooNE).
+            bool m_nu_particle_links{false};
         };
 
     }  // namespace Root

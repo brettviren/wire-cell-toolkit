@@ -503,7 +503,33 @@ bool PatternAlgorithms::cosmic_tagger(
     if (main_cluster && main_cluster->grouping())
         fiducial_utils = main_cluster->grouping()->get_fiducialutils();
 
+    // Consistent-FV containment (sbnd_xin/docs/74 G1): test p against the
+    // configured IFiducial with a tolerance vector, shifted-point convention.
+    // Deliberate duplication of FiducialUtils::inside_fiducial_volume (M10);
+    // negative tolerance = required inset, size 6/3/1 accepted.
+    auto contained_tol = [&](const Point& p, const std::vector<double>& tol) -> bool {
+        const auto& fid = m_cosmic_fiducial;
+        if (tol.empty()) return fid->contained(p);
+        double txl, txh, tyl, tyh, tzl, tzh;
+        if (tol.size() >= 6) {
+            txl = tol[0]; txh = tol[1]; tyl = tol[2]; tyh = tol[3]; tzl = tol[4]; tzh = tol[5];
+        } else if (tol.size() >= 3) {
+            txl = txh = tol[0]; tyl = tyh = tol[1]; tzl = tzh = tol[2];
+        } else {
+            txl = txh = tyl = tyh = tzl = tzh = tol[0];
+        }
+        if (!fid->contained(Point(p.x() - txl, p.y(), p.z()))) return false;
+        if (!fid->contained(Point(p.x() + txh, p.y(), p.z()))) return false;
+        if (!fid->contained(Point(p.x(), p.y() - tyl, p.z()))) return false;
+        if (!fid->contained(Point(p.x(), p.y() + tyh, p.z()))) return false;
+        if (!fid->contained(Point(p.x(), p.y(), p.z() - tzl))) return false;
+        if (!fid->contained(Point(p.x(), p.y(), p.z() + tzh))) return false;
+        return true;
+    };
+
     auto inside_fv = [&](const Point& p) -> bool {
+        if (m_cosmic_fiducial)  // doc 74 G1: inset box, same volume as TGM/STM/FC
+            return contained_tol(p, m_cosmic_fv_tolerance);
         if (!fiducial_utils) return true; // no FV check available → conservative
         return fiducial_utils->inside_fiducial_volume(p);
     };
@@ -512,8 +538,8 @@ bool PatternAlgorithms::cosmic_tagger(
     auto segs_at_vtx = [&](VertexPtr vtx, auto callback) {
         if (!vtx || !vtx->descriptor_valid()) return;
         auto vd = vtx->get_descriptor();
-        for (auto [eit, eit_end] = boost::out_edges(vd, graph); eit != eit_end; ++eit) {
-            SegmentPtr seg = graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, graph)) {
+            SegmentPtr seg = graph[eit].segment;
             if (seg) callback(seg);
         }
     };
@@ -533,8 +559,15 @@ bool PatternAlgorithms::cosmic_tagger(
         // Use tighter tolerance (STM-like -1.5cm) for the vertex outside-FV check.
         // The prototype calls fid->inside_fiducial_volume(test_p, offset_x, &stm_tol_vec)
         // with all tolerances set to -1.5 cm, meaning the fiducial volume is shrunk by 1.5cm.
+        // With cosmic_consistent_fv (doc 74 G1/G2) the same -1.5 cm applies to the
+        // configured bare volume (prototype parity: the SCB arrays carry no
+        // boundary_dis_cut inset either), and the CPA-hole bands of the
+        // FiducialUtils fallback vanish.
         const std::vector<double> stm_tol_vec(6, -1.5 * units::cm);
-        if (fiducial_utils && !fiducial_utils->inside_fiducial_volume(test_p, stm_tol_vec))
+        if (m_cosmic_fiducial) {
+            if (!contained_tol(test_p, stm_tol_vec))
+                flag_cosmic_1 = true;
+        } else if (fiducial_utils && !fiducial_utils->inside_fiducial_volume(test_p, stm_tol_vec))
             flag_cosmic_1 = true;
     }
 
@@ -555,12 +588,12 @@ bool PatternAlgorithms::cosmic_tagger(
         segs_at_vtx(main_vertex, [&](SegmentPtr sg) {
             double length      = segment_track_length(sg);
             double med_dqdx    = segment_median_dQ_dx(sg);
-            double dqdx_cut    = 0.8866 + 0.9533 * std::pow(18 * units::cm / length, 0.4234);
+            double dqdx_cut    = muon_dqdx_cut(length);
             int    pdg         = sg->has_particle_info() ? sg->particle_info()->pdg() : 0;
             bool   is_shower   = seg_is_shower(sg);
 
             bool muon_like = (pdg == 13) ||
-                             (!is_shower && med_dqdx < dqdx_cut * 1.05 * 43e3 / units::cm && pdg != 211);
+                             (!is_shower && med_dqdx < dqdx_cut * 1.05 * m_mip_dqdx_median && pdg != 211);
 
             if (muon_like) {
                 if (segments_in_long_muon.count(sg)) {
@@ -592,8 +625,8 @@ bool PatternAlgorithms::cosmic_tagger(
             double length = segment_track_length(sg);
             if (length > 2.5 * units::cm ||
                 (length > 0.9 * units::cm && sg->has_particle_info() && sg->particle_info()->pdg() == 2212) ||
-                !sg->dir_weak()) {
-                if (length < 15 * units::cm && segment_median_dQ_dx(sg) / (43e3 / units::cm) < 0.75 && sg->dir_weak())
+                !seg_dir_weak(sg)) {
+                if (length < 15 * units::cm && segment_median_dQ_dx(sg) / m_mip_dqdx_median < 0.75 && seg_dir_weak(sg))
                     return;
                 valid_tracks++;
             }
@@ -651,9 +684,9 @@ bool PatternAlgorithms::cosmic_tagger(
             ti.cosmict_2_total_shower_length = static_cast<float>(total_shower_length / units::cm);
             ti.cosmict_2_flag_inside      = flag_inside;
             ti.cosmict_2_angle_beam       = static_cast<float>(dir.angle(dir_beam) / M_PI * 180.0);
-            ti.cosmict_2_flag_dir_weak    = muon->dir_weak();
-            ti.cosmict_2_dQ_dx_end        = static_cast<float>(dQ_dx_end / (43e3 / units::cm));
-            ti.cosmict_2_dQ_dx_front      = static_cast<float>(dQ_dx_front / (43e3 / units::cm));
+            ti.cosmict_2_flag_dir_weak    = seg_dir_weak(muon);
+            ti.cosmict_2_dQ_dx_end        = static_cast<float>(dQ_dx_end / m_mip_dqdx_median);
+            ti.cosmict_2_dQ_dx_front      = static_cast<float>(dQ_dx_front / m_mip_dqdx_median);
             ti.cosmict_2_theta            = static_cast<float>(vec_theta(dir) / M_PI * 180.0);
             ti.cosmict_2_phi              = static_cast<float>(vec_phi(dir) / M_PI * 180.0);
             ti.cosmict_2_valid_tracks     = valid_tracks;
@@ -661,7 +694,7 @@ bool PatternAlgorithms::cosmic_tagger(
             int pdg = muon->has_particle_info() ? muon->particle_info()->pdg() : 0;
             if (pdg == 13 && n_muon_tracks <= 2 && total_shower_length < 40 * units::cm &&
                 (((!flag_inside) && dir.angle(dir_beam) / M_PI * 180.0 > 40) ||
-                 (flag_inside && ((muon->dir_weak() && !(dQ_dx_end > 1.4 * 43e3 / units::cm && dQ_dx_end > 1.2 * dQ_dx_front)) ||
+                 (flag_inside && ((seg_dir_weak(muon) && !(dQ_dx_end > 1.4 * m_mip_dqdx_median && dQ_dx_end > 1.2 * dQ_dx_front)) ||
                                   dir.angle(dir_beam) / M_PI * 180.0 > 60))) &&
                 (vec_theta(dir) / M_PI * 180.0 >= 100.0 || std::fabs(std::fabs(vec_phi(dir) / M_PI * 180.0) - 90) <= 50) &&
                 valid_tracks == 0)
@@ -705,16 +738,16 @@ bool PatternAlgorithms::cosmic_tagger(
             ti.cosmict_3_filled        = 1;
             ti.cosmict_3_flag_inside   = flag_inside;
             ti.cosmict_3_angle_beam    = static_cast<float>(dir.angle(dir_beam) / M_PI * 180.0);
-            ti.cosmict_3_flag_dir_weak = last_sg ? last_sg->dir_weak() : false;
-            ti.cosmict_3_dQ_dx_front   = static_cast<float>(dQ_dx_front / (43e3 / units::cm));
-            ti.cosmict_3_dQ_dx_end     = static_cast<float>(dQ_dx_end   / (43e3 / units::cm));
+            ti.cosmict_3_flag_dir_weak = last_sg ? seg_dir_weak(last_sg) : false;
+            ti.cosmict_3_dQ_dx_front   = static_cast<float>(dQ_dx_front / m_mip_dqdx_median);
+            ti.cosmict_3_dQ_dx_end     = static_cast<float>(dQ_dx_end   / m_mip_dqdx_median);
             ti.cosmict_3_theta         = static_cast<float>(vec_theta(dir) / M_PI * 180.0);
             ti.cosmict_3_phi           = static_cast<float>(vec_phi(dir)   / M_PI * 180.0);
             ti.cosmict_3_valid_tracks  = valid_tracks;
 
-            bool dir_weak_end = last_sg && last_sg->dir_weak();
+            bool dir_weak_end = last_sg && seg_dir_weak(last_sg);
             if ((((!flag_inside) && dir.angle(dir_beam) / M_PI * 180.0 > 40) ||
-                 (flag_inside && ((dir_weak_end && !(dQ_dx_end > 1.4 * 43e3 / units::cm && dQ_dx_end > 1.2 * dQ_dx_front)) ||
+                 (flag_inside && ((dir_weak_end && !(dQ_dx_end > 1.4 * m_mip_dqdx_median && dQ_dx_end > 1.2 * dQ_dx_front)) ||
                                   dir.angle(dir_beam) / M_PI * 180.0 > 60))) &&
                 (vec_theta(dir) / M_PI * 180.0 >= 100.0 || std::fabs(std::fabs(vec_phi(dir) / M_PI * 180.0) - 90) <= 50) &&
                 valid_tracks == 0)
@@ -832,8 +865,8 @@ bool PatternAlgorithms::cosmic_tagger(
             double length = segment_track_length(sg);
             if (length > 2.5 * units::cm ||
                 (length > 0.9 * units::cm && sg->has_particle_info() && sg->particle_info()->pdg() == 2212) ||
-                !sg->dir_weak()) {
-                if (length < 15 * units::cm && segment_median_dQ_dx(sg) / (43e3 / units::cm) < 0.75 && sg->dir_weak())
+                !seg_dir_weak(sg)) {
+                if (length < 15 * units::cm && segment_median_dQ_dx(sg) / m_mip_dqdx_median < 0.75 && seg_dir_weak(sg))
                     return;
                 valid_tracks++;
             }
@@ -856,8 +889,8 @@ bool PatternAlgorithms::cosmic_tagger(
             double length2nd = segment_track_length(muon_2nd);
             if (length2nd > 2.5 * units::cm ||
                 (length2nd > 0.9 * units::cm && muon_2nd->has_particle_info() && muon_2nd->particle_info()->pdg() == 2212) ||
-                !muon_2nd->dir_weak()) {
-                if (!(length2nd < 15 * units::cm && segment_median_dQ_dx(muon_2nd) / (43e3 / units::cm) < 0.75 && muon_2nd->dir_weak()))
+                !seg_dir_weak(muon_2nd)) {
+                if (!(length2nd < 15 * units::cm && segment_median_dQ_dx(muon_2nd) / m_mip_dqdx_median < 0.75 && seg_dir_weak(muon_2nd)))
                     valid_tracks++;
             }
 
@@ -879,7 +912,7 @@ bool PatternAlgorithms::cosmic_tagger(
                     if (sg1 == muon || sg1 == muon_2nd) return;
                     if (michel_ele && sg1 == michel_ele->start_segment()) return;
                     if (long_muon && sg1 == long_muon->start_segment()) return;
-                    if (sg1->dir_weak() && segment_track_length(sg1) < 5 * units::cm)
+                    if (seg_dir_weak(sg1) && segment_track_length(sg1) < 5 * units::cm)
                         valid_tracks--;
                 });
             }
@@ -916,7 +949,7 @@ bool PatternAlgorithms::cosmic_tagger(
                     dQ_dx_end   = segment_median_dQ_dx(muon, 0, 10);
                     dQ_dx_front = segment_median_dQ_dx(muon, n - 10, n);
                 }
-                flag_weak_dir    = muon->dir_weak();
+                flag_weak_dir    = seg_dir_weak(muon);
                 muon_length      = segment_track_length(muon);
                 n_muon_tracks    = calculate_num_daughter_tracks(graph, main_vertex, muon, false, 3 * units::cm).first;
                 total_shower_length = calculate_num_daughter_showers(graph, main_vertex, muon).second;
@@ -943,7 +976,7 @@ bool PatternAlgorithms::cosmic_tagger(
                     dQ_dx_end = end_is_other
                         ? segment_median_dQ_dx(last_sg, 0, 10)
                         : segment_median_dQ_dx(last_sg, (int)last_sg->fits().size() - 10, (int)last_sg->fits().size());
-                    flag_weak_dir = last_sg->dir_weak();
+                    flag_weak_dir = seg_dir_weak(last_sg);
                 }
                 muon_length   = long_muon->get_total_track_length();
                 n_muon_tracks = 1;
@@ -965,18 +998,18 @@ bool PatternAlgorithms::cosmic_tagger(
                         flag_sec = true;
                 }
             } else if (muon_2nd) {
-                if (muon_2nd->dir_weak() && segment_track_length(muon_2nd) < 8 * units::cm)
+                if (seg_dir_weak(muon_2nd) && segment_track_length(muon_2nd) < 8 * units::cm)
                     flag_sec = true;
 
                 Vector dir2 = segment_cal_dir_3vector(muon_2nd, mv_pt, 15 * units::cm);
                 VertexPtr other_vtx2 = find_other_vertex(graph, muon_2nd, main_vertex);
 
                 ti.cosmict_6_filled       = 1;
-                ti.cosmict_6_flag_dir_weak= muon_2nd->dir_weak();
+                ti.cosmict_6_flag_dir_weak= seg_dir_weak(muon_2nd);
                 ti.cosmict_6_flag_inside  = inside_fv(vtx_fit_pt(other_vtx2));
                 ti.cosmict_6_angle        = static_cast<float>(dir.angle(dir2) / M_PI * 180.0);
 
-                if (muon_2nd->dir_weak() && !inside_fv(vtx_fit_pt(other_vtx2))) {
+                if (seg_dir_weak(muon_2nd) && !inside_fv(vtx_fit_pt(other_vtx2))) {
                     if (dir.angle(dir2) / M_PI * 180.0 > 170)
                         flag_cosmic_6 = true;
                 }
@@ -990,14 +1023,14 @@ bool PatternAlgorithms::cosmic_tagger(
             ti.cosmict_7_flag_inside     = flag_inside;
             ti.cosmict_7_angle_beam      = static_cast<float>(dir.angle(dir_beam) / M_PI * 180.0);
             ti.cosmict_7_flag_dir_weak   = flag_weak_dir;
-            ti.cosmict_7_dQ_dx_end       = static_cast<float>(dQ_dx_end   / (43e3 / units::cm));
-            ti.cosmict_7_dQ_dx_front     = static_cast<float>(dQ_dx_front / (43e3 / units::cm));
+            ti.cosmict_7_dQ_dx_end       = static_cast<float>(dQ_dx_end   / m_mip_dqdx_median);
+            ti.cosmict_7_dQ_dx_front     = static_cast<float>(dQ_dx_front / m_mip_dqdx_median);
             ti.cosmict_7_theta           = static_cast<float>(vec_theta(dir) / M_PI * 180.0);
             ti.cosmict_7_phi             = static_cast<float>(vec_phi(dir)   / M_PI * 180.0);
 
             if (flag_sec && n_muon_tracks <= 2 && total_shower_length < 40 * units::cm) {
                 if ((((!flag_inside) && dir.angle(dir_beam) / M_PI * 180.0 > 40) ||
-                     (flag_inside && ((flag_weak_dir && !(dQ_dx_end > 1.4 * 43e3 / units::cm && dQ_dx_end > 1.2 * dQ_dx_front)) ||
+                     (flag_inside && ((flag_weak_dir && !(dQ_dx_end > 1.4 * m_mip_dqdx_median && dQ_dx_end > 1.2 * dQ_dx_front)) ||
                                       dir.angle(dir_beam) / M_PI * 180.0 > 60))) &&
                     (vec_theta(dir) / M_PI * 180.0 >= 100.0 || std::fabs(std::fabs(vec_phi(dir) / M_PI * 180.0) - 90) <= 50))
                     flag_cosmic_7 = true;
@@ -1068,18 +1101,22 @@ bool PatternAlgorithms::cosmic_tagger(
             if (len > 3 * units::cm) {
                 big_cluster_ids.insert(cl_id);
             } else {
-                // Check if top part of detector (y > 50cm)
+                // Check if top part of detector (uBooNE y > 50 cm = 67 cm below
+                // the y = +117 cm top face; m_cosmic_y_small_piece, doc pr/2 2e(iv))
                 const auto& pca = cl->get_pca();
-                if (pca.center.y() > 50 * units::cm) {
+                if (pca.center.y() > m_cosmic_y_small_piece) {
                     num_small_pieces++;
                     acc_small_length += len;
                 }
             }
         }
 
-        // Collect segment points for big clusters
-        for (auto [eit, eit_end] = boost::edges(graph); eit != eit_end; ++eit) {
-            SegmentPtr sg = graph[*eit].segment;
+        // Collect segment points for big clusters.  ordered_edges, not
+        // boost::edges: this loop does a first-wins insert into map_cl_high_pt
+        // and push_back()s into map_cl_pts (whose order feeds a PCA), so the
+        // iteration order is an input to the result.
+        for (const auto& ed : ordered_edges(graph)) {
+            SegmentPtr sg = graph[ed].segment;
             if (!sg || !sg->cluster()) continue;
             int cl_id = sg->cluster()->get_cluster_id();
             if (!big_cluster_ids.count(cl_id)) continue;
@@ -1100,9 +1137,10 @@ bool PatternAlgorithms::cosmic_tagger(
                 map_cl_shower_pts[cl_id] += static_cast<int>(fits.size());
         }
 
-        // Add vertex positions to cluster point clouds
-        for (auto [vit, vit_end] = boost::vertices(graph); vit != vit_end; ++vit) {
-            VertexPtr vtx = graph[*vit].vertex;
+        // Add vertex positions to cluster point clouds (ordered_nodes: the
+        // push_back order feeds a PCA, and the y-max update is tie-sensitive).
+        for (const auto& vd_it : ordered_nodes(graph)) {
+            VertexPtr vtx = graph[vd_it].vertex;
             if (!vtx || !vtx->cluster()) continue;
             int cl_id = vtx->cluster()->get_cluster_id();
             if (!big_cluster_ids.count(cl_id)) continue;
@@ -1172,7 +1210,7 @@ bool PatternAlgorithms::cosmic_tagger(
                     if (cl_len > max_length) max_length = cl_len;
                 }
             } else {
-                bool top_main = (cl_id == main_cl_id && highest_y_cl > 100 * units::cm);
+                bool top_main = (cl_id == main_cl_id && highest_y_cl > m_cosmic_y_top_main);
                 if (angle_cosmic < 20 || (angle_cosmic < 30 && top_main)) {
                     acc_cosmic_len += cl_len;
                     num_cosmic++;
@@ -1187,9 +1225,19 @@ bool PatternAlgorithms::cosmic_tagger(
         bool flagp_cosmic = false;
         if (((num_cosmic > 2  && acc_cosmic_len + acc_small_length > 0.55 * acc_total_len) ||
              (num_cosmic >= 2 && acc_cosmic_len + acc_small_length > 0.70 * acc_total_len) ||
-             (num_cosmic == 1 && acc_cosmic_len + acc_small_length > 0.625 * acc_total_len && highest_y > 102 * units::cm)) &&
-            mv_pt.y() > 0 && flag_main_cluster && highest_y > 80 * units::cm)
+             (num_cosmic == 1 && acc_cosmic_len + acc_small_length > 0.625 * acc_total_len && highest_y > m_cosmic_y_top_strict)) &&
+            mv_pt.y() > m_cosmic_y_mid && flag_main_cluster && highest_y > m_cosmic_y_top_loose)
             flagp_cosmic = true;
+        // mv_pt.y() > m_cosmic_y_mid above is the detector MID-PLANE: 0 on
+        // uBooNE (y in [-116,+117]) and SBND (y in [-200,+200]), the C++
+        // default; ICARUS (y in [-182,+135]) sets it (icarus/docs/04 G2).
+        SPDLOG_LOGGER_TRACE(s_log,
+            "cosmic_tagger: part D num_cosmic={} highest_y={:.1f} cm acc_cosmic={:.1f} acc_small={:.1f} "
+            "acc_total={:.1f} cm flagp_cosmic={} (y cuts: top_main={:.1f} strict={:.1f} loose={:.1f} small={:.1f} cm)",
+            num_cosmic, highest_y / units::cm, acc_cosmic_len / units::cm, acc_small_length / units::cm,
+            acc_total_len / units::cm, flagp_cosmic, m_cosmic_y_top_main / units::cm,
+            m_cosmic_y_top_strict / units::cm, m_cosmic_y_top_loose / units::cm,
+            m_cosmic_y_small_piece / units::cm);
 
         if (num_cosmic == 1 && acc_cosmic_len > 100 * units::cm)
             flagp_cosmic = false;
@@ -1207,7 +1255,7 @@ bool PatternAlgorithms::cosmic_tagger(
             segs_at_vtx(main_vertex, [&](SegmentPtr sg1) {
                 if (seg_is_shower(sg1)) return;
                 double length = segment_track_length(sg1);
-                if ((sg1->dir_weak() && length > 10 * units::cm) || !sg1->dir_weak())
+                if ((seg_dir_weak(sg1) && length > 10 * units::cm) || !seg_dir_weak(sg1))
                     n_solid_tracks++;
             });
 
@@ -1285,8 +1333,8 @@ bool PatternAlgorithms::cosmic_tagger(
             }
         }
 
-        for (auto [vit, vit_end] = boost::vertices(graph); vit != vit_end; ++vit) {
-            VertexPtr vtx = graph[*vit].vertex;
+        for (const auto& vd_it : ordered_nodes(graph)) {
+            VertexPtr vtx = graph[vd_it].vertex;
             if (!vtx) continue;
             if (!vtx->cluster() || !main_cluster) continue;
             if (vtx->cluster()->get_cluster_id() != main_cluster->get_cluster_id()) continue;
@@ -1300,13 +1348,15 @@ bool PatternAlgorithms::cosmic_tagger(
                     if (angle_beam > 90) angle_beam = 180 - angle_beam;
                     double length = segment_track_length(sg);
 
-                    if (!seg_is_shower(sg) && sg->dir_weak() && angle_beam < 25 && length > 10 * units::cm)
+                    if (!seg_is_shower(sg) && seg_dir_weak(sg) && angle_beam < 25 && length > 10 * units::cm)
                         flag_cosmic_10 = true;
 
                     ti.cosmict_10_flag_inside.push_back(inside_fv(vpt));
-                    ti.cosmict_10_vtx_z.push_back(static_cast<float>(vpt.z() / units::cm));
+                    // icarus/docs/04 G3: m_cosmic_vtx_z_origin (default 0) puts
+                    // the BDT feature on the uBooNE/SBND z >= 0 convention.
+                    ti.cosmict_10_vtx_z.push_back(static_cast<float>((vpt.z() - m_cosmic_vtx_z_origin) / units::cm));
                     ti.cosmict_10_flag_shower.push_back(seg_is_shower(sg));
-                    ti.cosmict_10_flag_dir_weak.push_back(sg->dir_weak());
+                    ti.cosmict_10_flag_dir_weak.push_back(seg_dir_weak(sg));
                     ti.cosmict_10_angle_beam.push_back(static_cast<float>(angle_beam));
                     ti.cosmict_10_length.push_back(static_cast<float>(length / units::cm));
                     ti.cosmict_flag_10.push_back(flag_cosmic_10);
@@ -1335,5 +1385,8 @@ bool PatternAlgorithms::cosmic_tagger(
                        flag_cosmic_10_save;
 
     ti.cosmict_flag = flag_cosmic;
+    // doc pr/36 §10.8 (F7 = P4).  prototype (NeutrinoID_cosmic_tagger.h
+    // lines 860-862): if (flag_cosmic){ neutrino_type |= 1UL << 1; }
+    if (m_neutrino_type_bitmask && flag_cosmic) ti.neutrino_type |= 1 << 1;
     return flag_cosmic;
 }

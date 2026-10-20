@@ -211,7 +211,7 @@ namespace quickhull {
 				}
 				// Disable the face, but retain pointer to the points that were on the positive side of it. We need to assign those points
 				// to the new faces we create shortly.
-				auto t = std::move(m_mesh.disableFace(faceIndex));
+				auto t = m_mesh.disableFace(faceIndex);
 				if (t) {
 					assert(t->size()); // Because we should not assign point vectors to faces unless needed...
 					m_disabledFacePointVectors.push_back(std::move(t));
@@ -337,6 +337,13 @@ namespace quickhull {
 	template<typename T>
 	bool QuickHull<T>::reorderHorizonEdges(std::vector<IndexType>& horizonEdges) {
 		const size_t horizonEdgeCount = horizonEdges.size();
+		// [XQ] Guard against a degenerate horizon: a valid horizon loop needs >=3
+		// edges.  With 0 edges the original `horizonEdgeCount-1` underflows (size_t)
+		// and horizonEdges[i] reads out of bounds -> SIGSEGV.  Returning false here
+		// routes into the caller's existing "Failed to solve horizon edge" path.
+		if (horizonEdgeCount < 3) {
+			return false;
+		}
 		for (size_t i=0;i<horizonEdgeCount-1;i++) {
 			const IndexType endVertex = m_mesh.m_halfEdges[ horizonEdges[i] ].m_endVertex;
 			bool foundNext = false;

@@ -45,6 +45,23 @@ namespace WireCell {
         /// Modified Box model, R = ln(a+b*dE/dX)/(b*dE/dX), dQ = (R/Wi)*dE
         /// a=A, b=B/(Efield*rho) as defined in:
         /// http://lar.bnl.gov/properties/pass.html#recombination
+        ///
+        /// PARAMETERS ARE IN THE WCT SYSTEM OF UNITS -- note the unit factors
+        /// on the constructor defaults below.  Gen::PracticalBoxRecombination
+        /// (PracticalRecombinationModels.h) is the SAME physics with the SAME
+        /// numerals but in practical units (Efield in kV/cm, B in
+        /// (kV/cm)(g/cm^2)/MeV), which is how LArSoft's ModBox constants, the
+        /// WCP prototype and every detector config in this tree express them.
+        ///
+        /// The two are NOT interchangeable and NOT a duplicate to be merged:
+        /// feeding practical-unit numbers to this class is wrong by
+        /// units::cm/units::MeV = 10 in the quenching term, which silently
+        /// moved a MIP from 2.10 to 1.37 MeV/cm across 23 of 35 uBooNE events.
+        /// gen/test/doctest_practical_recombination.cxx pins both conventions
+        /// and asserts the mismatched combination stays wrong; if that test
+        /// ever goes green on the mismatch, the classes have converged and the
+        /// uBooNE binding must be revisited.  Background: doc 88, upstream
+        /// e6fb7ef3.
         class BoxRecombination : public IRecombinationModel, public IConfigurable {
             double m_efield, m_a, m_b, m_rho, m_wi;
 
@@ -54,6 +71,42 @@ namespace WireCell {
                              double rho = 1.396 * units::gram / units::cm3,
                              double Wi = 23.6 * units::eV / (-1 * units::eplus));
             virtual ~BoxRecombination();
+            virtual double operator()(double dE, double dX = 0.0);
+            virtual double dE(double dQ, double dX);
+            virtual void configure(const WireCell::Configuration& config);
+            virtual WireCell::Configuration default_configuration() const;
+        };
+
+        /// Modified Box model with a free power on dE/dx:
+        ///     u = k * (dEdx/pivot)^p,  R = ln(A + u)/u,  dQ = C * (R/Wi) * dE
+        /// Fitted to SBND stopping-track dQ/dx vs residual range at 0.5 kV/cm
+        /// (wcp-porting-validation sbnd_xin/docs/55 sec 7g; canonical parameters in
+        /// nusel_display/stm_ref_dqdx.json).  The drift field is not an explicit
+        /// parameter: it is absorbed into the fitted (k, p).
+        ///
+        /// Unlike the classes above, the defaults follow the *practical-unit*
+        /// convention the jsonnet configs actually use (plain numbers: Wi in MeV,
+        /// pivot in MeV/cm), so an unconfigured instance is the canonical SBND fit
+        /// rather than silently broken (the unit-bearing ctor defaults above make an
+        /// unconfigured BoxRecombination::dE() return 0 for any input).
+        ///
+        /// There is no closed-form inverse.  dE() solves the forward relation by
+        /// fixed-count bisection on the monotone branch dEdx in (0, dedx_max]; the
+        /// forward peaks at ~77.4 MeV/cm at the canonical parameters, so dQ/dx above
+        /// the peak saturates the inverse at dedx_max.  Callers in clus/ clamp their
+        /// dE/dx to [0, 50] MeV/cm, well inside the branch.
+        class PowerBoxRecombination : public IRecombinationModel, public IConfigurable {
+            double m_a, m_k, m_p, m_c, m_pivot, m_wi, m_dedx_max;
+
+            double forward_dqdx(double dedx) const;  // e/cm from MeV/cm
+
+           public:
+            PowerBoxRecombination(double A = 0.93, double k = 0.282371, double p = 1.362179,
+                                  double C = 0.855175,
+                                  double pivot = 2.1,        // MeV/cm
+                                  double Wi = 23.6e-6,       // MeV per electron-ion pair
+                                  double dedx_max = 77.0);   // MeV/cm, end of the monotone branch
+            virtual ~PowerBoxRecombination();
             virtual double operator()(double dE, double dX = 0.0);
             virtual double dE(double dQ, double dX);
             virtual void configure(const WireCell::Configuration& config);

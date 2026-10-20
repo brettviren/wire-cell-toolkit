@@ -1,9 +1,11 @@
 #include "WireCellClus/Facade_Blob.h"
 #include "WireCellClus/Facade_Cluster.h"
 #include "WireCellClus/Facade_Grouping.h"
+#include "WireCellClus/CtpcAnisoMetric.h"
 #include "WireCellClus/TrackFitting.h"
 #include "WireCellAux/PlaneTools.h"
 #include <boost/container_hash/hash.hpp>
+#include <algorithm>
 
 using namespace WireCell;
 using namespace WireCell::Clus;
@@ -119,6 +121,10 @@ void Facade::Grouping::from(const Grouping& other)
 {
     m_anodes = other.m_anodes;
     m_dv = other.m_dv;
+    // doc pdvd/36: a derived grouping (retile's shadow grouping) must answer
+    // the same metric as its source, or the connectors built on it disagree
+    // with the good-point tests on the original.
+    m_ctpc_aniso_metric = other.m_ctpc_aniso_metric;
 }
 
 
@@ -150,6 +156,27 @@ std::map<int, Cluster*> Grouping::separate(
     bool notify_value)
 {
     const int ident = cluster->ident();
+
+    // Perblob row-order invariant (clus/docs/perblob_invariant.md): the base
+    // separate() moves blob children but knows nothing of the cluster-level
+    // N-row "perblob" Dataset whose row i must describe child i.  Snapshot it
+    // here and carve it across the survivor and the splits below, so every
+    // caller gets consistent per-part provenance for free.  Clusters without
+    // the Dataset (the overwhelmingly common case, e.g. the whole pre-isolated
+    // clustering stage) pay one map lookup.
+    Dataset pb_snap;
+    bool pb_entry = false, pb_ok = false;
+    {
+        const auto& lpcs = cluster->value().local_pcs();
+        auto it = lpcs.find("perblob");
+        if (it != lpcs.end()) {
+            pb_entry = true;
+            pb_ok = !it->second.empty()
+                && it->second.size_major() == (size_t) cluster->nchildren();
+            if (pb_ok) pb_snap = it->second;  // copy
+        }
+    }
+
     auto ret = this->NaryTree::FacadeParent<Cluster, points_t>::separate(cluster, groups, false, notify_value);
 
     // Clear cache of original cluster after separation
@@ -162,11 +189,192 @@ std::map<int, Cluster*> Grouping::separate(
         c->from(*cluster);
     }
 
+    if (pb_entry && !ret.empty()) {
+        static auto pblog = Log::logger("clus");
+        if (!pb_ok) {
+            // Rows already disagreed with the children on the way in -- a
+            // truthful carve is impossible.  Drop it loudly rather than let a
+            // misaligned array propagate (a loud absence beats a silent lie).
+            pblog->warn("Grouping::separate: cluster {} 'perblob' rows do not "
+                        "match its children -- dropping the dataset",
+                        ident);
+            if (!remove) cluster->value().local_pcs().erase("perblob");
+        }
+        else {
+            auto rows_of = [&groups](int want) {
+                std::vector<size_t> rows;
+                for (size_t i = 0; i < groups.size(); ++i) {
+                    if (want < 0 ? groups[i] < 0 : groups[i] == want) {
+                        rows.push_back(i);
+                    }
+                }
+                return rows;
+            };
+            if (!remove) {
+                auto kept = rows_of(-1);
+                auto& lpcs = cluster->value().local_pcs();
+                if (kept.empty()) {
+                    // subset({}) would be a keyless Dataset; an absent entry
+                    // is the cleaner representation of "no rows".
+                    lpcs.erase("perblob");
+                }
+                else {
+                    lpcs["perblob"] = pb_snap.subset(kept);
+                }
+            }
+            for (auto& [gid, c] : ret) {
+                c->value().local_pcs()["perblob"] = pb_snap.subset(rows_of(gid));
+            }
+        }
+    }
+
     if(remove){
         // Remove the original cluster from the grouping.
         this->destroy_child(cluster, notify_value);
     }
-    return ret;    
+    return ret;
+}
+
+namespace {
+    // Snapshot of one merge participant's "perblob" state, taken BEFORE the
+    // base merge moves children / destroys shells.
+    struct PBPart {
+        Facade::Cluster* c{nullptr};
+        size_t nkids{0};
+        bool entry{false};   // has a "perblob" entry at all
+        bool usable{false};  // entry with non-empty keys and rows == children
+        Dataset ds;          // copy, only when usable
+    };
+
+    PBPart pb_snap_of(Facade::Cluster* c)
+    {
+        PBPart p;
+        p.c = c;
+        if (!c) return p;
+        p.nkids = (size_t) c->nchildren();
+        const auto& lpcs = c->value().local_pcs();
+        auto it = lpcs.find("perblob");
+        if (it == lpcs.end()) return p;
+        p.entry = true;
+        if (!it->second.empty() && it->second.size_major() == p.nkids) {
+            p.usable = true;
+            p.ds = it->second;  // copy
+        }
+        return p;
+    }
+
+    // After the base merge: concatenate the parts' datasets onto the target's
+    // in adoption order, or drop the target's dataset loudly when a truthful
+    // concatenation is impossible.  See the Grouping::merge() header docs.
+    void pb_concat(PBPart& tsnap, std::vector<PBPart>& psnaps,
+                   Facade::Cluster* target, bool keep)
+    {
+        static auto pblog = WireCell::Log::logger("clus");
+
+        // keep=true leaves the emptied part shells alive; a retained
+        // "perblob" entry there would be rows without children.
+        if (keep) {
+            for (auto& p : psnaps) {
+                if (p.entry) p.c->value().local_pcs().erase("perblob");
+            }
+        }
+
+        // Contributors are the participants that brought children (and hence
+        // must bring rows).  Zero-child participants have nothing to say.
+        size_t nwith = 0, nwithout = 0;
+        if (tsnap.c && tsnap.nkids > 0) (tsnap.usable ? ++nwith : ++nwithout);
+        for (const auto& p : psnaps) {
+            if (p.nkids > 0) (p.usable ? ++nwith : ++nwithout);
+        }
+
+        if (!target) {
+            // Base merge made its own fresh target which we cannot reach from
+            // here; any carried provenance died with the shells.
+            if (nwith) {
+                pblog->warn("Grouping::merge: {} part(s) carried 'perblob' but "
+                            "no target was given -- provenance dropped",
+                            nwith);
+            }
+            return;
+        }
+
+        if (nwith == 0) {
+            // Nothing carried.  If the target holds a stale entry (e.g. rows
+            // that disagreed with its children on the way in) drop it now
+            // that the child list changed.
+            if (tsnap.entry && !tsnap.usable) {
+                target->value().local_pcs().erase("perblob");
+                if (tsnap.nkids > 0) {
+                    pblog->warn("Grouping::merge: target cluster {} 'perblob' "
+                                "rows did not match its children -- dropped",
+                                target->ident());
+                }
+            }
+            return;
+        }
+
+        bool ok = (nwithout == 0);
+        if (ok) {
+            // Key sets must agree for a truthful row-wise concatenation.
+            const PBPart* ref = (tsnap.c && tsnap.nkids > 0 && tsnap.usable)
+                                    ? &tsnap : nullptr;
+            for (const auto& p : psnaps) {
+                if (!(p.nkids > 0 && p.usable)) continue;
+                if (!ref) { ref = &p; continue; }
+                if (p.ds.keys() != ref->ds.keys()) { ok = false; break; }
+            }
+        }
+        if (ok) {
+            Dataset out;
+            if (tsnap.c && tsnap.nkids > 0) out = tsnap.ds;  // copy
+            for (const auto& p : psnaps) {
+                if (p.nkids > 0) out.append(p.ds);
+            }
+            if (out.size_major() == (size_t) target->nchildren()) {
+                target->value().local_pcs()["perblob"] = std::move(out);
+                return;
+            }
+            ok = false;
+        }
+
+        // Could not concatenate truthfully: loud absence beats silent lie.
+        target->value().local_pcs().erase("perblob");
+        pblog->warn("Grouping::merge: cluster {} 'perblob' could not be "
+                    "carried through the merge ({} with / {} without usable "
+                    "rows) -- dropped",
+                    target->ident(), nwith, nwithout);
+    }
+}
+
+std::vector<int> Grouping::merge(std::map<int, Cluster*>& splits, Cluster* target,
+                                 bool keep, int existingID)
+{
+    PBPart tsnap = pb_snap_of(target);
+    std::vector<PBPart> psnaps;
+    psnaps.reserve(splits.size());
+    for (auto& [gid, c] : splits) {  // ascending gid == base adoption order
+        (void) gid;
+        psnaps.push_back(pb_snap_of(c));
+    }
+    auto cc = this->NaryTree::FacadeParent<Cluster, points_t>::merge(
+        splits.begin(), splits.end(), target, keep, existingID);
+    pb_concat(tsnap, psnaps, target, keep);
+    return cc;
+}
+
+std::vector<int> Grouping::merge(std::vector<Cluster*>& parts, Cluster* target,
+                                 bool keep, int existingID)
+{
+    PBPart tsnap = pb_snap_of(target);
+    std::vector<PBPart> psnaps;
+    psnaps.reserve(parts.size());
+    for (auto* c : parts) {  // vector order == base adoption order
+        psnaps.push_back(pb_snap_of(c));
+    }
+    auto cc = this->NaryTree::FacadeParent<Cluster, points_t>::merge(
+        parts.begin(), parts.end(), target, keep, existingID);
+    pb_concat(tsnap, psnaps, target, keep);
+    return cc;
 }
 
 void Grouping::fill_cache(GroupingCache& gc) const
@@ -296,63 +504,134 @@ size_t Grouping::hash() const
 
 const Grouping::kd2d_t& Grouping::kd2d(const int apa, const int face, const int pind) const
 {
-    std::vector<std::string> plane_names = {"U", "V", "W"};
-    const auto sname = String::format("ctpc_a%df%dp%d",apa, face, plane_names[pind]);
-    // const auto sname = String::format("ctpc_f%dp%d", face, pind);
-    Tree::Scope scope = {sname, {"x", "y"}, 1};
-    const auto& sv = m_node->value.scoped_view(scope);
-    // std::cout << "sname: " << sname << " npoints: " << sv.kd().npoints() << std::endl;
+    // kd2d() is called per-point-per-plane inside the graph-building good-point tests
+    // (millions of times per event), but the (apa,face,pind) -> Scope mapping is
+    // data-independent.  Memoize the Scope so the expensive boost::format scope-key build
+    // runs once per key instead of on every call (it was ~40% of clustering CPU; see
+    // clustering-timing-profile.md §2).
+    auto& by_face = m_kd2d_scope_cache[apa][face];
+    auto it = by_face.find(pind);
+    if (it == by_face.end()) {
+        std::vector<std::string> plane_names = {"U", "V", "W"};
+        const auto sname = String::format("ctpc_a%df%dp%d", apa, face, plane_names[pind]);
+        it = by_face.emplace(pind, kd2d_cache_t{Tree::Scope{sname, {"x", "y"}, 1}, nullptr, nullptr}).first;
+    }
+    auto& entry = it->second;
+
+    // Fast path: the scoped view's indices are still valid, i.e. no node has been
+    // inserted or removed in this scope since we last resolved it (on_insert/on_remove
+    // unconditionally clear the flag).  Its k-d tree is therefore current, so return it
+    // directly and skip the scoped_view() Scope hash-lookup + dynamic_cast (~16% of
+    // clustering; see clustering-timing-profile.md §4).  Safe because the ctpc scoped
+    // views are never erased, so the cached pointers stay valid for the tree's lifetime.
+    if (entry.sv && entry.valid && *entry.valid) {
+        return entry.sv->kd();
+    }
+
+    // Slow path: (re)resolve via scoped_view(), which rebuilds the indices and revalidates
+    // as needed; then cache the (stable) view pointer and validity flag for the fast path.
+    const auto& sv = m_node->value.scoped_view(entry.scope);
+    entry.sv = &sv;
+    if (!entry.valid) {
+        entry.valid = m_node->value.scoped_indices_valid(entry.scope);
+    }
     return sv.kd();
 }
 
 
-bool Grouping::is_good_point(const geo_point_t& point, const int apa, const int face, double radius, int ch_range, int allowed_bad) const {
+bool Grouping::is_good_point(const geo_point_t& point, const int apa, const int face, double radius, int ch_range, int allowed_bad, const double pitch_frac) const {
+    // doc icarus/04 sec 8: a 3-D dead region counts as dead on all planes (same
+    // verdict as the dead gap below, tested first: no wire cache is needed).
+    // Null region (default) -> no-op.
+    if (in_dead_region(point)) return true;
+    // Hand-declared dead gap: the full vertical W-defect column counts as dead on
+    // all planes (generalizes the y~0 center patch).  Default-empty -> no-op.
+    if (in_dead_gap(point, ch_range, apa, face)) return true;
     const int nplanes = 3;
+    const int needed = nplanes - allowed_bad;
     int matched_planes = 0;
+    // doc pdvd/32 round 3: the per-plane pitch floor (see the header for why).
+    // This function runs per point per plane in the clustering good-point
+    // tests, so the legacy path must cost nothing: with pitch_frac == 0 the
+    // fastgeom lookup is skipped entirely and `r` folds back to `radius`.
+    const fastgeom_t* fg = (pitch_frac > 0.0) ? &fastgeom(apa, face) : nullptr;
     for (int pind = 0; pind < nplanes; ++pind) {
-        if (get_closest_points(point, radius, apa, face, pind).size() > 0) {
+        const double r = fg ? std::max(radius, pitch_frac * fg->pitch[pind]) : radius;
+        if (has_closest_point(point, r, apa, face, pind)) {
             matched_planes++;
         } else if (get_closest_dead_chs(point, ch_range, apa, face, pind)) {
             matched_planes++;
         }
+        // Short-circuit: the per-plane tests are pure queries, so once the
+        // verdict is decided the remaining planes' kd descents can be skipped.
+        if (matched_planes >= needed) return true;
+        if (matched_planes + (nplanes - 1 - pind) < needed) return false;
     }
-    // std::cout << "matched_planes: " << matched_planes << std::endl;
-    if (matched_planes >= nplanes - allowed_bad) {
-        return true;
-    }
-    return false;
+    return matched_planes >= needed;
 }
 
-bool Grouping::is_good_point_wc(const geo_point_t& point, const int apa, const int face, double radius, int ch_range, int allowed_bad) const 
+bool Grouping::is_good_point_wc(const geo_point_t& point, const int apa, const int face, double radius, int ch_range, int allowed_bad) const
 {
+    // doc icarus/04 sec 8: a 3-D dead region counts as dead on all planes (same
+    // verdict as the dead gap below, tested first: no wire cache is needed).
+    // Null region (default) -> no-op.
+    if (in_dead_region(point)) return true;
+    // Hand-declared dead gap: the full vertical W-defect column counts as dead on
+    // all planes (generalizes the y~0 center patch).  Default-empty -> no-op.
+    if (in_dead_gap(point, ch_range, apa, face)) return true;
     const int nplanes = 3;
+    const int needed = 4 - allowed_bad;
     int matched_planes = 0;
-    
-    // Loop through U,V,W planes
+
+    // Loop through U,V,W planes.  Weights remaining after each plane: after U
+    // it is V+W = 3, after V it is W = 2.
+    static const int remaining_weight[3] = {3, 2, 0};
     for (int pind = 0; pind < nplanes; pind++) {
         int weight = (pind == 2) ? 2 : 1; // W plane counts double
-        if (get_closest_points(point, radius, apa, face, pind).size() > 0) {
+        if (has_closest_point(point, radius, apa, face, pind)) {
             matched_planes += weight;
         }
         else if (get_closest_dead_chs(point, ch_range, apa, face, pind)) {
             matched_planes += weight;
         }
+        // Short-circuit on a decided verdict (pure queries, no side effects).
+        if (matched_planes >= needed) return true;
+        if (matched_planes + remaining_weight[pind] < needed) return false;
     }
 
-    return matched_planes >= 4 - allowed_bad;
+    return matched_planes >= needed;
 }
 
 std::vector<int> Grouping::test_good_point(const geo_point_t& point, const int apa, const int face, 
     double radius, int ch_range) const 
 {
-    std::vector<int> num_planes(6, 0);  // Initialize with 6 zeros
+    int scratch[6];
+    test_good_point(point, apa, face, scratch, radius, ch_range);
+    return std::vector<int>(scratch, scratch + 6);
+}
+
+void Grouping::test_good_point(const geo_point_t& point, const int apa, const int face,
+    int (&num_planes)[6], double radius, int ch_range) const
+{
+    for (int i = 0; i < 6; ++i) num_planes[i] = 0;   // was vector(6, 0)
+    // doc icarus/04 sec 8: a 3-D dead region is dead on all three planes (slots
+    // 3,4,5), like the dead gap below; tested first, no wire cache needed.
+    // Null (default) -> no-op.
+    if (in_dead_region(point)) {
+        num_planes[3] = num_planes[4] = num_planes[5] = 1;
+        return;
+    }
+    // Hand-declared dead gap: the full vertical W-defect column counts as dead on
+    // all three planes (slots 3,4,5).  Default-empty -> falls through to normal check.
+    if (in_dead_gap(point, ch_range, apa, face)) {
+        num_planes[3] = num_planes[4] = num_planes[5] = 1;
+        return;
+    }
     // std::cout << "abc: " << point << " " << radius << " " << ch_range << std::endl;
     // Check each plane (0,1,2)
     for (int pind = 0; pind < 3; ++pind) {
-        // Get closest points for this plane
-        const auto closest_pts = get_closest_points(point, radius, apa, face, pind);
-        
-        if (closest_pts.size() > 0) {
+        // Only existence matters here (size() > 0), so use the cheaper nearest-1 query.
+        if (has_closest_point(point, radius, apa, face, pind)) {
             // Has hits in this plane
             num_planes[pind]++;
         }
@@ -364,8 +643,6 @@ std::vector<int> Grouping::test_good_point(const geo_point_t& point, const int a
         }
         // std::cout << closest_pts.size() << " " << get_closest_dead_chs(point, ch_range, face, pind) << " " << num_planes[pind] << " " << num_planes[pind+3] << std::endl;
     }
-    
-    return num_planes;
 }
 
 double Facade::Grouping::get_ave_3d_charge(const geo_point_t& point, const int apa, const int face,  const double radius) const {
@@ -424,86 +701,177 @@ Grouping::kd_results_t Grouping::get_closest_points(const geo_point_t& point, co
                                                     int pind) const
 {
     double x = point[0];
-    const auto [angle_u,angle_v,angle_w] = wire_angles(apa, face);
-    std::vector<double> angles = {angle_u, angle_v, angle_w};
-    double y = cos(angles[pind]) * point[2] - sin(angles[pind]) * point[1];
+    const fastgeom_t& fg = fastgeom(apa, face);
+    const double angle = fg.angle[pind];
+    double y = cos(angle) * point[2] - sin(angle) * point[1];
     const auto& skd = kd2d(apa, face, pind);
-    return skd.radius<std::vector<double>>(radius * radius, {x, y});
+    // Stack query (std::array) instead of a 2-element heap vector; this helper
+    // runs per-point-per-plane in the clustering good-point tests.
+    const std::array<double, 2> query{x, y};
+    // doc pdvd/36: the lattice-normalised ellipse (CtpcAnisoMetric.h), exact
+    // by a circumscribe-and-filter two-level query.  OFF => the legacy
+    // statement below, unchanged.
+    if (m_ctpc_aniso_metric) {
+        return ctpc_radius_aniso(skd, query, radius, fg.yscale[pind]);
+    }
+    return skd.radius<std::array<double, 2>>(radius * radius, query);
+}
+
+bool Grouping::has_closest_point(const geo_point_t& point, const double radius, const int apa, const int face,
+                                 int pind) const
+{
+    double x = point[0];
+    const fastgeom_t& fg = fastgeom(apa, face);
+    const double angle = fg.angle[pind];
+    double y = cos(angle) * point[2] - sin(angle) * point[1];
+    const auto& skd = kd2d(apa, face, pind);
+    // Existence-only query: boolean-identical to knn(1) + strict dist <
+    // radius^2 test (and to !get_closest_points(...).empty()), but the
+    // k-d search terminates at the first in-radius point instead of
+    // resolving the true nearest neighbor.  Distances are squared (L2).
+    // Stack query (std::array) to avoid a 2-element heap vector.
+    const std::array<double, 2> query{x, y};
+    // doc pdvd/36: the lattice-normalised ellipse (CtpcAnisoMetric.h).  Two
+    // exact brackets (inscribed circle hit => true, circumscribed circle
+    // empty => false) keep the early exit for the common cases; only the
+    // in-between case enumerates.  OFF => the legacy statement, unchanged.
+    if (m_ctpc_aniso_metric) {
+        return ctpc_exists_within_aniso(skd, query, radius, fg.yscale[pind]);
+    }
+    return skd.exists_within(radius * radius, query);
 }
 
 bool Grouping::get_closest_dead_chs(const geo_point_t& point, const int ch_range, const int apa, const int face, int pind) const {
-    const auto [tind, wind] = convert_3Dpoint_time_ch(point, apa, face, pind);
+    // doc icarus/04 sec 8: every plane is dead inside a 3-D dead region.
+    // Null region (default) -> no-op.
+    if (in_dead_region(point)) return true;
     const auto& ch2xrange = get_dead_winds(apa, face, pind);
-    for (int ch = wind - ch_range; ch <= wind + ch_range; ++ch) {
-        if (ch2xrange.find(ch) ==  ch2xrange.end()) continue;
-        const auto [xmin, xmax] = ch2xrange.at(ch);
+    if (ch2xrange.empty()) return false;
+    const auto [tind, wind] = convert_3Dpoint_time_ch(point, apa, face, pind);
+    (void)tind;
+    // One ordered-map descent for the whole [wind-ch_range, wind+ch_range]
+    // window instead of a find() per channel; same ascending visit order.
+    for (auto it = ch2xrange.lower_bound(wind - ch_range);
+         it != ch2xrange.end() && it->first <= wind + ch_range; ++it) {
+        const auto [xmin, xmax] = it->second;
         if (point[0] >= xmin && point[0] <= xmax) {
-            // std::cout << "ch " << ch << " x " << point[0] << " xmin " << xmin << " xmax " << xmax << std::endl;
             return true;
         }
     }
     return false;
 }
 
-std::tuple<int, int> Grouping::convert_3Dpoint_time_ch(const geo_point_t& point, const int apa, const int face, const int pind) const {
+bool Grouping::in_dead_gap(const geo_point_t& point, const int ch_range, const int apa, const int face) const {
+    // Project to the W (collection) wind.  A dead W wind spans the full vertical
+    // column, so a hit here flags the whole defect band as dead on all planes.
+    const auto& gap = get_dead_gap_winds(apa, face);
+    if (gap.empty()) return false;  // default builds: no gap -> no behavior change
+    const auto [tind, wind] = convert_3Dpoint_time_ch(point, apa, face, 2);
+    (void)tind;
+    for (int ch = wind - ch_range; ch <= wind + ch_range; ++ch) {
+        const auto it = gap.find(ch);
+        if (it == gap.end()) continue;
+        const auto [xmin, xmax] = it->second;
+        if (point[0] >= xmin && point[0] <= xmax) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const Grouping::fastgeom_t& Grouping::fastgeom(const int apa, const int face) const
+{
+    const size_t key = apa * 2 + face;
+    if (key < m_fastgeom.size() && m_fastgeom[key]) return *m_fastgeom[key];
+
     if (m_anodes.size()==0) {
         raise<ValueError>("Anode is null");
     }
-    const auto iface = m_anodes.at(apa)->faces()[face];
-    if (iface == nullptr) {
+    auto fgp = std::make_unique<fastgeom_t>();
+    auto& fg = *fgp;
+    fg.iface = m_anodes.at(apa)->faces()[face];
+    if (fg.iface == nullptr) {
         raise<ValueError>("anode %d has no face %d", m_anodes.at(apa)->ident(), face);
     }
-
     const auto [angle_u,angle_v,angle_w] = wire_angles(apa, face);
-    std::vector<double> angles = {angle_u, angle_v, angle_w};
-    const double angle = angles[pind];
-    const double pitch = pitch_mags().at(apa).at(face).at(pind);
-    const double center = proj_centers().at(apa).at(face).at(pind);
+    fg.angle = {angle_u, angle_v, angle_w};
+    for (int pind = 0; pind < 3; ++pind) {
+        fg.pitch[pind] = pitch_mags().at(apa).at(face).at(pind);
+        fg.center[pind] = proj_centers().at(apa).at(face).at(pind);
+        // doc sbnd_xin/119 round 3: hoisted out of point2wind, which called both per point.
+        fg.cos_angle[pind] = std::cos(fg.angle[pind]);
+        fg.sin_angle[pind] = std::sin(fg.angle[pind]);
+    }
+    // doc sbnd_xin/119 round 3: hoisted out of drift2time, which walked the face's plane and wire
+    // containers (both returned BY VALUE) on every projected point to recover these two.
+    fg.xsign = fg.iface->dirx();
+    fg.xorig = fg.iface->planes()[2]->wires().front()->center().x();
+    fg.time_offset = cache().map_time_offset.at(apa).at(face);
+    fg.drift_speed = cache().map_drift_speed.at(apa).at(face);
+    fg.tick = cache().map_tick.at(apa).at(face);
+    // doc pdvd/36: the ctpc lattice constants.  nticks_live_slice comes from
+    // the same DetectorVolumes metadata loop as tick and drift_speed
+    // (fill_dv_cache), so the .at() precondition is unchanged.  An absent
+    // key reads as 0 => drift_step 0 => yscale 1 on every plane, i.e. the
+    // knob is silently inert; that is reported loudly below when it is on.
+    {
+        const int nticks = cache().map_nticks_per_slice.at(apa).at(face);
+        fg.drift_step = nticks * fg.tick * fg.drift_speed;
+        for (int pind = 0; pind < 3; ++pind) {
+            fg.yscale[pind] = ctpc_yscale(fg.drift_step, fg.pitch[pind]);
+        }
+        if (m_ctpc_aniso_metric) {
+            static auto alog = Log::logger("clus");
+            if (fg.drift_step <= 0.0) {
+                alog->warn("Grouping ctpc_aniso_metric ON but apa {} face {} has drift_step {} "
+                           "(nticks_live_slice {} tick {} drift_speed {}): metric is the legacy "
+                           "isotropic one on this face -- an inert knob, check the DetectorVolumes metadata",
+                           apa, face, fg.drift_step, nticks, fg.tick, fg.drift_speed);
+            }
+            else {
+                alog->info("Grouping ctpc_aniso_metric ON: apa {} face {} drift_step {:.4f} mm, "
+                           "pitch U/V/W {:.4f}/{:.4f}/{:.4f} mm, yscale U/V/W {:.4f}/{:.4f}/{:.4f}",
+                           apa, face, fg.drift_step / units::mm,
+                           fg.pitch[0] / units::mm, fg.pitch[1] / units::mm, fg.pitch[2] / units::mm,
+                           fg.yscale[0], fg.yscale[1], fg.yscale[2]);
+            }
+        }
+    }
+    if (key >= m_fastgeom.size()) m_fastgeom.resize(key + 1);
+    m_fastgeom[key] = std::move(fgp);
+    return *m_fastgeom[key];
+}
 
-    // std::cout << "Test: " << pitch/units::cm << " " << center/units::cm << std::endl;
+std::tuple<int, int> Grouping::convert_3Dpoint_time_ch(const geo_point_t& point, const int apa, const int face, const int pind) const {
+    const auto& fg = fastgeom(apa, face);
 
-    const int wind = point2wind(point, angle, pitch, center);
+    // doc sbnd_xin/119 round 3: the _cs / (xsign, xorig) forms take the per-(apa,face) constants
+    // from the memo instead of re-deriving them here, per point.  Same expressions, same values.
+    const int wind = point2wind_cs(point, fg.cos_angle[pind], fg.sin_angle[pind], fg.pitch[pind], fg.center[pind]);
 
-    // const auto params = get_params();
-    double time_offset = cache().map_time_offset.at(apa).at(face);
-    double drift_speed = cache().map_drift_speed.at(apa).at(face);
-    double tick = cache().map_tick.at(apa).at(face);
-
-    //std::cout << "Test: " << params.time_offset/units::us << " " << params.drift_speed/(units::mm/units::us) << " " << point[0] << std::endl;
-
-    const double time = drift2time(iface, time_offset, drift_speed, point[0]);
-    const int tind = std::round(time / tick);
+    const double time = drift2time(fg.xsign, fg.xorig, fg.time_offset, fg.drift_speed, point[0]);
+    const int tind = std::round(time / fg.tick);
 
     return {tind, wind};
 }
 
-std::pair<double,double> Grouping::convert_time_wire_2Dpoint(const int timeslice, const int wire, const int apa, const int face, const int plane) const 
+double Grouping::convert_3Dpoint_wire_cont(const geo_point_t& point, const int apa, const int face, const int pind) const {
+    const auto& fg = fastgeom(apa, face);
+    return point2wind_cont_cs(point, fg.cos_angle[pind], fg.sin_angle[pind], fg.pitch[pind], fg.center[pind]);
+}
+
+std::pair<double,double> Grouping::convert_time_wire_2Dpoint(const int timeslice, const int wire, const int apa, const int face, const int plane) const
 {
-    if (m_anodes.size() == 0) {
-        raise<ValueError>("Anode is null");
-    }
-    const auto iface = m_anodes.at(apa)->faces()[face];
-    if (iface == nullptr) {
-        raise<ValueError>("anode %d has no face %d", m_anodes.at(apa)->ident(), face);
-    }
     const int nplanes = 3;
-    // const auto params = get_params();
-    const auto& pitch_mags = this->pitch_mags();
-    const auto& proj_centers = this->proj_centers();
-    
-    double time_offset = cache().map_time_offset.at(apa).at(face);
-    double drift_speed = cache().map_drift_speed.at(apa).at(face);
-    double tick = cache().map_tick.at(apa).at(face);
+    const auto& fg = fastgeom(apa, face);
 
     // Convert time to x position
-    const double x = time2drift(iface, time_offset, drift_speed, timeslice * tick);
-    
+    const double x = time2drift(fg.iface, fg.time_offset, fg.drift_speed, timeslice * fg.tick);
+
     // Get y position based on channel and plane
     double y;
     if (plane >= 0 && plane < nplanes) {
-        const double pitch = pitch_mags.at(apa).at(face).at(plane);
-        const double center = proj_centers.at(apa).at(face).at(plane);
-        y = pitch * (wire+0.5) + center;
+        y = fg.pitch[plane] * (wire+0.5) + fg.center[plane];
     }
     else {
         raise<ValueError>("invalid plane index %d", plane);
@@ -698,7 +1066,23 @@ void Grouping::build_wire_cache(int apa, int face, int plane) const {
             cache.dead_wires[plane][wire_index] = {start_x, end_x};
         }
     }
-    
+
+    // Dead-gap registry (W plane only): the hand-declared W winds whose full
+    // vertical column is treated as dead on all planes (see in_dead_gap).  Empty
+    // unless PointTreeBuilding serialized a dead_gap_a*f*pW PC (gap-flagged region).
+    if (plane == 2) {
+        const std::string gap_name = String::format("dead_gap_a%df%dpW", apa, face);
+        if (local_pcs.find(gap_name) != local_pcs.end()) {
+            const auto& gap = local_pcs.at(gap_name);
+            const auto& xbeg = gap.get("xbeg")->elements<float_t>();
+            const auto& xend = gap.get("xend")->elements<float_t>();
+            const auto& wind = gap.get("wind")->elements<int_t>();
+            for (size_t i = 0; i < wind.size(); ++i) {
+                cache.dead_gap_w[wind[i]] = {xbeg[i], xend[i]};
+            }
+        }
+    }
+
     cache.cached[plane] = true;
 }
 
@@ -724,7 +1108,19 @@ std::pair<double, double> Grouping::get_wire_charge(int apa, int face, int plane
     return wire_it->second;
 }
 
-bool Grouping::is_wire_dead(int apa, int face, int plane, 
+const std::unordered_map<int, std::pair<double, double>>*
+Grouping::wire_charge_row(int apa, int face, int plane, int time_slice) const {
+    build_wire_cache(apa, face, plane);
+    auto& gc = this->cache();
+    const auto& cache = gc.wire_caches[apa][face];
+    auto time_it = cache.charge_data[plane].find(time_slice);
+    if (time_it == cache.charge_data[plane].end()) {
+        return nullptr;
+    }
+    return &time_it->second;
+}
+
+bool Grouping::is_wire_dead(int apa, int face, int plane,
                            int wire_index, int time_slice) const {
     // Ensure cache is built for this APA/face/plane
     build_wire_cache(apa, face, plane);
@@ -814,6 +1210,12 @@ std::map<int, std::pair<double, double>>& Grouping::get_dead_winds(const int apa
     return cache.dead_wires[pind];
 }
 
+std::map<int, std::pair<double, double>>& Grouping::get_dead_gap_winds(const int apa, const int face) const {
+    // The gap registry is loaded alongside the W (plane 2) dead-winds cache.
+    build_wire_cache(apa, face, 2);
+    return this->cache().wire_caches[apa][face].dead_gap_w;
+}
+
 
 void Grouping::clear_cache() const
 {
@@ -861,6 +1263,174 @@ bool Grouping::is_blob_plane_bad(const Blob* blob, int plane, double cut_ratio) 
     }
     
     return false;
+}
+
+
+Facade::Flash Facade::Grouping::flash_at(int flash_index) const
+{
+    Flash flash;                // starts invalid
+    if (flash_index < 0) {
+        return flash;
+    }
+    if (! this->has_pc("flash")) {
+        return flash;
+    }
+
+    // The index must address a row that exists.  Without this, the reads below
+    // ran off the end of the arrays: get_element() (Facade_Mixins.h) forwards to
+    // Array::element(), an UNCHECKED pointer offset, so a stale index returned
+    // raw memory while operator bool() still said "true".  In SBND production
+    // 758 of 50699 matched clusters did exactly that (sbnd_xin/docs/99).
+    //
+    // Bound on the SAME array flashes() sizes its loop with, deliberately: every
+    // flash_at() call made from flashes() then passes by construction, so the
+    // enumeration path (and with it QLMatching) cannot move -- only a caller
+    // resolving a STORED index, i.e. Cluster::get_flash(), can.
+    const auto ftime = this->get_pcarray<double>("time", "flash");
+    if ((size_t) flash_index >= ftime.size()) {
+        return flash;           // stale/foreign index: addresses no flash
+    }
+    flash.m_valid = true;
+
+    // Read the singular values straight off their spans rather than through
+    // get_element().  Validity stays keyed on "time" alone (above), so a PC that
+    // omits a companion array -- as a legacy archive may -- still enumerates
+    // every flash and merely defaults that one field, exactly as the old
+    // get_element(..., def) call did.
+    const auto fvalue = this->get_pcarray<double>("value", "flash");
+    const auto fident = this->get_pcarray<int>("ident", "flash");
+    const auto ftype  = this->get_pcarray<int>("type", "flash");
+    const size_t fi = (size_t) flash_index;
+    flash.m_time  = ftime[fi];
+    flash.m_value = fi < fvalue.size() ? fvalue[fi] : 0.0;
+    flash.m_ident = fi < fident.size() ? fident[fi] : -1;
+    flash.m_type  = fi < ftype.size()  ? ftype[fi]  : -1;
+
+    if (!(this->has_pc("light") && this->has_pc("flashlight"))) {
+        return flash;           // valid, but no per-OpDet info.
+    }
+
+    // Spans.  Walk the flashlight join to look up rows in the light PC.
+    const auto fl_flash = this->get_pcarray<int>("flash", "flashlight");
+    const auto fl_light = this->get_pcarray<int>("light", "flashlight");
+    const auto l_idents = this->get_pcarray<int>("ident", "light");
+    const auto l_times  = this->get_pcarray<double>("time", "light");
+    const auto l_values = this->get_pcarray<double>("value", "light");
+    const auto l_errors = this->get_pcarray<double>("error", "light");
+
+    const size_t nfl = fl_light.size();
+    for (size_t ifl = 0; ifl < nfl; ++ifl) {
+        if (fl_flash[ifl] != flash_index) continue;
+        const int light_index = fl_light[ifl];
+
+        flash.m_idents.push_back(l_idents[light_index]);
+        flash.m_times.push_back(l_times[light_index]);
+        flash.m_values.push_back(l_values[light_index]);
+        flash.m_errors.push_back(l_errors[light_index]);
+    }
+
+    // Sparse readout-coverage rows (channels with coverage < 1 of this
+    // flash's window).  Absent PC (legacy archives) => empty, fully covered.
+    if (this->has_pc("flashcov")) {
+        const auto c_flash = this->get_pcarray<int>("flash", "flashcov");
+        const auto c_chan  = this->get_pcarray<int>("channel", "flashcov");
+        const auto c_cov   = this->get_pcarray<double>("cov", "flashcov");
+        for (size_t r = 0; r < c_flash.size(); ++r) {
+            if (c_flash[r] != flash_index) continue;
+            flash.m_cov_idents.push_back(c_chan[r]);
+            flash.m_covs.push_back(c_cov[r]);
+        }
+    }
+    return flash;
+}
+
+std::vector<Facade::Flash> Facade::Grouping::flashes() const
+{
+    std::vector<Flash> out;
+    if (! this->has_pc("flash")) {
+        return out;
+    }
+    const auto ftime = this->get_pcarray<double>("time", "flash");
+    const size_t nflash = ftime.size();
+    out.reserve(nflash);
+    for (size_t i = 0; i < nflash; ++i) {
+        out.push_back(flash_at((int)i));
+    }
+    return out;
+}
+
+Facade::Flash Facade::Grouping::flash_by_gid(int gid) const
+{
+    Flash flash;                // starts invalid
+    if (gid < 0) {
+        return flash;
+    }
+    if (! this->has_pc("opflash")) {
+        return flash;           // detector/config that emits no merged flash PC
+    }
+    const auto ogid  = this->get_pcarray<int>("gid", "opflash");
+    const auto otime = this->get_pcarray<double>("time", "opflash");
+    const auto och   = this->get_pcarray<int>("ch", "opflash");
+    const auto ope   = this->get_pcarray<double>("pe", "opflash");
+    const size_t nrow = ogid.size();
+    // Every column must cover every row: these are written together, but a
+    // hand-built or partially-merged PC need not be, and get_pcarray hands back
+    // an UNCHECKED span (see the range guard in flash_at()).
+    if (nrow == 0 || otime.size() < nrow || och.size() < nrow || ope.size() < nrow) {
+        return flash;
+    }
+
+    std::vector<size_t> rows;
+    for (size_t i = 0; i < nrow; ++i) {
+        if (ogid[i] == gid) rows.push_back(i);
+    }
+    if (rows.empty()) {
+        return flash;           // no such flash in this grouping
+    }
+
+    // Sum in ASCENDING CHANNEL order, not row order.  The "value" of the
+    // canonical flash PC is FlashTensorToOpticalPCs' `sum += pe` over channels
+    // 0..nchan-1, so summing this way reproduces it BIT-EXACTLY; summing in row
+    // order does not survive the merge's row interleaving (measured: 27.5%
+    // agreement, worst error 1.5e-10, vs 100% in channel order).  Skipped zero
+    // channels cannot change a double sum, so dropping them below is safe.
+    std::stable_sort(rows.begin(), rows.end(),
+                     [&och](size_t a, size_t b) { return och[a] < och[b]; });
+
+    double sum = 0.0;
+    std::vector<int> idents;
+    std::vector<double> times, values;
+    int last_ch = -1;
+    for (size_t r : rows) {
+        if (och[r] == last_ch) {
+            // Two rows for one (gid, channel) => this gid names more than one
+            // flash (see the gid-uniqueness precondition in the header).  Refuse
+            // rather than return a doubled PE sum from a Frankenstein flash.
+            return Flash{};
+        }
+        last_ch = och[r];
+        sum += ope[r];
+        if (ope[r] != 0.0) {    // the "light" PC likewise stores only fired channels
+            idents.push_back(och[r]);
+            times.push_back(otime[r]);
+            values.push_back(ope[r]);
+        }
+    }
+
+    flash.m_valid = true;
+    flash.m_time  = otime[rows.front()];   // one time per flash; all rows equal
+    flash.m_value = sum;
+    // The ident is the GID, not a row index: that is the whole point of this
+    // path, and it is what joins a consumer's output back to the "opflash" PC.
+    flash.m_ident = gid;
+    flash.m_type  = 0;                     // opflash carries no type column
+    flash.m_idents = std::move(idents);
+    flash.m_times  = std::move(times);
+    flash.m_values = std::move(values);
+    flash.m_errors.assign(flash.m_idents.size(), 0.0);  // no per-channel error here
+    // m_cov_idents / m_covs stay empty: "opflash" carries no coverage column,
+    // and empty means "fully covered" by the Flash contract.
+    return flash;
 }
 
 

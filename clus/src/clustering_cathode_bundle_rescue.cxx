@@ -1,0 +1,1275 @@
+// SBND cathode BUNDLE rescue (default-OFF, isolated, removable).
+//
+// NOT a WCP port -- a new algorithm.  It patches, on the TPC side, a known SBND
+// light-reconstruction defect: an early flash opens a readout window (~8 us) that
+// can ABSORB a later flash.  A beam interaction whose track crosses the central
+// cathode scintillates in both drift volumes and should yield a beam-coincident
+// flash on each side; when one side's flash is absorbed, that side's charge half
+// gets Q/L-matched to a DIFFERENT flash (2-13 us away, outside the beam window)
+// with a perfectly good light pattern.  The two halves then sit in different
+// bundles, cathode_connect's flash gate correctly refuses to join them, and the
+// beam-window gate hands the PR chain only half the track (doc pr/12 sec 6:
+// 7 of 12 "fit stops at the cathode" candidates; sbnd_xin/docs/pr/14).
+//
+// What it does, per event, after cathode_connect and BEFORE examine_bundles:
+//   1. find pairs (K_beam, K_far): K_beam matched in the beam window with a tip
+//      at the cathode; K_far in a DIFFERENT flash bundle within
+//      [-rescue_t0_early, +rescue_t0_late] of K_beam's t0, outside the beam
+//      window; the pair passes the cathode-crossing geometric test (duplicated
+//      from clustering_cathode_connect.cxx -- see note below) with K_far's x
+//      evaluated under the destination-T0 hypothesis.
+//   2. decide WHICH flash the joined crosser belongs to from the bundle
+//      structure: a/b = K_beam's length vs the longest OTHER member of its
+//      bundle; c/d = same for K_far.  The bundle that is dominated by its
+//      crosser half keeps the crosser; ties go to the longer half ("small
+//      merges to large").  Both directions occur in the hand-scanned truth set
+//      (4 into the beam bundle, 4 out of it -- doc pr/14 sec 3).
+//   3. merge the pair into ONE cluster (merge_clusters, exactly as
+//      cathode_connect) and re-stamp the merged cluster's flash identity
+//      (cluster_t0 / flash / matched_flash_gid / lm_flag) from the destination
+//      bundle, then re-materialize the corrected coordinates under the new T0.
+//      Merging BEFORE examine_bundles is what makes the crosser one
+//      flash-collapse member, so the PR job's unmerge_bundle keeps it whole
+//      (same invariant as cathode_connect; doc 53).
+//   4. (rescue_unmatched, default OFF; sbnd_xin/docs/pr/17) a second pass
+//      adopts NON-MATCHED clusters: when the far half is one whole cluster
+//      (e.g. after the pr/15 vertex veto), no wrong flash may claim it and
+//      Q/L matching leaves it flashless -- invisible downstream.  If it
+//      geometrically continues a beam-window cluster across the cathode it
+//      is merged into the beam bundle (forced direction: it has no flash of
+//      its own).  Its geometry is evaluated in the RAW scope (its x_t0cor
+//      carries the sentinel T0).
+//
+// Round 2 (sbnd_xin/docs/73): doc 72 sec A found 10 in-beam events in 3000 that
+// this pass still leaves cut at the cathode.  Four knobs, ALL default OFF and
+// each opening one measured blocker, are added: rescue_allow_in_beam_far,
+// rescue_geom_first, rescue_pierce_test and rescue_dest_beam_for_new.  With all
+// four false the accept path and the direction rule are the pr/14 ones exactly.
+// See the CbrParams comments for what each measures.
+//
+// Isolation: this file is self-contained (all helpers file-static); the
+// geometric pair test is DUPLICATED from clustering_cathode_connect.cxx
+// (M10 fork-by-duplication -- the production connector stays byte-identical).
+// When the light reconstruction fixes the absorbing-window defect upstream,
+// retire this pass by flipping its single config flag (cathode_rescue_on in
+// cfg/pgrapher/experiment/sbnd/clus.jsonnet).
+//
+// Inert by default: with beam_window_low == beam_window_high (C++ default 0/0)
+// no cluster is "in beam" and visit() is a no-op even if mistakenly inserted.
+
+#include "WireCellClus/IEnsembleVisitor.h"
+#include "WireCellClus/ClusteringFuncs.h"
+#include "WireCellClus/ClusteringFuncsMixins.h"
+
+#include "WireCellIface/IConfigurable.h"
+
+#include "WireCellUtil/NamedFactory.h"
+#include "WireCellAux/Logger.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>   // std::getenv  (CATHODE_RESCUE_DEBUG instrumentation, removable)
+#include <cstdio>    // std::fprintf
+
+class ClusteringCathodeBundleRescue;
+WIRECELL_FACTORY(ClusteringCathodeBundleRescue, ClusteringCathodeBundleRescue,
+                 WireCell::INamed, WireCell::IConfigurable, WireCell::Clus::IEnsembleVisitor)
+
+using namespace WireCell;
+using namespace WireCell::Clus;
+using namespace WireCell::Clus::Facade;
+
+namespace {
+
+// All geometry/window parameters of the pass, bundled to keep signatures sane.
+struct CbrParams {
+    // beam window (half-open [low, high), same convention as CreateSteinerGraph).
+    double beam_window_low{0.0};
+    double beam_window_high{0.0};
+    // asymmetric bundle search window around the beam cluster's t0:
+    // accept t0_far - t0_beam in [-rescue_t0_early, +rescue_t0_late].
+    double rescue_t0_early{8*units::us};
+    double rescue_t0_late{13*units::us};
+    bool require_far_out_of_beam{true};
+    // geometric pair test -- duplicated knob set of clustering_cathode_connect.cxx.
+    double drift_cut{5*units::cm};
+    double dis_cut{5*units::cm};
+    double max_dis{25*units::cm};
+    double angle_cut{10.0};        // degrees
+    double conn_far_cut{30.0};     // degrees
+    double cathode_x{0.0};
+    double cathode_x_cut{3.5*units::cm};
+    double hough_radius{20*units::cm};
+    double min_length{10*units::cm};
+    double min_length_short{10*units::cm};
+    double short_dir_len{0.0};
+    double conn_short_cut{30.0};   // degrees
+    double tip_touch_cut{0.0};
+    double tip_touch_angle_cut{10.0};
+    double cathode_band_dis{0.0};
+    // unmatched-cluster adoption pass (default OFF; sbnd_xin/docs/pr/17).
+    // A cluster the Q/L matching left with NO flash at all (56463 veto-ON
+    // mode: the true flash was absorbed and no wrong flash claims the whole
+    // cluster) is invisible downstream.  If it geometrically continues a
+    // beam-window cluster across the cathode, adopt it into the beam bundle.
+    bool rescue_unmatched{false};
+    double unmatched_min_length{30*units::cm};
+    int unmatched_min_npts{200};
+    // near-cathode fragment adoption pass (default OFF; sbnd_xin/docs/pr/19).
+    // The per-APA clustering_isolated cathode guard leaves near-cathode shower
+    // fragments UNABSORBED (they plausibly belong to activity in the other
+    // drift volume); Q/L matching leaves them flashless.  Here, with cross-
+    // cathode context available, adopt such a fragment into a beam-window
+    // cluster when its raw closest approach (under the beam-T0 hypothesis) is
+    // within adopt_dis.  Iterates, so a chained fragment family is collected
+    // hop by hop as the beam cluster grows (444187: 1.9 cm first hop, up to
+    // ~12 cm between family members).  The length ceiling is the protection
+    // against swallowing a long flashless cosmic on mere proximity -- long
+    // orphans go through pass 2's strict crossing-pair geometry instead.
+    bool adopt_nu_fragments{false};
+    double adopt_dis{10*units::cm};
+    double adopt_xcut{30*units::cm};          // fragment must reach this close to the cathode
+    double adopt_frag_max_length{60*units::cm};
+    int adopt_min_npts{5};
+    double adopt_beam_min_length{10*units::cm};
+    // ---- round 2 (sbnd_xin/docs/73), ALL default OFF -----------------------
+    // doc 72 sec A found 10 in-beam events in 3000 where the bundle main is cut
+    // at the cathode and the raw image plainly continues into the other TPC.
+    // Every one is a pair this pass declined; the three knobs below each open
+    // one measured blocker.  With all three false the accept path is exactly
+    // the pr/14 one.
+    //
+    // F1: let K_far be IN the beam window provided it is in a different flash
+    // bundle (2 events: both halves matched, each to its own side's in-beam
+    // flash, and clustering never joined them).  Both halves in-beam => the T0
+    // hypothesis moves by <= (2.2-0.2) us * 0.1563 cm/us = 0.31 cm, sub-blob,
+    // so the existing direction rule needs no new tie-break.
+    bool rescue_allow_in_beam_far{false};
+    // F2: the [-rescue_t0_early, +rescue_t0_late] window encodes the absorbing
+    // window (a wrong flash 2-13 us away).  Measured, the wrong flash can be
+    // +589/+855/+581/+108/+28/-43 us away -- no time prior reaches that.  When
+    // true, a pair the window rejected is still tested, but must pass a
+    // TIGHTENED geometry (geom_first_dis + pierce_cut + collinearity) on top of
+    // every existing gate.  Purely additive: no pair the legacy path takes can
+    // change.
+    bool rescue_geom_first{false};
+    // 8 cm, not the 5 cm docs/73 sec 5 proposed: measured on the signal set, the
+    // tip-to-tip separation of a genuine one-sided crosser runs to 6.7 cm
+    // (evt65053, dis 6.68 with a 2.68 cm piercing agreement), so 5 cm cut a real
+    // event on a quantity the piercing test measures far better.  Still 3x
+    // tighter than max_dis.
+    double geom_first_dis{8*units::cm};
+    // F3: `conn` (the tip-to-tip vector) is not a usable direction estimate
+    // when it is dominated by drift -- it is then the cathode dead gap plus the
+    // near-cathode imaging loss, not a track segment, and angle(conn, dir)
+    // degenerates to acos(|dir_x|), i.e. conn_far_cut=30 deg silently becomes a
+    // cut on |dir_x| > 0.866 (evt65289: dis 5.28 of which dX 5.14, cc 45.2 deg
+    // AFTER tt_pca=9.0 had passed angle_cut=10) -- nor when the baseline is too
+    // short to define a direction at all (evt51128: dis 2.78, cc 41.0 deg over
+    // a 2.8 cm lever arm).  In either regime substitute the CATHODE-PIERCING
+    // agreement, a fixed transverse tolerance independent of dis.
+    bool rescue_pierce_test{false};
+    double pierce_cut{8*units::cm};
+    double conn_drift_frac{0.8};   // dX/dis above this => conn is pure drift
+    double conn_min_dis{8*units::cm};  // dis below this => conn has no lever arm
+    // F4: acceptance is not a fix.  The a/b/c/d rule decides which bundle keeps
+    // the merged crosser, and it is length-based: on evt51128 the beam-side
+    // donor is a 4 cm stub (the rescue runs BEFORE examine_bundles, so the
+    // flash-collapse has not yet glued it to the rest of the beam bundle), so
+    // the rule can send the joined crosser OUT of the beam bundle -- accepted,
+    // but worse for PR.  When true, a pair admitted ONLY by an F1/F2/F3 path
+    // adopts the beam bundle unconditionally.  Legacy-path pairs keep a/b/c/d
+    // byte-identical, so the pr/14 hand scan (4 moves in, 4 out) is not
+    // re-opened.
+    bool rescue_dest_beam_for_new{false};
+    // Containment veto for round-2 pairs (docs/73 sec 5.5).  The geometric test
+    // above only ever looks at the two TIP points, but the merge re-materializes
+    // the WHOLE far half under the destination T0.  A pair can pass every tip
+    // test and still be absurd: on evt486907 the far half (matched 990 us away)
+    // is APA0 charge that lands at x = +33 cm under the beam T0 -- 33 cm inside
+    // TPC1, where charge on APA0 wires cannot be.  Its RAW x already runs past
+    // the cathode, which only happens when the true t0 is genuinely hundreds of
+    // us positive, i.e. it is a cosmic and not the missing half at all.
+    //
+    // 1 cm, and it is NOT a resolution tolerance -- it is a direct bound on how
+    // wrong the destination-T0 hypothesis may be.  Measured over 3463 per-APA
+    // cluster parts in 300 production events, legitimate charge NEVER crosses
+    // the cathode at all (max overshoot 0.00 cm): x is derived from drift time
+    // inside the cluster's own wire volume, so it is hard-clipped at the plane.
+    // Anything past it is therefore v_drift * (T0 error), and the tolerance
+    // converts directly: 1 cm admits a 6.4 us error, 3 cm would admit 19 us.
+    // Since rescue_geom_first exists precisely to admit large-|dt0| pairs, this
+    // is the main thing bounding how wrong that hypothesis may be, so tight is
+    // better -- 3 cm would pass any false merge whose T0 error is under 19 us.
+    // Against the measured populations: the 11 good round-2 merges overshoot by
+    // <= 0.55 cm, the two false ones by 33.5 cm.
+    double far_contain_tol{1*units::cm};
+    // Round 3 (sbnd_xin/docs/73 sec 12).  Require the beam-side donor to be
+    // its bundle's DOMINANT matched main: it must carry Flags::main_cluster
+    // (flag_matched_mains, SBND production ON) AND be at least as long as
+    // every other member of its flash bundle (same ">=" convention as the
+    // a/b/c/d rule's beam_dom).  The rescue exists to reattach the missing
+    // half of the BEAM bundle's cathode crosser; the object cut at the
+    // cathode is the bundle's dominant track, so a subordinate fragment is
+    // never a legitimate donor.  The flag alone is NOT enough: an SBND flash
+    // bundle can hold more than one main (18255/52195 precedent), and on
+    // evt51128 the 3.8 cm donor c11 carries the flag (measured, [cbrsel]
+    // "main 1") while its bundle also holds the real 57.7 cm neutrino main
+    // -- the F3-admitted, F4-redirected merge was force-flagged main and
+    // demoted that neutrino out of candidate status before
+    // TaggerCheckNeutrino's pr/16 15 cm guard could see it.  With the
+    // dominance requirement a rescued join can no longer displace a longer
+    // bundle-mate: if the donor already dominates its bundle, promoting the
+    // merged object to main is the legitimate update.
+    bool rescue_beam_main_only{false};
+};
+
+// Fold an angle (deg, 0..180) about 180 -> collinearity (0 = parallel or anti-parallel).
+// (duplicated: clustering_cathode_connect.cxx collinear_deg)
+inline double collinear_deg(double angle_rad)
+{
+    double a = angle_rad / 3.1415926 * 180.0;
+    return std::min(a, 180.0 - a);
+}
+
+// Closest 3D approach RESTRICTED to points within `band` of the cathode plane.
+// (duplicated: clustering_cathode_connect.cxx cathode_band_closest)
+double cathode_band_closest(const Cluster& c1, const Cluster& c2,
+                            double cathode_x, double band,
+                            geo_point_t& q1, geo_point_t& q2)
+{
+    std::vector<geo_point_t> b1, b2;
+    const int n1 = c1.npoints();
+    for (int i = 0; i < n1; ++i) {
+        geo_point_t p = c1.point3d(i);
+        if (std::fabs(p.x() - cathode_x) < band) b1.push_back(p);
+    }
+    const int n2 = c2.npoints();
+    for (int i = 0; i < n2; ++i) {
+        geo_point_t p = c2.point3d(i);
+        if (std::fabs(p.x() - cathode_x) < band) b2.push_back(p);
+    }
+    if (b1.size() < 3 || b2.size() < 3) return 1e9;
+    double best = 1e9;
+    for (const auto& a : b1) {
+        for (const auto& b : b2) {
+            const double dx = a.x() - b.x(), dy = a.y() - b.y(), dz = a.z() - b.z();
+            const double d = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (d < best) { best = d; q1 = a; q2 = b; }
+        }
+    }
+    return best;
+}
+
+// Where a tip's local direction crosses the cathode plane (sbnd_xin/docs/73 F3).
+// Returns the transverse (y, z) piercing point.  A half whose direction is
+// unusable -- nearly isochronous (no lever arm), degenerate, or too short to
+// define one -- contributes its OWN tip (y, z) instead, which is already within
+// cathode_x_cut of the plane and is the better estimate there.  `min_len` is
+// short_dir_len, so the guard is inert when that branch is off (0).
+void pierce_point(const geo_point_t& p, const geo_point_t& dir, double len,
+                  double cathode_x, double min_len, double& y, double& z)
+{
+    y = p.y();
+    z = p.z();
+    const double m = dir.magnitude();
+    if (m <= 0) return;
+    const double ux = dir.x() / m;
+    if (std::fabs(ux) < 0.1) return;              // isochronous
+    if (min_len > 0 && len < min_len) return;     // too short to define a direction
+    const double t = (cathode_x - p.x()) / ux;
+    y = p.y() + t * dir.y() / m;
+    z = p.z() + t * dir.z() / m;
+}
+
+// Transverse distance between the two halves' cathode piercings.  Sharper than
+// the conn angle it replaces: conn_far_cut = 30 deg is a tolerance that SCALES
+// with dis (~2.5 cm at dis = 5 cm, ~12 cm at dis = 25 cm) and collapses to a
+// |dir_x| cut on a drift-dominated conn; this is a fixed transverse bound.
+double pierce_dist(const geo_point_t& p1, const geo_point_t& d1, double len1,
+                   const geo_point_t& p2, const geo_point_t& d2, double len2,
+                   const CbrParams& P)
+{
+    double y1, z1, y2, z2;
+    pierce_point(p1, d1, len1, P.cathode_x, P.short_dir_len, y1, z1);
+    pierce_point(p2, d2, len2, P.cathode_x, P.short_dir_len, y2, z2);
+    return std::sqrt((y1 - y2)*(y1 - y2) + (z1 - z2)*(z1 - z2));
+}
+
+// Re-seat the closest-point pair in the DESTINATION-T0 frame (F2 only).
+//
+// The pair test's header argues that running Find_Closest_Points on unshifted
+// coordinates is harmless because "a <= 2 cm rigid x-shift does not change which
+// tips face each other at the cathode".  That holds for the legacy population
+// (the far half is within 13 us of the beam half), but rescue_geom_first drops
+// the time window, and then xshift2 is v_drift * dt0 -- measured at -92 cm on
+// evt493439 and -134 cm on evt78242.  At that size the unshifted selection picks
+// a tip pair in the wrong frame and the whole geometric test evaluates the wrong
+// two points.  Re-run the same alternating nearest-neighbour convergence
+// Find_Closest_Points uses, but with each query point translated into the other
+// cluster's own frame.  Seeded from the unshifted pair, so it can only improve it.
+void reseat_closest_shifted(const Cluster& c1, const Cluster& c2, double xshift2,
+                            geo_point_t& p1, geo_point_t& p2)
+{
+    auto same = [](const geo_point_t& a, const geo_point_t& b) {
+        return std::fabs(a.x()-b.x()) < 1e-6 && std::fabs(a.y()-b.y()) < 1e-6 &&
+               std::fabs(a.z()-b.z()) < 1e-6;
+    };
+    geo_point_t a = p1, b = p2;
+    for (int it = 0; it < 20; ++it) {
+        // c2's nearest point to a, asked in c2's own (unshifted) frame.
+        const geo_point_t aq(a.x() - xshift2, a.y(), a.z());
+        const geo_point_t nb = c2.get_closest_point_blob(aq).first;
+        // c1's nearest point to that, asked in c1's frame.
+        const geo_point_t bq(nb.x() + xshift2, nb.y(), nb.z());
+        const geo_point_t na = c1.get_closest_point_blob(bq).first;
+        const bool done = same(na, a) && same(nb, b);
+        a = na;
+        b = nb;
+        if (done) break;
+    }
+    p1 = a;
+    p2 = b;
+}
+
+// Cathode-crossing pair test, duplicated from clustering_cathode_connect.cxx
+// is_cathode_crossing_pair (see that file's long header comment for the full cut
+// rationale) with ONE addition: `xshift2` translates cluster2's coordinates in x
+// before every cut.  cluster2 (the far half) carries a WRONG matched T0, so its
+// stored x_t0cor is off by v_drift * dt0 (up to ~2 cm at 12 us); xshift2 puts it
+// in the destination-T0 frame so the tip/drift/distance cuts are unbiased.  The
+// relative pair geometry is the SAME in either half's frame (the two TPCs drift
+// in opposite x), so one shift serves both possible move directions.  Residual
+// caveat: the closest-pair SELECTION (Find_Closest_Points / the band retry) runs
+// on unshifted coordinates; a <= 2 cm rigid x-shift does not change which tips
+// face each other at the cathode.  Local Hough / PCA directions are translation
+// invariant and are evaluated at the ORIGINAL points.
+//
+// Round 2 (sbnd_xin/docs/73) adds two out-of-band arguments, both inert with the
+// round-2 knobs off:
+//   `strict`    the caller admitted this pair only because rescue_geom_first
+//               waived the dt0 window, so every accept must additionally pass
+//               the tightened geometry (geom_first_dis + pierce_cut +
+//               collinearity).
+//   `via_new`   set when the acceptance came from an F3 piercing branch, i.e.
+//               the legacy geometry would have refused this pair.  The caller
+//               needs it for the F4 destination override.
+bool is_cathode_crossing_pair(
+    const Cluster& cluster1,
+    const Cluster& cluster2,
+    double length_1,
+    double length_2,
+    double xshift2,
+    const CbrParams& P,
+    bool strict = false,
+    bool* via_new = nullptr)
+{
+    if (via_new) *via_new = false;
+    geo_point_t p1;
+    geo_point_t p2;
+    // Find_Closest_Points ignores its length_cut argument (it returns the global
+    // closest 3D point pair); we apply our own cuts below.
+    double dis = WireCell::Clus::Facade::Find_Closest_Points(cluster1, cluster2,
+                                                             length_1, length_2,
+                                                             P.max_dis, p1, p2);
+
+    // F2 admitted this pair, so xshift2 may be O(100 cm) and the pair just
+    // selected sits in the wrong frame -- re-seat it.  Legacy and F1 pairs keep
+    // the unshifted selection (their shift is <= 2 cm and 0.31 cm respectively).
+    if (strict) reseat_closest_shifted(cluster1, cluster2, xshift2, p1, p2);
+
+    // the two closest points must sit in DIFFERENT TPCs (this is what makes the
+    // pass incapable of acting within a single TPC).
+    auto wpid_p1 = cluster1.wpid(p1);
+    auto wpid_p2 = cluster2.wpid(p2);
+    if (wpid_p1.apa() == wpid_p2.apa()) return false;
+
+    // CATHODE-BAND closest-approach retry (default OFF: cathode_band_dis == 0);
+    // see clustering_cathode_connect.cxx for rationale.  Runs on unshifted
+    // coordinates; the shift is applied to whichever pair is adopted.
+    if (P.cathode_band_dis > 0) {
+        const bool global_hardgated =
+            std::fabs(p1.x() - P.cathode_x) >= P.cathode_x_cut ||
+            std::fabs(p2.x() + xshift2 - P.cathode_x) >= P.cathode_x_cut ||
+            std::fabs(p1.x() - p2.x() - xshift2) >= P.drift_cut;
+        if (global_hardgated) {
+            geo_point_t q1, q2;
+            double bd = cathode_band_closest(cluster1, cluster2, P.cathode_x,
+                                             P.cathode_band_dis, q1, q2);
+            if (bd < P.max_dis) { p1 = q1; p2 = q2; }
+        }
+    }
+
+    // Destination-T0 hypothesis: shift cluster2's tip in x; keep the original
+    // point for the (translation-invariant) local Hough direction below.
+    const geo_point_t p2_orig = p2;
+    geo_point_t p2s(p2.x() + xshift2, p2.y(), p2.z());
+    dis = std::sqrt((p1.x() - p2s.x())*(p1.x() - p2s.x()) +
+                    (p1.y() - p2s.y())*(p1.y() - p2s.y()) +
+                    (p1.z() - p2s.z())*(p1.z() - p2s.z()));
+
+    // --- CATHODE_RESCUE_DEBUG per-return tracer (removable; env-gated) ---
+    static const bool cbr_dbg = std::getenv("CATHODE_RESCUE_DEBUG") != nullptr;
+    double _ttH = -1, _ttP = -1, _ccb = -1, _pdis = -1;
+    bool _pierce_ok = false;
+    auto DBG = [&](const char* why, bool acc) -> bool {
+        // rescue_geom_first admits a pair the dt0 window rejected; it may only
+        // be accepted on the tightened geometry.  Applied here, once, so every
+        // accept path in this function is covered.
+        bool strict_veto = false;
+        if (acc && strict) {
+            // Direction evidence: either the two halves' own directions agree,
+            // OR the piercing test fired -- which it only does where at least
+            // one direction is unusable and is therefore the BETTER evidence
+            // (evt319913: a 10 cm stub gives tt_hough = 11.2 deg against
+            // angle_cut = 10, while its piercing agrees to 1.20 cm).
+            const bool tt_ok = (_ttH >= 0 && _ttH < P.angle_cut) ||
+                               (_ttP >= 0 && _ttP < P.angle_cut);
+            if (!(dis < P.geom_first_dis && _pdis >= 0 && _pdis < P.pierce_cut &&
+                  (tt_ok || _pierce_ok))) {
+                acc = false;
+                strict_veto = true;
+            }
+        }
+        if (cbr_dbg && dis < P.max_dis) {
+            std::fprintf(stderr,
+                "[cbrx] c%d<->c%d %-16s dis=%.2f dX=%.2f tip=%.2f/%.2f xsh=%.2f ttH=%.1f ttP=%.1f cc=%.1f pierce=%.2f len=%.0f/%.0f -> %s%s\n",
+                (int)cluster1.ident(), (int)cluster2.ident(), why, dis/units::cm,
+                std::fabs(p1.x()-p2s.x())/units::cm,
+                std::fabs(p1.x()-P.cathode_x)/units::cm, std::fabs(p2s.x()-P.cathode_x)/units::cm,
+                xshift2/units::cm, _ttH, _ttP, _ccb, _pdis/units::cm,
+                length_1/units::cm, length_2/units::cm,
+                acc ? "ACCEPT" : "reject", strict_veto ? " (strict)" : "");
+        }
+        if (!acc && via_new) *via_new = false;
+        return acc;
+    };
+
+    // both closest points must end at the cathode plane.
+    if (std::fabs(p1.x() - P.cathode_x) >= P.cathode_x_cut) return DBG("tipx1", false);
+    if (std::fabs(p2s.x() - P.cathode_x) >= P.cathode_x_cut) return DBG("tipx2", false);
+
+    // same DRIFT depth (always tight).
+    if (std::fabs(p1.x() - p2s.x()) >= P.drift_cut) return DBG("drift", false);
+
+    // outer 3D distance ceiling.
+    if (dis >= P.max_dis) return DBG("maxdis", false);
+
+    // local track directions, from the Hough transform at the closest points.
+    geo_point_t dir1 = cluster1.vhough_transform(p1, P.hough_radius);
+    geo_point_t dir2 = cluster2.vhough_transform(p2_orig, P.hough_radius);
+    double tt_hough = collinear_deg(dir1.angle(dir2));
+    _ttH = tt_hough;
+
+    // cluster PCA principal axes (guarded).
+    geo_point_t pca1, pca2;
+    bool have_pca = false;
+    {
+        const auto& ax1 = cluster1.get_pca().axis;
+        const auto& ax2 = cluster2.get_pca().axis;
+        if (!ax1.empty() && !ax2.empty()) {
+            pca1.set(ax1.at(0).x(), ax1.at(0).y(), ax1.at(0).z());
+            pca2.set(ax2.at(0).x(), ax2.at(0).y(), ax2.at(0).z());
+            have_pca = true;
+        }
+    }
+
+    // Round 2 (docs/73): the piercing agreement, and the two regimes in which
+    // `conn` is not a usable direction estimate and it substitutes for the
+    // conn-angle cut.  Both are pure measurements here; nothing acts on them
+    // unless rescue_pierce_test / rescue_geom_first is on.
+    const double dX_tip = std::fabs(p1.x() - p2s.x());
+    _pdis = pierce_dist(p1, dir1, length_1, p2s, dir2, length_2, P);
+    const bool conn_unusable = (dis > 0 && dX_tip > P.conn_drift_frac * dis) ||
+                               (dis < P.conn_min_dis);
+    _pierce_ok = P.rescue_pierce_test && conn_unusable && _pdis < P.pierce_cut;
+    const bool pierce_ok = _pierce_ok;
+
+    if (dis < P.dis_cut) {
+        // CLOSE regime: accept on local half-track collinearity alone.
+        if (tt_hough < P.angle_cut) return DBG("close_primary", true);
+
+        // BOTH-LONG PCA fallback (OFF unless short_dir_len > 0); tip-touch
+        // relaxation as in the connector.  The crosser_conn_relax /
+        // crosser_pca_angle knobs of the connector are NOT duplicated here
+        // (PDVD-specific; SBND leaves them off).
+        if (P.short_dir_len > 0 && have_pca &&
+            std::min(length_1, length_2) >= P.short_dir_len) {
+            double tt_pca = collinear_deg(pca1.angle(pca2));
+            geo_point_t conn(p1.x() - p2s.x(), p1.y() - p2s.y(), p1.z() - p2s.z());
+            double cc_pca = std::min(collinear_deg(conn.angle(pca1)),
+                                     collinear_deg(conn.angle(pca2)));
+            _ttP = tt_pca; _ccb = cc_pca;
+            const bool tip_touch = (P.tip_touch_cut > 0 && dis < P.tip_touch_cut);
+            const bool acc_pca = (tt_pca < P.angle_cut && (tip_touch || cc_pca < P.conn_far_cut));
+            const bool acc_hough = (tip_touch && tt_hough < P.tip_touch_angle_cut);
+            if (acc_pca || acc_hough) return DBG("close_bothlong", true);
+        }
+
+        // SHORT-STUB prolongation (OFF unless short_dir_len > 0).
+        if (P.short_dir_len > 0 &&
+            std::min(length_1, length_2) < P.short_dir_len &&
+            std::max(length_1, length_2) >= P.short_dir_len) {
+            const bool one_is_anchor = (length_1 >= length_2);
+            const geo_point_t& anchor_pt    = one_is_anchor ? p1 : p2s;
+            const geo_point_t& stub_pt      = one_is_anchor ? p2s : p1;
+            const geo_point_t& anchor_hough = one_is_anchor ? dir1 : dir2;
+            const geo_point_t& anchor_pca   = one_is_anchor ? pca1 : pca2;
+            geo_point_t conn(anchor_pt.x() - stub_pt.x(),
+                             anchor_pt.y() - stub_pt.y(),
+                             anchor_pt.z() - stub_pt.z());
+            double cc_hough = collinear_deg(conn.angle(anchor_hough));
+            double cc_pca = have_pca ? collinear_deg(conn.angle(anchor_pca)) : 999.0;
+            _ccb = std::min(cc_hough, cc_pca);
+            if (std::min(cc_hough, cc_pca) < P.conn_short_cut) {
+                return DBG("close_shortstub", true);
+            }
+            // F3 (docs/73): at evt51128's dis = 2.78 cm the conn angle is noise
+            // (2.7 cm of it is transverse), so accept on the piercing agreement
+            // ALONE.  Deliberately no collinearity companion: the stub is 4 cm
+            // and has no usable direction of its own (its tt_hough is 11.6 deg
+            // against angle_cut = 10, and the both-long PCA branch never ran),
+            // so pierce_point falls back to its tip (y, z) and the test is
+            // "does the LONG half's extrapolation pass within pierce_cut of the
+            // stub".
+            if (pierce_ok) {
+                if (via_new) *via_new = true;
+                return DBG("short_pierce", true);
+            }
+            return DBG("close_shortstub", false);
+        }
+        return DBG("close_fallthrough", false);
+    }
+
+    // FAR regime.
+    double tt_pca = have_pca ? collinear_deg(pca1.angle(pca2)) : 999.0;
+    _ttP = tt_pca;
+    if (tt_hough >= P.angle_cut && tt_pca >= P.angle_cut) return DBG("far_notcollinear", false);
+
+    geo_point_t conn(p1.x() - p2s.x(), p1.y() - p2s.y(), p1.z() - p2s.z());
+    double cc_hough = collinear_deg(conn.angle(dir1));
+    double cc_pca = have_pca ? std::min(collinear_deg(conn.angle(pca1)),
+                                        collinear_deg(conn.angle(pca2))) : 999.0;
+    _ccb = std::min(cc_hough, cc_pca);
+    if (cc_hough >= P.conn_far_cut && cc_pca >= P.conn_far_cut) {
+        // F3 (docs/73): on evt65289 conn is 97 % drift (dis 5.28, dX 5.14) --
+        // the cathode dead gap plus the near-cathode imaging loss, not a track
+        // segment -- so cc = 45.2 deg measures acos(|dir_x|), not collinearity,
+        // and tt_pca = 9.0 deg had ALREADY passed angle_cut = 10.  Substitute
+        // the piercing agreement; the collinearity gate above still stands.
+        if (!pierce_ok) return DBG("far_conn", false);
+        if (via_new) *via_new = true;
+        return DBG("far_pierce", true);
+    }
+
+    return DBG("far_accept", true);
+}
+
+} // anonymous namespace
+
+class ClusteringCathodeBundleRescue : public IConfigurable,
+                                      public Clus::IEnsembleVisitor,
+                                      public Aux::Logger,
+                                      private NeedDV, private NeedPCTS, private NeedScope {
+public:
+    ClusteringCathodeBundleRescue()
+        : Aux::Logger("CathodeBundleRescue", "clus")
+    {}
+    virtual ~ClusteringCathodeBundleRescue() {}
+
+    void configure(const WireCell::Configuration& config) {
+        NeedDV::configure(config);
+        NeedPCTS::configure(config);
+        NeedScope::configure(config);
+
+        // Window knobs.  beam_window defaults to an EMPTY window: no beam
+        // cluster, no candidate pair, visit() is a no-op unless configured.
+        p_.beam_window_low        = get(config, "beam_window_low", p_.beam_window_low);
+        p_.beam_window_high       = get(config, "beam_window_high", p_.beam_window_high);
+        p_.rescue_t0_early        = get(config, "rescue_t0_early", p_.rescue_t0_early);
+        p_.rescue_t0_late         = get(config, "rescue_t0_late", p_.rescue_t0_late);
+        p_.require_far_out_of_beam= get(config, "require_far_out_of_beam", p_.require_far_out_of_beam);
+
+        // Geometric pair test knobs (same names and defaults as the connector).
+        p_.drift_cut       = get(config, "drift_cut", p_.drift_cut);
+        p_.dis_cut         = get(config, "dis_cut", p_.dis_cut);
+        p_.max_dis         = get(config, "max_dis", p_.max_dis);
+        p_.angle_cut       = get(config, "angle_cut", p_.angle_cut);
+        p_.conn_far_cut    = get(config, "conn_far_cut", p_.conn_far_cut);
+        p_.cathode_x       = get(config, "cathode_x", p_.cathode_x);
+        p_.cathode_x_cut   = get(config, "cathode_x_cut", p_.cathode_x_cut);
+        p_.hough_radius    = get(config, "hough_radius", p_.hough_radius);
+        p_.min_length      = get(config, "min_length", p_.min_length);
+        p_.min_length_short= get(config, "min_length_short", p_.min_length);
+        p_.short_dir_len   = get(config, "short_dir_len", p_.short_dir_len);
+        p_.conn_short_cut  = get(config, "conn_short_cut", p_.conn_short_cut);
+        p_.tip_touch_cut   = get(config, "tip_touch_cut", p_.tip_touch_cut);
+        p_.tip_touch_angle_cut = get(config, "tip_touch_angle_cut", p_.angle_cut);
+        p_.cathode_band_dis= get(config, "cathode_band_dis", p_.cathode_band_dis);
+
+        // Unmatched-cluster adoption pass (C++ default false => the pass is
+        // absent and behavior is byte-identical to pre-knob builds).
+        p_.rescue_unmatched     = get(config, "rescue_unmatched", p_.rescue_unmatched);
+        p_.unmatched_min_length = get(config, "unmatched_min_length", p_.unmatched_min_length);
+        p_.unmatched_min_npts   = get(config, "unmatched_min_npts", p_.unmatched_min_npts);
+
+        // Near-cathode fragment adoption pass (C++ default false => the pass
+        // is absent and behavior is byte-identical to pre-knob builds).
+        p_.adopt_nu_fragments     = get(config, "adopt_nu_fragments", p_.adopt_nu_fragments);
+        p_.adopt_dis              = get(config, "adopt_dis", p_.adopt_dis);
+        p_.adopt_xcut             = get(config, "adopt_xcut", p_.adopt_xcut);
+        p_.adopt_frag_max_length  = get(config, "adopt_frag_max_length", p_.adopt_frag_max_length);
+        p_.adopt_min_npts         = get(config, "adopt_min_npts", p_.adopt_min_npts);
+        p_.adopt_beam_min_length  = get(config, "adopt_beam_min_length", p_.adopt_beam_min_length);
+
+        // Round 2 (sbnd_xin/docs/73).  Every C++ default is false / inert, so an
+        // absent key leaves the pr/14 accept path byte-identical.
+        p_.rescue_allow_in_beam_far = get(config, "rescue_allow_in_beam_far", p_.rescue_allow_in_beam_far);
+        p_.rescue_geom_first        = get(config, "rescue_geom_first", p_.rescue_geom_first);
+        p_.geom_first_dis           = get(config, "geom_first_dis", p_.geom_first_dis);
+        p_.rescue_pierce_test       = get(config, "rescue_pierce_test", p_.rescue_pierce_test);
+        p_.pierce_cut               = get(config, "pierce_cut", p_.pierce_cut);
+        p_.conn_drift_frac          = get(config, "conn_drift_frac", p_.conn_drift_frac);
+        p_.conn_min_dis             = get(config, "conn_min_dis", p_.conn_min_dis);
+        p_.rescue_dest_beam_for_new = get(config, "rescue_dest_beam_for_new", p_.rescue_dest_beam_for_new);
+        p_.far_contain_tol          = get(config, "far_contain_tol", p_.far_contain_tol);
+
+        // Round 3 (sbnd_xin/docs/73 sec 12).  C++ default false => absent key
+        // leaves every round-1/round-2 accept path byte-identical.
+        p_.rescue_beam_main_only    = get(config, "rescue_beam_main_only", p_.rescue_beam_main_only);
+    }
+
+    virtual Configuration default_configuration() const {
+        Configuration cfg;
+        return cfg;
+    }
+
+    void visit(Ensemble& ensemble) const {
+        auto groupings = ensemble.with_name("live");
+        if (groupings.empty()) return;
+        rescue(*groupings.at(0));
+    }
+
+private:
+    CbrParams p_;
+
+    struct Member {           // one flash-matched cluster, snapshot per round
+        Cluster* cluster;
+        int ident;
+        int gid;
+        double t0;
+        double length;
+    };
+
+    bool in_beam(double t0) const {
+        return t0 >= p_.beam_window_low && t0 < p_.beam_window_high;
+    }
+
+    // x-shift that moves the far half into the destination-T0 frame:
+    // x_hyp = x_t0cor(old t0) - dirx * (t0_dest - t0_old) * v_drift.
+    // dirx/speed are per (apa, face) of the far tip; trigger offsets cancel in
+    // the difference.  Falls back to 0 (no shift) if the speed map lacks the
+    // face -- the cuts then simply run on the stored coordinates, which the
+    // pr/12 measurements show still pass for the known population.
+    double far_xshift(const Grouping& grouping, const Cluster& far, double dt0_dest) const {
+        // any point of the far cluster gives its apa/face (single-TPC cluster).
+        if (far.npoints() == 0) return 0.0;
+        auto wpid = far.wpid(far.point3d(0));
+        const auto speeds = grouping.get_drift_speed();
+        auto ait = speeds.find(wpid.apa());
+        if (ait == speeds.end()) return 0.0;
+        auto fit = ait->second.find(wpid.face());
+        if (fit == ait->second.end()) return 0.0;
+        const double dirx = m_dv->face_dirx(WirePlaneId(kAllLayers, wpid.face(), wpid.apa()));
+        return -dirx * dt0_dest * fit->second;
+    }
+
+    // Would the far half still lie inside its OWN drift volume once
+    // re-materialized under the destination T0?  (docs/73 sec 5.5)
+    //
+    // Sign convention is taken from far_xshift above, not re-derived: that
+    // returns -dirx * dt0 * speed, and the doc-72 measurement is
+    // dx = SIGN(apa) * v * t0 with SIGN = -1 for the x<0 volume.  Hence
+    // SIGN = -dirx, so the volume a face belongs to is the side of the cathode
+    // on which (x - cathode_x) * dirx < 0.  Any point that ends up more than
+    // `tol` on the WRONG side has been pushed through the cathode.
+    //
+    // Only the cathode side is tested.  An over-shift the other way would push
+    // charge behind the anode, equally unphysical, but the anode plane position
+    // is not available here; the cathode test is the one the observed failures
+    // trip, by 33 cm.
+    bool far_stays_in_tpc(const Cluster& far, double xshift) const {
+        const int N = far.npoints();
+        if (N == 0) return true;
+        auto wpid = far.wpid(far.point3d(0));
+        const double dirx = m_dv->face_dirx(WirePlaneId(kAllLayers, wpid.face(), wpid.apa()));
+        if (dirx == 0) return true;
+        double worst = -1e9;
+        for (int i = 0; i != N; ++i) {
+            const double d = (far.point3d(i).x() + xshift - p_.cathode_x) * dirx;
+            if (d > worst) worst = d;
+        }
+        if (worst <= p_.far_contain_tol) return true;
+        static const bool dbg = std::getenv("CATHODE_RESCUE_DEBUG") != nullptr;
+        if (dbg) {
+            std::fprintf(stderr,
+                "[cbrsel] c%d far half leaves its own TPC by %.1f cm under the "
+                "destination T0 (tol %.1f) -> reject\n",
+                (int)far.ident(), worst/units::cm, p_.far_contain_tol/units::cm);
+        }
+        return false;
+    }
+
+    void rescue(Grouping& live_grouping) const {
+        if (!(p_.beam_window_high > p_.beam_window_low)) return;
+
+        // Selection-loop tracer (removable; env-gated, same switch as [cbrx]).
+        // Prints EVERY candidate pair with both t0 / gid / in-beam flags and the
+        // gate that pruned it -- the window gates below run before the geometric
+        // test, so [cbrx] alone cannot attribute them.
+        static const bool cbr_sel_dbg = std::getenv("CATHODE_RESCUE_DEBUG") != nullptr;
+
+        // One accepted move per round, then FULL re-enumeration: merge_clusters
+        // destroys both inputs and appends a fresh cluster, so every pointer,
+        // index and bundle tally is stale after it.  Progress is guaranteed
+        // (each round removes one cluster and the merged pair shares one gid,
+        // so it can never re-qualify against itself).
+        int nrounds = 0;
+        while (true) {
+            auto live_clusters = live_grouping.children();
+            for (auto* live : live_clusters) {
+                if (live->get_default_scope().hash() != m_scope.hash()) {
+                    live->set_default_scope(m_scope);
+                }
+            }
+
+            // Flash-matched membership snapshot (by value; ident order).
+            std::vector<Member> members;
+            for (auto* c : live_clusters) {
+                if (c->get_scalar<int>("flash", -1) < 0) continue;
+                const int gid = c->get_scalar<int>("matched_flash_gid", -1);
+                if (gid < 0) continue;
+                members.push_back({c, (int)c->ident(), gid,
+                                   c->get_cluster_t0(), c->get_length()});
+            }
+            std::sort(members.begin(), members.end(),
+                      [](const Member& a, const Member& b) { return a.ident < b.ident; });
+
+            // First qualifying pair in (ident_beam, ident_far) order.
+            const Member* best_beam = nullptr;
+            const Member* best_far = nullptr;
+            bool best_new_path = false;
+            for (const auto& kb : members) {
+                if (best_beam) break;
+                if (!in_beam(kb.t0)) continue;
+                if (!kb.cluster->get_scope_filter(m_scope)) continue;
+                if (kb.length < p_.min_length_short) continue;
+                // Round 3: the donor must be the beam bundle's DOMINANT
+                // matched main (see CbrParams::rescue_beam_main_only).
+                // Beam-side prune, so it is printed once per donor, not once
+                // per pair.  The sibling scan mirrors the a/b/c/d rule's
+                // b_len (max length over same-gid members, donor excluded).
+                if (p_.rescue_beam_main_only) {
+                    const char* bprune = nullptr;
+                    if (!kb.cluster->get_flag(Flags::main_cluster)) {
+                        bprune = "not_main";
+                    }
+                    else {
+                        double sib_len = 0;
+                        for (const auto& m : members) {
+                            if (m.cluster == kb.cluster) continue;
+                            if (m.gid == kb.gid) sib_len = std::max(sib_len, m.length);
+                        }
+                        if (kb.length < sib_len) bprune = "not_dominant";
+                    }
+                    if (bprune) {
+                        if (cbr_sel_dbg) {
+                            std::fprintf(stderr,
+                                "[cbrsel] c%d(gid %d t0 %.3f us beam 1 %.1f cm) -> %s\n",
+                                kb.ident, kb.gid, kb.t0/units::us, kb.length/units::cm,
+                                bprune);
+                        }
+                        continue;
+                    }
+                }
+                for (const auto& kf : members) {
+                    if (kf.gid == kb.gid) continue;
+                    const double dt0 = kf.t0 - kb.t0;
+                    // The two window gates, evaluated rather than applied, so
+                    // the selection tracer below can name the one that pruned
+                    // the pair.  Classes A and B of docs/73 sec 4 die HERE,
+                    // before the geometric test runs at all -- which is why
+                    // the [cbrx] tracer inside it printed nothing for 10 of the
+                    // 12 events and that attribution had to be inferred.
+                    const bool dt0_ok = !(dt0 < -p_.rescue_t0_early || dt0 > p_.rescue_t0_late);
+                    const bool beam_far_ok = !(p_.require_far_out_of_beam &&
+                                               !p_.rescue_allow_in_beam_far &&
+                                               in_beam(kf.t0));
+                    const char* prune = nullptr;
+                    if (!dt0_ok && !p_.rescue_geom_first)             prune = "dt0";
+                    else if (!beam_far_ok)                            prune = "in_beam_far";
+                    else if (!kf.cluster->get_scope_filter(m_scope))  prune = "scope";
+                    else if (kf.length < p_.min_length_short)         prune = "len_far";
+                    else if (std::max(kb.length, kf.length) < p_.min_length) prune = "len_max";
+                    if (cbr_sel_dbg) {
+                        std::fprintf(stderr,
+                            "[cbrsel] c%d(gid %d t0 %.3f us beam %d main %d %.1f cm) <-> "
+                            "c%d(gid %d t0 %.3f us beam %d %.1f cm) dt0=%.3f us -> %s\n",
+                            kb.ident, kb.gid, kb.t0/units::us, (int)in_beam(kb.t0),
+                            (int)kb.cluster->get_flag(Flags::main_cluster),
+                            kb.length/units::cm,
+                            kf.ident, kf.gid, kf.t0/units::us, (int)in_beam(kf.t0),
+                            kf.length/units::cm, dt0/units::us,
+                            prune ? prune : "geometry");
+                    }
+                    if (prune) continue;
+                    const double xshift = far_xshift(live_grouping, *kf.cluster, kb.t0 - kf.t0);
+                    bool via_new = false;
+                    if (!is_cathode_crossing_pair(*kb.cluster, *kf.cluster,
+                                                  kb.length, kf.length, xshift, p_,
+                                                  /*strict=*/!dt0_ok, &via_new)) continue;
+                    // Iso-band veto (doc pr/66): never select a pair the
+                    // per-APA neutrino guard refused.  Applied HERE, at
+                    // candidate SELECTION, rather than via merge_clusters'
+                    // edge filter: this loop commits to one pair per round and
+                    // aborts the whole rescue with a warning if the resulting
+                    // merge doesn't produce exactly one cluster, so a
+                    // post-selection veto would turn a declined merge into a
+                    // rescue-wide stop instead of simply trying the next
+                    // candidate.  Constant-false when the array was never
+                    // written (knob off), so this costs nothing then.
+                    if (band_veto_forbids(kb.cluster, kf.cluster)) continue;
+                    const bool new_path = via_new || !dt0_ok ||
+                                          (p_.rescue_allow_in_beam_far && in_beam(kf.t0));
+                    // Containment veto (docs/73 sec 5.5): the tip tests above say
+                    // nothing about where the REST of the far half lands under
+                    // the destination T0.  Round-2 pairs only -- legacy shifts are
+                    // <= 2 cm and cannot move a half through the cathode.
+                    if (new_path && !far_stays_in_tpc(*kf.cluster, xshift)) continue;
+                    best_beam = &kb;
+                    best_far = &kf;
+                    // Admitted only by a round-2 path?  Either the dt0 window
+                    // refused it (F2), or the far half is itself in-beam (F1),
+                    // or the geometry was accepted on the piercing test the
+                    // legacy conn-angle cut would have refused (F3).  Consumed
+                    // by the F4 destination override below.
+                    best_new_path = new_path;
+                    break;
+                }
+            }
+            if (!best_beam) break;
+
+            // Bundle-structure inputs for the direction rule (a/b/c/d).
+            double b_len = 0, d_len = 0;
+            for (const auto& m : members) {
+                if (m.cluster == best_beam->cluster || m.cluster == best_far->cluster) continue;
+                if (m.gid == best_beam->gid) b_len = std::max(b_len, m.length);
+                if (m.gid == best_far->gid) d_len = std::max(d_len, m.length);
+            }
+            const double a_len = best_beam->length;
+            const double c_len = best_far->length;
+            const bool beam_dom = a_len >= b_len;
+            const bool far_dom = c_len >= d_len;
+            // Which flash does the joined crosser adopt?  The bundle dominated
+            // by its crosser half keeps it; ties go to the longer half.
+            bool dest_is_beam;
+            const char* rule;
+            // F4 (docs/73): a/b/c/d is length-based, and this pass runs BEFORE
+            // examine_bundles, so the beam-side donor can still be a stub the
+            // flash-collapse has not yet glued to the rest of its bundle
+            // (evt51128: a_len = 4 cm against a ~290 cm sibling).  The rule then
+            // sends the joined crosser out of the beam bundle -- accepted, but
+            // worse for PR.  Round-2 pairs are in-beam-anchored by construction,
+            // so force the beam destination for them; legacy pairs are
+            // untouched, so the pr/14 hand scan is not re-opened.
+            if (p_.rescue_dest_beam_for_new && best_new_path) {
+                                             dest_is_beam = true;  rule = "new-path-beam"; }
+            else if (beam_dom && !far_dom) { dest_is_beam = true;  rule = "beam-dominant"; }
+            else if (far_dom && !beam_dom) { dest_is_beam = false; rule = "far-dominant"; }
+            else                           { dest_is_beam = (a_len >= c_len); rule = "longer-half"; }
+
+            // Snapshot destination identity and the SOURCE bundle id by value
+            // (merge_clusters destroys both member clusters).
+            const Member& dest = dest_is_beam ? *best_beam : *best_far;
+            const Member& src = dest_is_beam ? *best_far : *best_beam;
+            const double dest_t0 = dest.t0;
+            const int dest_flash = dest.cluster->get_scalar<int>("flash", -1);
+            const int dest_gid = dest.gid;
+            const int dest_lm = dest.cluster->get_scalar<int>("lm_flag", -1);
+            const int src_gid = src.gid;
+
+            log->info("rescue round {}: c{} (gid {}, t0 {:.3f} us, {:.1f} cm) + "
+                      "c{} (gid {}, t0 {:.3f} us, {:.1f} cm) -> gid {} ({}; "
+                      "a={:.1f} b={:.1f} c={:.1f} d={:.1f} cm)",
+                      nrounds, best_beam->ident, best_beam->gid,
+                      best_beam->t0/units::us, best_beam->length/units::cm,
+                      best_far->ident, best_far->gid,
+                      best_far->t0/units::us, best_far->length/units::cm,
+                      dest_gid, rule,
+                      a_len/units::cm, b_len/units::cm, c_len/units::cm, d_len/units::cm);
+
+            // Merge exactly as cathode_connect does (2-vertex graph, default
+            // merge_clusters args carry the assoc_cluster_id/main provenance).
+            typedef cluster_connectivity_graph_t Graph;
+            Graph g;
+            std::map<int, int> desc;
+            int idx_beam = -1, idx_far = -1;
+            for (size_t ilive = 0; ilive < live_clusters.size(); ++ilive) {
+                if (live_clusters[ilive] == best_beam->cluster) idx_beam = (int)ilive;
+                if (live_clusters[ilive] == best_far->cluster) idx_far = (int)ilive;
+            }
+            for (size_t ilive = 0; ilive < live_clusters.size(); ++ilive) {
+                desc[(int)ilive] = boost::add_vertex((int)ilive, g);
+            }
+            boost::add_edge(desc[idx_beam], desc[idx_far], g);
+            auto fresh = merge_clusters(g, live_grouping);
+            if (fresh.size() != 1) {
+                log->warn("rescue round {}: expected 1 merged cluster, got {} -- stopping",
+                          nrounds, fresh.size());
+                break;
+            }
+            Cluster* merged = fresh.at(0);
+
+            // Re-stamp the flash identity AFTER the merge (merge_clusters derives
+            // it from the longest member, which may carry the source flash), then
+            // re-materialize the corrected coordinates under the destination T0
+            // (T0 first, then correct -- the improvecluster_2.cxx idiom; no
+            // geometry access on `merged` before add_corrected_points).
+            merged->set_cluster_t0(dest_t0);
+            merged->set_scalar<int>("flash", dest_flash);
+            merged->set_scalar<int>("matched_flash_gid", dest_gid);
+            merged->set_scalar<int>("lm_flag", dest_lm);
+            // The joined crosser is a bundle main by construction (multi-main
+            // flash groups are legal downstream).
+            merged->set_flag(Flags::main_cluster, 1);
+            merged->set_flag(Flags::associated_cluster, 0);
+            const auto& default_scope = merged->get_default_scope();
+            const auto& raw_scope = merged->get_raw_scope();
+            if (default_scope.hash() != raw_scope.hash()) {
+                auto correction_name = merged->get_scope_transform(default_scope);
+                merged->add_corrected_points(m_pcts, correction_name);
+            }
+
+            // Source-bundle main repair: the source bundle lost its crosser
+            // half; if members remain but none is a main, promote the longest
+            // so the bundle stays visible to unmerge/TGM/STM/Neutrino.
+            Cluster* promote = nullptr;
+            bool src_has_main = false;
+            for (auto* c : live_grouping.children()) {
+                if (c == merged) continue;
+                if (c->get_scalar<int>("matched_flash_gid", -1) != src_gid) continue;
+                if (c->get_flag(Flags::main_cluster)) { src_has_main = true; break; }
+                if (!promote || c->get_length() > promote->get_length()) promote = c;
+            }
+            if (!src_has_main && promote) {
+                promote->set_flag(Flags::main_cluster, 1);
+                promote->set_flag(Flags::associated_cluster, 0);
+                log->debug("rescue round {}: promoted c{} ({:.1f} cm) to main of source gid {}",
+                           nrounds, (int)promote->ident(),
+                           promote->get_length()/units::cm, src_gid);
+            }
+
+            ++nrounds;
+        }
+
+        // ---- Pass 2 (rescue_unmatched; sbnd_xin/docs/pr/17): adopt NON-MATCHED
+        // clusters.  Same absorbing-window defect, different failure shape: when
+        // the whole far half is ONE cluster (e.g. after the pr/15 vertex veto
+        // rejoined it), no wrong flash may claim it at all and Q/L matching
+        // leaves it with no flash.  Such a cluster is invisible downstream (no
+        // bundle, no beam-window evaluation) AND its corrected coordinates were
+        // materialized with the sentinel T0 (56463: x_t0cor off by 1.5e6 m), so
+        // it must be evaluated in its RAW scope under the destination-T0
+        // hypothesis (raw x is the t0=0 frame; the shift for beam t0 is sub-mm).
+        // Direction is FORCED into the beam bundle -- an unmatched cluster has
+        // no flash to offer -- so this pass can only ADD charge to the beam
+        // bundle; a wrongly adopted cosmic crosser becomes a joined cathode
+        // crosser the TGM/STM taggers evaluate downstream (the self-correcting
+        // pattern of doc pr/14 sec 7.4, evts 288952/352365).  Runs AFTER the
+        // bundle pass, on the post-move state.
+        int nadopt = 0;
+        if (p_.rescue_unmatched) {
+            while (true) {
+                auto live_clusters = live_grouping.children();
+                // Matched clusters in the analysis scope; unmatched candidates
+                // in their raw scope (see above).  Restored after the pass.
+                for (auto* live : live_clusters) {
+                    const bool matched = live->get_scalar<int>("flash", -1) >= 0 &&
+                                         live->get_scalar<int>("matched_flash_gid", -1) >= 0;
+                    const auto& want = matched ? m_scope : live->get_raw_scope();
+                    if (live->get_default_scope().hash() != want.hash()) {
+                        live->set_default_scope(want);
+                    }
+                }
+
+                std::vector<Member> members;    // flash-matched, ident order
+                std::vector<Member> orphans;    // unmatched candidates, ident order
+                for (auto* c : live_clusters) {
+                    const int gid = c->get_scalar<int>("matched_flash_gid", -1);
+                    if (c->get_scalar<int>("flash", -1) >= 0 && gid >= 0) {
+                        members.push_back({c, (int)c->ident(), gid,
+                                           c->get_cluster_t0(), c->get_length()});
+                        continue;
+                    }
+                    // Size floors keep specks and debris out of the beam bundle.
+                    if (c->npoints() < p_.unmatched_min_npts) continue;
+                    const double len = c->get_length();
+                    if (len < p_.unmatched_min_length) continue;
+                    // No scope-filter gate here: the in/out-of-volume partition
+                    // needs a T0 the unmatched cluster does not have.  The
+                    // tip-at-the-cathode geometry below is the containment gate.
+                    orphans.push_back({c, (int)c->ident(), -1, 0.0, len});
+                }
+                std::sort(members.begin(), members.end(),
+                          [](const Member& a, const Member& b) { return a.ident < b.ident; });
+                std::sort(orphans.begin(), orphans.end(),
+                          [](const Member& a, const Member& b) { return a.ident < b.ident; });
+
+                const Member* best_beam = nullptr;
+                const Member* best_orphan = nullptr;
+                for (const auto& kb : members) {
+                    if (best_beam) break;
+                    if (!in_beam(kb.t0)) continue;
+                    if (!kb.cluster->get_scope_filter(m_scope)) continue;
+                    if (kb.length < p_.min_length_short) continue;
+                    for (const auto& ko : orphans) {
+                        if (std::max(kb.length, ko.length) < p_.min_length) continue;
+                        // Raw x is the t0=0 frame: dt0_dest = t0_beam - 0.
+                        const double xshift = far_xshift(live_grouping, *ko.cluster, kb.t0);
+                        if (!is_cathode_crossing_pair(*kb.cluster, *ko.cluster,
+                                                      kb.length, ko.length, xshift, p_)) continue;
+                        // Iso-band veto (doc pr/66): see the crosser-rescue
+                        // selection loop above for why this must be a
+                        // selection-time cut, not a post-selection one.
+                        if (band_veto_forbids(kb.cluster, ko.cluster)) continue;
+                        best_beam = &kb;
+                        best_orphan = &ko;
+                        break;
+                    }
+                }
+                if (!best_beam) break;
+
+                // Snapshot the (beam) destination identity by value.
+                const double dest_t0 = best_beam->t0;
+                const int dest_flash = best_beam->cluster->get_scalar<int>("flash", -1);
+                const int dest_gid = best_beam->gid;
+                const int dest_lm = best_beam->cluster->get_scalar<int>("lm_flag", -1);
+
+                log->info("unmatched rescue round {}: c{} (gid {}, t0 {:.3f} us, {:.1f} cm) + "
+                          "c{} (unmatched, {:.1f} cm, {} pts) -> gid {}",
+                          nadopt, best_beam->ident, best_beam->gid,
+                          best_beam->t0/units::us, best_beam->length/units::cm,
+                          best_orphan->ident, best_orphan->length/units::cm,
+                          best_orphan->cluster->npoints(), dest_gid);
+
+                typedef cluster_connectivity_graph_t Graph;
+                Graph g;
+                std::map<int, int> desc;
+                int idx_beam = -1, idx_orphan = -1;
+                for (size_t ilive = 0; ilive < live_clusters.size(); ++ilive) {
+                    if (live_clusters[ilive] == best_beam->cluster) idx_beam = (int)ilive;
+                    if (live_clusters[ilive] == best_orphan->cluster) idx_orphan = (int)ilive;
+                }
+                for (size_t ilive = 0; ilive < live_clusters.size(); ++ilive) {
+                    desc[(int)ilive] = boost::add_vertex((int)ilive, g);
+                }
+                boost::add_edge(desc[idx_beam], desc[idx_orphan], g);
+                auto fresh = merge_clusters(g, live_grouping);
+                if (fresh.size() != 1) {
+                    log->warn("unmatched rescue round {}: expected 1 merged cluster, got {} -- stopping",
+                              nadopt, fresh.size());
+                    break;
+                }
+                Cluster* merged = fresh.at(0);
+
+                // Beam identity, then corrected coordinates under the beam T0
+                // (this also replaces the orphan points' sentinel-T0 x_t0cor).
+                // The merge inputs had MIXED scopes (orphan raw), so pin the
+                // merged cluster's default scope explicitly before correcting.
+                merged->set_cluster_t0(dest_t0);
+                merged->set_scalar<int>("flash", dest_flash);
+                merged->set_scalar<int>("matched_flash_gid", dest_gid);
+                merged->set_scalar<int>("lm_flag", dest_lm);
+                merged->set_flag(Flags::main_cluster, 1);
+                merged->set_flag(Flags::associated_cluster, 0);
+                merged->set_default_scope(m_scope);
+                if (m_scope.hash() != merged->get_raw_scope().hash()) {
+                    auto correction_name = merged->get_scope_transform(m_scope);
+                    merged->add_corrected_points(m_pcts, correction_name);
+                }
+                // No source-bundle repair: the orphan belonged to no bundle.
+
+                ++nadopt;
+            }
+
+            // Leave every cluster in the analysis scope, as the bundle pass does
+            // (unaccepted orphans were parked in their raw scope above).
+            for (auto* live : live_grouping.children()) {
+                if (live->get_default_scope().hash() != m_scope.hash()) {
+                    live->set_default_scope(m_scope);
+                }
+            }
+        }
+
+        // ---- Pass 3 (adopt_nu_fragments; sbnd_xin/docs/pr/19): adopt small
+        // flashless NEAR-CATHODE fragments into a beam-window cluster on raw
+        // proximity.  Companion of the per-APA clustering_isolated cathode
+        // guard, which leaves such fragments unabsorbed (444187: ~560 pts of
+        // nueCC shower fragments 1.9 cm across the cathode from the nu main).
+        // Same scope discipline as pass 2: the fragments' x_t0cor was
+        // materialized from the sentinel T0, so candidates are evaluated in
+        // RAW scope under the beam-T0 hypothesis (sub-mm shift in the beam
+        // window).  Pass 2's strict crossing-pair geometry is deliberately
+        // NOT used here -- shower fragments are not track tips; the
+        // protections are instead the length ceiling (a long flashless
+        // cosmic never qualifies), the cathode-reach requirement, and the
+        // beam-window destination.  One adoption per round, full
+        // re-enumeration, first qualifying (beam ident, fragment ident) pair.
+        int nfrag = 0;
+        if (p_.adopt_nu_fragments) {
+            while (true) {
+                auto live_clusters = live_grouping.children();
+                for (auto* live : live_clusters) {
+                    const bool matched = live->get_scalar<int>("flash", -1) >= 0 &&
+                                         live->get_scalar<int>("matched_flash_gid", -1) >= 0;
+                    const auto& want = matched ? m_scope : live->get_raw_scope();
+                    if (live->get_default_scope().hash() != want.hash()) {
+                        live->set_default_scope(want);
+                    }
+                }
+
+                std::vector<Member> members;      // flash-matched, ident order
+                std::vector<Member> fragments;    // flashless small candidates, ident order
+                for (auto* c : live_clusters) {
+                    const int gid = c->get_scalar<int>("matched_flash_gid", -1);
+                    if (c->get_scalar<int>("flash", -1) >= 0 && gid >= 0) {
+                        members.push_back({c, (int)c->ident(), gid,
+                                           c->get_cluster_t0(), c->get_length()});
+                        continue;
+                    }
+                    if (c->npoints() < p_.adopt_min_npts) continue;
+                    const double len = c->get_length();
+                    if (len >= p_.adopt_frag_max_length) continue;
+                    // Cathode reach, in the fragment's raw frame.
+                    double dcath = 1e9;
+                    const int N = c->npoints();
+                    for (int k = 0; k != N; ++k) {
+                        double d = std::fabs(c->point3d(k).x() - p_.cathode_x);
+                        if (d < dcath) dcath = d;
+                    }
+                    if (dcath >= p_.adopt_xcut) continue;
+                    fragments.push_back({c, (int)c->ident(), -1, 0.0, len});
+                }
+                std::sort(members.begin(), members.end(),
+                          [](const Member& a, const Member& b) { return a.ident < b.ident; });
+                std::sort(fragments.begin(), fragments.end(),
+                          [](const Member& a, const Member& b) { return a.ident < b.ident; });
+
+                const Member* best_beam = nullptr;
+                const Member* best_frag = nullptr;
+                double best_gap = -1;
+                for (const auto& kb : members) {
+                    if (best_beam) break;
+                    if (!in_beam(kb.t0)) continue;
+                    if (!kb.cluster->get_scope_filter(m_scope)) continue;
+                    if (kb.length < p_.adopt_beam_min_length) continue;
+                    for (const auto& kf : fragments) {
+                        // Raw x is the t0=0 frame: dt0_dest = t0_beam - 0.
+                        const double xshift = far_xshift(live_grouping, *kf.cluster, kb.t0);
+                        double gap = 1e9;
+                        const int N = kf.cluster->npoints();
+                        for (int k = 0; k != N; ++k) {
+                            geo_point_t p = kf.cluster->point3d(k);
+                            geo_point_t ps(p.x() + xshift, p.y(), p.z());
+                            double d = kb.cluster->get_closest_dis(ps);
+                            if (d < gap) gap = d;
+                        }
+                        if (gap >= p_.adopt_dis) continue;
+                        // Iso-band veto (doc pr/66): see the crosser-rescue
+                        // selection loop above for why this must be a
+                        // selection-time cut, not a post-selection one.
+                        if (band_veto_forbids(kb.cluster, kf.cluster)) continue;
+                        best_beam = &kb;
+                        best_frag = &kf;
+                        best_gap = gap;
+                        break;
+                    }
+                }
+                if (!best_beam) break;
+
+                const double dest_t0 = best_beam->t0;
+                const int dest_flash = best_beam->cluster->get_scalar<int>("flash", -1);
+                const int dest_gid = best_beam->gid;
+                const int dest_lm = best_beam->cluster->get_scalar<int>("lm_flag", -1);
+
+                log->info("fragment adopt round {}: c{} (gid {}, t0 {:.3f} us, {:.1f} cm) + "
+                          "c{} (flashless, {:.1f} cm, {} pts, gap {:.1f} cm) -> gid {}",
+                          nfrag, best_beam->ident, best_beam->gid,
+                          best_beam->t0/units::us, best_beam->length/units::cm,
+                          best_frag->ident, best_frag->length/units::cm,
+                          best_frag->cluster->npoints(), best_gap/units::cm, dest_gid);
+
+                typedef cluster_connectivity_graph_t Graph;
+                Graph g;
+                std::map<int, int> desc;
+                int idx_beam = -1, idx_frag = -1;
+                for (size_t ilive = 0; ilive < live_clusters.size(); ++ilive) {
+                    if (live_clusters[ilive] == best_beam->cluster) idx_beam = (int)ilive;
+                    if (live_clusters[ilive] == best_frag->cluster) idx_frag = (int)ilive;
+                }
+                for (size_t ilive = 0; ilive < live_clusters.size(); ++ilive) {
+                    desc[(int)ilive] = boost::add_vertex((int)ilive, g);
+                }
+                boost::add_edge(desc[idx_beam], desc[idx_frag], g);
+                auto fresh = merge_clusters(g, live_grouping);
+                if (fresh.size() != 1) {
+                    log->warn("fragment adopt round {}: expected 1 merged cluster, got {} -- stopping",
+                              nfrag, fresh.size());
+                    break;
+                }
+                Cluster* merged = fresh.at(0);
+
+                // Beam identity, then corrected coordinates under the beam T0
+                // (replaces the fragment points' sentinel-T0 x_t0cor); mixed-
+                // scope inputs, so pin the default scope first (pass-2 idiom).
+                merged->set_cluster_t0(dest_t0);
+                merged->set_scalar<int>("flash", dest_flash);
+                merged->set_scalar<int>("matched_flash_gid", dest_gid);
+                merged->set_scalar<int>("lm_flag", dest_lm);
+                merged->set_flag(Flags::main_cluster, 1);
+                merged->set_flag(Flags::associated_cluster, 0);
+                merged->set_default_scope(m_scope);
+                if (m_scope.hash() != merged->get_raw_scope().hash()) {
+                    auto correction_name = merged->get_scope_transform(m_scope);
+                    merged->add_corrected_points(m_pcts, correction_name);
+                }
+                // No source-bundle repair: the fragment belonged to no bundle.
+
+                ++nfrag;
+            }
+
+            // Leave every cluster in the analysis scope (pass-2 idiom).
+            for (auto* live : live_grouping.children()) {
+                if (live->get_default_scope().hash() != m_scope.hash()) {
+                    live->set_default_scope(m_scope);
+                }
+            }
+        }
+
+        if (nrounds) {
+            log->info("cathode bundle rescue: {} move(s) applied", nrounds);
+        }
+        if (nadopt) {
+            log->info("unmatched rescue: {} adoption(s) applied", nadopt);
+        }
+        if (nfrag) {
+            log->info("fragment adopt: {} adoption(s) applied", nfrag);
+        }
+    }
+};
+
+
+// Local Variables:
+// mode: c++
+// c-basic-offset: 4
+// End:

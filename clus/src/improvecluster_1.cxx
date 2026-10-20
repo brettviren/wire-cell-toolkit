@@ -31,14 +31,23 @@ namespace WireCell::Clus {
     {
         // Base class configure() handles NeedDV, NeedPCTS, samplers, and anodes.
         RetileCluster::configure(cfg);
+        // doc pdvd/40 round 3.  Both default to the historical filter; a config
+        // that never mentions the keys runs bit-for-bit as before.
+        m_bad_blob_max_run = get(cfg, "bad_blob_max_run", m_bad_blob_max_run);
+        m_bad_blob_report = get(cfg, "bad_blob_report", m_bad_blob_report);
+        // doc pdhd/08.  Both default 0 = OFF; a config that never mentions the
+        // keys runs bit-for-bit as before.
+        m_hack_max_bridge = get(cfg, "hack_max_bridge", m_hack_max_bridge);
+        m_bad_blob_run_merge = get(cfg, "bad_blob_run_merge", m_bad_blob_run_merge);
     }
 
     Configuration ImproveCluster_1::default_configuration() const
     {
         Configuration cfg = RetileCluster::default_configuration();
-        
-      
-        
+        cfg["bad_blob_max_run"] = m_bad_blob_max_run;
+        cfg["bad_blob_report"] = m_bad_blob_report;
+        cfg["hack_max_bridge"] = m_hack_max_bridge;
+        cfg["bad_blob_run_merge"] = m_bad_blob_run_merge;
         return cfg;
     }
 
@@ -176,6 +185,33 @@ namespace WireCell::Clus {
             SPDLOG_LOGGER_TRACE(log, "timing: sample_live loop (apa={},face={}) took {} ms", apa, face, MS(Clock::now()-t0).count());
             SPDLOG_LOGGER_TRACE(log, "{} points sampled for apa {} face {} Blobs {}", npoints, apa, face, niblobs);
 
+            // doc pdvd/27: the blobs being retiled must lie inside the face
+            // volume they are retiled into.  They do not when the point tree
+            // was sampled with a different wires file than this job's anodes:
+            // PDVD v6 -> v7-uvwfit swapped the face idents of anodes 2,3,6,7,
+            // and every retile on those anodes then landed one face height off
+            // (039349/53's "isolated piece" and chords).  Log-only diagnostic;
+            // outputs are unchanged.
+            {
+                double oy0 = 1e9, oy1 = -1e9, oz0 = 1e9, oz1 = -1e9;
+                for (int pi = 0; pi < orig_cluster->npoints(); ++pi) {
+                    const auto w = orig_cluster->wire_plane_id(pi);
+                    if (w.apa() != apa || w.face() != face) continue;
+                    const auto pp = orig_cluster->point3d_raw(pi);
+                    oy0 = std::min(oy0, pp.y()); oy1 = std::max(oy1, pp.y());
+                    oz0 = std::min(oz0, pp.z()); oz1 = std::max(oz1, pp.z());
+                }
+                const auto bb = m_face.at(apa).at(face)->sensitive().bounds();  // copy: sensitive() returns by value
+                const double tol = 1 * units::cm;
+                const double sy0 = std::min(bb.first.y(), bb.second.y()) - tol, sy1 = std::max(bb.first.y(), bb.second.y()) + tol;
+                const double sz0 = std::min(bb.first.z(), bb.second.z()) - tol, sz1 = std::max(bb.first.z(), bb.second.z()) + tol;
+                if (oy0 <= oy1 && (oy0 < sy0 || oy1 > sy1 || oz0 < sz0 || oz1 > sz1)) {
+                    SPDLOG_LOGGER_WARN(log, "ImproveCluster_1: cluster {} apa {} face {}: its points span y=[{:.1f},{:.1f}] z=[{:.1f},{:.1f}] cm but this face's sensitive volume is y=[{:.1f},{:.1f}] z=[{:.1f},{:.1f}] cm -- the point tree and this job's anode geometry disagree (point tree sampled with another wires file?); the retile lands in the wrong face (doc pdvd/27)",
+                                       orig_cluster->ident(), apa, face, oy0/units::cm, oy1/units::cm, oz0/units::cm, oz1/units::cm,
+                                       sy0/units::cm, sy1/units::cm, sz0/units::cm, sz1/units::cm);
+                }
+            }
+
 
             // remove bad blobs ...
             t0 = Clock::now();
@@ -198,12 +234,15 @@ namespace WireCell::Clus {
         if (default_scope.hash()!=raw_scope.hash()){
             t0 = Clock::now();
             auto correction_name = orig_cluster->get_scope_transform(default_scope);
-            // std::vector<int> filter_results = c
+            // add_corrected_points builds x_t0cor from get_cluster_t0(); a
+            // freshly-retiled cluster's T0 defaults to 0 until from() copies it
+            // below, so running the correction first produced an UNCORRECTED
+            // x_t0cor (raw drift-x, off by v_drift*T0).  Set the real T0 first.
+            // See clus/docs/tgm/fc_steiner_sp_bugfix.md (bug 1).
+            new_cluster.set_cluster_t0(orig_cluster->get_cluster_t0());
             new_cluster.add_corrected_points(m_pcts, correction_name);
-            // Set this as the default scope for viewing
-            new_cluster.from(*orig_cluster); // copy state from original cluster
+            new_cluster.from(*orig_cluster); // copy remaining state from original cluster
             SPDLOG_LOGGER_TRACE(log, "timing: add_corrected_points took {} ms", MS(Clock::now()-t0).count());
-            // std::cout << "Test: Same:" << default_scope.hash() << " " << raw_scope.hash() << std::endl; 
         }
 
 
@@ -220,7 +259,7 @@ namespace WireCell::Clus {
 
 
 
-void ImproveCluster_1::get_activity_improved(const Cluster& cluster, std::map<std::pair<int, int>,std::vector<WireCell::RayGrid::measure_t>>& map_slices_measures, int apa, int face) const{
+void ImproveCluster_1::get_activity_improved(const Cluster& cluster, std::map<std::pair<int, int>,std::vector<WireCell::RayGrid::measure_t>>& map_slices_measures, int apa, int face, bool extend) const{
 
     auto uvwt_min = cluster.get_uvwt_min(apa, face);
     auto uvwt_max = cluster.get_uvwt_max(apa, face);
@@ -362,7 +401,8 @@ void ImproveCluster_1::get_activity_improved(const Cluster& cluster, std::map<st
     };
 
     // Step 2: Handle dead channels — one loop over planes replaces three identical blocks.
-    for (int pl = 0; pl < 3; ++pl) {
+    // doc pdvd/113: extend=false (retile_mode "footprint") skips Steps 2 and 3.
+    for (int pl = 0; extend && pl < 3; ++pl) {
         for (const auto& [start, end] : *dead_ch_ranges[pl]) {
             for (int ch = start; ch < end; ++ch) {
                 for (int time_slice = min_time; time_slice < max_time; time_slice += tick_span) {
@@ -376,7 +416,7 @@ void ImproveCluster_1::get_activity_improved(const Cluster& cluster, std::map<st
     }
 
     // Step 3: Handle good channels from CTPC — one loop over planes.
-    for (int pl = 0; pl < 3; ++pl) {
+    for (int pl = 0; extend && pl < 3; ++pl) {
         for (const auto& [time_ch, charge_info] : *tcc_maps[pl]) {
             int time_slice = time_ch.first;
             int ch = time_ch.second;
@@ -418,10 +458,21 @@ void ImproveCluster_1::get_activity_improved(const Cluster& cluster, std::map<st
 
 
 // Step 2. Modify activity to suit.
-void ImproveCluster_1::hack_activity_improved(const Cluster& cluster, std::map<std::pair<int, int>, std::vector<WRG::measure_t> >& map_slices_measures, const std::vector<size_t>& path_wcps, int apa, int face) const
+void ImproveCluster_1::hack_activity_improved(const Cluster& cluster, std::map<std::pair<int, int>, std::vector<WRG::measure_t> >& map_slices_measures, const std::vector<size_t>& path_wcps, int apa, int face, const char* which, bridge_cells_t* bridge_cells) const
 {
 
     const double low_dis_limit = 0.3 * units::cm;
+
+    // doc pdhd/08 stage 1.  Report-only bridge accounting.  A "bridge" is one
+    // gap between consecutive path points that this function fills with
+    // int(dis/0.3)+1 invented points (prototype ImprovePR3DCluster.cxx:973-990,
+    // uncapped there and here).  bridge_of[i] is the bridge that invented path
+    // point i, -1 for a real one.
+    const bool rep = m_bad_blob_report;
+    std::vector<int> bridge_of;
+    std::vector<double> bridge_gap;
+    std::vector<int> bridge_ncount;
+    long n_capped = 0;
     // Get path points
     // auto path_wcps = cluster.get_path_wcps();
     std::vector<std::pair<geo_point_t, WirePlaneId>> path_pts;
@@ -433,18 +484,38 @@ void ImproveCluster_1::hack_activity_improved(const Cluster& cluster, std::map<s
         // std::cerr << "retile: path:" << wcp << " p:" << p << " wpid:" << wpid_p << "\n";
         if (path_pts.empty()) {
             path_pts.push_back(std::make_pair(p, wpid_p));
+            if (rep) bridge_of.push_back(-1);
         } else {
             double dis = (p - path_pts.back().first).magnitude();
             if (dis < low_dis_limit) {
                 path_pts.push_back(std::make_pair(p, wpid_p));
+                if (rep) bridge_of.push_back(-1);
+            } else if (m_hack_max_bridge > 0 && dis > m_hack_max_bridge) {
+                // doc pdhd/08.  Refuse to invent a bridge longer than the cap.
+                // The prototype (ImprovePR3DCluster.cxx:973-990) has no cap and
+                // neither does the knob-off path.  The real endpoint is kept, so
+                // the path is not shortened -- only its invented interior is
+                // dropped.  Note this is NOT a subset of the uncapped path: the
+                // kept point carries wpid_p rather than the interpolated
+                // get_wireplaneid, and path_pts is shorter, which shifts the
+                // i+-1 coverage test below.
+                path_pts.push_back(std::make_pair(p, wpid_p));
+                if (rep) { bridge_of.push_back(-1); ++n_capped; }
             } else {
                 int ncount = int(dis/low_dis_limit) + 1;
                 auto p2 = path_pts.back().first;
                 auto wpid2 = path_pts.back().second;
+                int bid = -1;
+                if (rep) {
+                    bid = int(bridge_gap.size());
+                    bridge_gap.push_back(dis);
+                    bridge_ncount.push_back(ncount);
+                }
                 for (int i=0; i < ncount; i++) {
                     Point p1 = p2 + (p - p2) * (i+1)/ncount;
                     auto wpid_p1 = get_wireplaneid(p1, wpid_p, wpid2, m_dv);
                     path_pts.push_back(std::make_pair(p1, wpid_p1));
+                    if (rep) bridge_of.push_back(bid);
                 }
             }
         }
@@ -509,9 +580,16 @@ void ImproveCluster_1::hack_activity_improved(const Cluster& cluster, std::map<s
         // std::cout << wire_hits[0] << " " << wire_hits[1] << " " << wire_hits[2] << " " << path_pts_flag[i] << std::endl;    
     }
 
+    // doc pdhd/08 stage 1: per-bridge cell accounting.
+    const size_t nbridge = bridge_gap.size();
+    std::vector<long> b_new(nbridge, 0), b_sreal(nbridge, 0), b_sdead(nbridge, 0), b_sprior(nbridge, 0);
+    long n_onface = 0;
+
     // Add missing activity based on path points
     for (size_t i = 0; i < path_pts.size(); i++) {
         if (path_pts[i].second.apa() != apa || path_pts[i].second.face() != face) continue;
+        const int bid = rep ? bridge_of[i] : -1;
+        if (rep) ++n_onface;
 
         // Skip if point is well-covered by existing activity
         if (i == 0) {
@@ -555,8 +633,26 @@ void ImproveCluster_1::hack_activity_improved(const Cluster& cluster, std::map<s
                     if (wire < wire_limits[plane].first || wire > wire_limits[plane].second ||
                          pow(dw,2) + pow(dt,2)>3*3) 
                         continue;
-                    if (measures.at(wire) > 0.0) continue; // Already has activity
+                    if (measures.at(wire) > 0.0) {
+                        // doc pdhd/08 stage 1: classify the skip.  A cell already
+                        // painted BY A BRIDGE is the same fabrication counted twice
+                        // (the second hack_activity_improved call retraces the
+                        // first's ghost); a dead sentinel (:441) or real charge
+                        // means the bridge was riding on activity that already
+                        // existed, i.e. it was harmless here.
+                        if (rep && bid >= 0) {
+                            if (bridge_cells && bridge_cells->count(std::make_tuple(time_slice, int(plane), wire)))
+                                ++b_sprior[bid];
+                            else if (measures.at(wire) == 1.0e-3) ++b_sdead[bid];
+                            else ++b_sreal[bid];
+                        }
+                        continue; // Already has activity
+                    }
                     measures.at(wire) = 1.0e-3;  // Set activity
+                    if (rep) {
+                        if (bid >= 0) ++b_new[bid];
+                        if (bridge_cells) bridge_cells->insert(std::make_tuple(time_slice, int(plane), wire));
+                    }
                 }
             }
 
@@ -587,7 +683,40 @@ void ImproveCluster_1::hack_activity_improved(const Cluster& cluster, std::map<s
             ++it;
         }
     }
-   
+
+    // doc pdhd/08 stage 1.  One report line per call.  new_cells is what this
+    // call's bridges actually invented; skip_prior is what an earlier bridge had
+    // already invented at the same cell (the same ghost, painted twice);
+    // skip_dead / skip_real are cells the bridge found already covered by an
+    // admitted dead channel or by charge, where the bridge did nothing.
+    // new_frac = (new + sprior) / (all cells the segment touched) is the number
+    // that says whether a LENGTH cap on the gap is the right knob.
+    if (rep) {
+        long tot_new = 0, tot_sreal = 0, tot_sdead = 0, tot_sprior = 0;
+        for (size_t b = 0; b < nbridge; ++b) {
+            tot_new += b_new[b]; tot_sreal += b_sreal[b];
+            tot_sdead += b_sdead[b]; tot_sprior += b_sprior[b];
+        }
+        std::vector<size_t> order(nbridge);
+        for (size_t b = 0; b < nbridge; ++b) order[b] = b;
+        std::stable_sort(order.begin(), order.end(),
+                         [&](size_t a, size_t b) { return bridge_gap[a] > bridge_gap[b]; });
+        std::string line = fmt::format(
+            "BRIDGE cid={} ident={} apa={} face={} which={} npath={} npath_face={} nbridge={} capped={} new_cells={} skip_real={} skip_dead={} skip_prior={}",
+            cluster.get_cluster_id(), cluster.ident(), apa, face, which,
+            path_pts.size(), n_onface, nbridge, n_capped, tot_new, tot_sreal, tot_sdead, tot_sprior);
+        int shown = 0;
+        for (size_t b : order) {
+            if (shown >= 12) break;
+            const long touched = b_new[b] + b_sreal[b] + b_sdead[b] + b_sprior[b];
+            line += fmt::format(" | seg {}: gap_cm={:.2f} ncount={} new={} sprior={} sreal={} sdead={} new_frac={:.3f}",
+                                shown, bridge_gap[b] / units::cm, bridge_ncount[b],
+                                b_new[b], b_sprior[b], b_sreal[b], b_sdead[b],
+                                touched > 0 ? double(b_new[b] + b_sprior[b]) / double(touched) : 0.0);
+            ++shown;
+        }
+        SPDLOG_LOGGER_DEBUG(log, "{}", line);
+    }
 
 }
 
@@ -595,9 +724,34 @@ void ImproveCluster_1::hack_activity_improved(const Cluster& cluster, std::map<s
 std::vector<const WireCell::Clus::Facade::Blob*>
 ImproveCluster_1::remove_bad_blobs(const Cluster& cluster, Cluster& shad_cluster, int tick_span, int apa, int face) const
 {
-    // Get time-organized maps of original and new blobs
-    const auto& orig_time_blob_map = cluster.time_blob_map().at(apa).at(face);
-    const auto& new_time_blob_map = shad_cluster.time_blob_map().at(apa).at(face);
+    // Get time-organized maps of original and new blobs.  A multi-APA
+    // (cathode-crossing) cluster can retile to a shadow with blobs on only
+    // one APA -- a missing (apa,face) entry on either side means there is
+    // nothing to filter for this pair.
+    static const std::map<int, BlobSet> empty_tbm;
+    // doc pdvd/40 round 3.  The shadow cluster's ClusterCache (time_blob_map,
+    // npoints, ...) is filled on first use and is NOT invalidated when blob
+    // children are inserted or removed (Mixins::Cached has no child-change
+    // hook; Cluster::on_insert/on_remove clear only the sv3d memo).  The
+    // caller inserts one (apa, face)'s blobs, calls this, removes some, then
+    // inserts the next face's blobs and calls again -- so from the second
+    // face on, the cached map has no entry for the face being filtered and
+    // the filter silently returns nothing (PDVD 039252/2: 80 of 493 retiled
+    // clusters span >1 face; cluster 119's 122 cm column sits on its second
+    // face and was never examined).  With the run bound ON the cache is
+    // refreshed here; OFF keeps the historical behaviour byte-for-byte.
+    if (m_bad_blob_max_run > 0) {
+        shad_cluster.invalidate_cache();
+    }
+    auto tbm_at = [](const auto& tbm, int apa, int face) -> const auto& {
+        auto ait = tbm.find(apa);
+        if (ait == tbm.end()) return empty_tbm;
+        auto fit = ait->second.find(face);
+        if (fit == ait->second.end()) return empty_tbm;
+        return fit->second;
+    };
+    const auto& orig_time_blob_map = tbm_at(cluster.time_blob_map(), apa, face);
+    const auto& new_time_blob_map = tbm_at(shad_cluster.time_blob_map(), apa, face);
 
     // Build index mappings for new blobs.  Sort by (time_slice, blob->ident())
     // so vertex IDs are deterministic across runs regardless of heap layout.
@@ -627,7 +781,25 @@ ImproveCluster_1::remove_bad_blobs(const Cluster& cluster, Cluster& shad_cluster
     
     // If no new blobs or only one blob, nothing to filter.
     if (all_new_blobs.size() <= 1) {
+        if (m_bad_blob_report) {
+            // census: how often the stale cache (see above) hides a face
+            size_t nchildren_face = 0;
+            for (const Blob* b : shad_cluster.children())
+                if (b->wpid().apa() == apa && b->wpid().face() == face) ++nchildren_face;
+            SPDLOG_LOGGER_DEBUG(log, "BADBLOBSKIP ident={} apa={} face={} cached_nnew={} children_on_face={}",
+                                cluster.ident(), apa, face, all_new_blobs.size(), nchildren_face);
+        }
         return {};
+    }
+
+    // doc pdvd/40 round 3: the historical filter is kept textually intact
+    // below; the knob-ON path and the log-only census live in
+    // remove_bad_blobs_runs().  Either knob routes through it (the census must
+    // see the legacy vote next to the run structure), and with bad_blob_max_run
+    // <= 0 it returns exactly the legacy vote -- asserted in
+    // doctest_bad_blob_runs.cxx.
+    if (m_bad_blob_max_run > 0 || m_bad_blob_report) {
+        return remove_bad_blobs_runs(cluster, all_new_blobs, orig_time_blob_map, new_time_blob_map, tick_span, apa, face);
     }
     
     // Create graph for new blobs - establish connectivity between adjacent time slices
@@ -737,6 +909,163 @@ ImproveCluster_1::remove_bad_blobs(const Cluster& cluster, Cluster& shad_cluster
     return blobs_to_remove;
 }
 
+
+// doc pdvd/40 round 3.  Knob-ON path and census for remove_bad_blobs.  See
+// BadBlobRuns.h for the decision semantics; this function only builds the
+// inputs (adjacency, per-blob support, centers) from the two blob maps.
+std::vector<const WireCell::Clus::Facade::Blob*>
+ImproveCluster_1::remove_bad_blobs_runs(const Cluster& cluster,
+                                        const std::vector<const Blob*>& all_new_blobs,
+                                        const std::map<int, BlobSet>& orig_time_blob_map,
+                                        const std::map<int, BlobSet>& new_time_blob_map,
+                                        int tick_span, int apa, int face) const
+{
+    const int N = all_new_blobs.size();
+    std::map<const Blob*, int> map_blob_index;
+    for (int i = 0; i < N; ++i) map_blob_index[all_new_blobs[i]] = i;
+
+    // Per-blob support: the historical +-1 slice overlap test, applied to EVERY blob.
+    auto supported_by_orig = [&](const Blob* blob) {
+        const int ts = blob->slice_index_min();
+        for (int dts : {-tick_span, 0, tick_span}) {
+            auto it = orig_time_blob_map.find(ts + dts);
+            if (it == orig_time_blob_map.end()) continue;
+            for (const Blob* ob : it->second)
+                if (blob->overlap_fast(*ob, 1)) return true;
+        }
+        return false;
+    };
+    std::vector<bool> supported(N, false);
+    std::vector<Point> centers(N);
+    std::vector<int> slice(N, 0);
+    int nsup = 0;
+    for (int i = 0; i < N; ++i) {
+        supported[i] = supported_by_orig(all_new_blobs[i]);
+        nsup += supported[i] ? 1 : 0;
+        centers[i] = all_new_blobs[i]->center_pos();
+        slice[i] = all_new_blobs[i]->slice_index_min();
+    }
+
+    // Adjacency.  Legacy = adjacent-slice overlap; the round-3 graph adds
+    // same-slice overlap (a column at fixed drift time is many blobs in ONE
+    // slice, with no adjacent-slice edge between them).  Blob sets iterate in
+    // pointer order, so edges are collected as index pairs and sorted.
+    std::vector<std::pair<int, int>> edges_legacy, edges_ss;
+    for (const auto& [time_slice, current_blobs] : new_time_blob_map) {
+        auto next_it = new_time_blob_map.find(time_slice + tick_span);
+        if (next_it != new_time_blob_map.end()) {
+            for (const Blob* b1 : current_blobs)
+                for (const Blob* b2 : next_it->second)
+                    if (b1->overlap_fast(*b2, 1))
+                        edges_legacy.emplace_back(map_blob_index[b1], map_blob_index[b2]);
+        }
+        for (const Blob* b1 : current_blobs)
+            for (const Blob* b2 : current_blobs) {
+                const int i1 = map_blob_index[b1], i2 = map_blob_index[b2];
+                if (i1 < i2 && b1->overlap_fast(*b2, 1)) edges_ss.emplace_back(i1, i2);
+            }
+    }
+    std::sort(edges_legacy.begin(), edges_legacy.end());
+    std::sort(edges_ss.begin(), edges_ss.end());
+    std::vector<std::pair<int, int>> edges_all(edges_legacy);
+    edges_all.insert(edges_all.end(), edges_ss.begin(), edges_ss.end());
+    std::sort(edges_all.begin(), edges_all.end());
+
+    const auto legacy_rm = BadBlobRuns::legacy_component_vote(N, edges_legacy, supported);
+    const auto res = BadBlobRuns::analyze(N, edges_all, supported, centers, m_bad_blob_max_run, slice,
+                                          m_bad_blob_run_merge);
+
+    if (m_bad_blob_report) {
+        // cid = the Bee / calib-dump cluster id (get_cluster_id), the key the
+        // offline census joins on; ident = the node ident used in other log
+        // lines.  Run centers are in the RAW drift frame (blob center_pos), not
+        // x_t0cor: match to the 3D census on (y, z) within a cluster.
+        size_t norig = 0;
+        for (const auto& kv : orig_time_blob_map) norig += kv.second.size();
+        std::vector<int> comp_legacy;
+        const int ncomp_legacy = BadBlobRuns::label_components(N, edges_legacy, comp_legacy);
+        std::string line = fmt::format(
+            "BADBLOB cid={} ident={} apa={} face={} nnew={} norig={} ncomp={} ncomp_ss={} nsup={} legacy_rm={} run_rm={} nruns={} maxrun_cm={:.1f} merge_rm={}",
+            cluster.get_cluster_id(), cluster.ident(), apa, face, N, norig,
+            ncomp_legacy, res.ncomp, nsup, legacy_rm.size(), res.removed_by_run.size(),
+            res.runs.size(), res.runs.empty() ? 0.0 : res.runs.front().span / units::cm,
+            res.removed_by_merge.size());
+        int shown = 0;
+        for (const auto& run : res.runs) {
+            if (shown >= 12) break;
+            if (run.span < 3 * units::cm && shown > 0) break;   // longest first; stop at the short tail
+            // bb = the run's raw-frame bounding box of blob centers (x0,x1,y0,y1,z0,z1)
+            Point lo = centers[run.blobs.front()], hi = lo;
+            for (int i : run.blobs) {
+                const auto& c = centers[i];
+                lo = Point(std::min(lo.x(), c.x()), std::min(lo.y(), c.y()), std::min(lo.z(), c.z()));
+                hi = Point(std::max(hi.x(), c.x()), std::max(hi.y(), c.y()), std::max(hi.z(), c.z()));
+            }
+            // comp= appended (not inserted) so the doc pdhd/07 parser's RE_RUN
+            // still matches this line unchanged.
+            line += fmt::format(" | run {}: nb={} nslices={} span_cm={:.1f} craw=({:.1f},{:.1f},{:.1f}) bb=({:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f}) comp={}",
+                                shown, run.blobs.size(), run.nslices, run.span / units::cm,
+                                run.center.x() / units::cm, run.center.y() / units::cm, run.center.z() / units::cm,
+                                lo.x() / units::cm, hi.x() / units::cm, lo.y() / units::cm, hi.y() / units::cm,
+                                lo.z() / units::cm, hi.z() / units::cm, run.component);
+            ++shown;
+        }
+        SPDLOG_LOGGER_DEBUG(log, "{}", line);
+
+        // doc pdhd/08 stage 1: the SAME runs again, one machine line each and
+        // UNTRUNCATED, carrying the component id.  The human line above stops at
+        // 12 entries / 3 cm, which is why doc 07 could not tell whether a
+        // fabrication broken into several runs was broken WITHIN one component
+        // (so a per-component bound would rejoin it) or ACROSS components (so it
+        // would not).  Run::component is already computed (BadBlobRuns.h:50).
+        for (size_t k = 0; k < res.runs.size(); ++k) {
+            const auto& run = res.runs[k];
+            if (run.blobs.empty()) continue;
+            Point lo = centers[run.blobs.front()], hi = lo;
+            for (int i : run.blobs) {
+                const auto& c = centers[i];
+                lo = Point(std::min(lo.x(), c.x()), std::min(lo.y(), c.y()), std::min(lo.z(), c.z()));
+                hi = Point(std::max(hi.x(), c.x()), std::max(hi.y(), c.y()), std::max(hi.z(), c.z()));
+            }
+            SPDLOG_LOGGER_DEBUG(log,
+                "BADBLOBRUN cid={} ident={} apa={} face={} k={} comp={} nb={} nslices={} span_cm={:.2f} bb=({:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f})",
+                cluster.get_cluster_id(), cluster.ident(), apa, face, k, run.component,
+                run.blobs.size(), run.nslices, run.span / units::cm,
+                lo.x() / units::cm, hi.x() / units::cm, lo.y() / units::cm, hi.y() / units::cm,
+                lo.z() / units::cm, hi.z() / units::cm);
+        }
+        // Per-blob detail at TRACE (PDVD_LOG_LEVEL=trace): the offline census
+        // labels every Steiner point by the retiled blob it came from.
+        // run = index into the longest-first run list, -1 = supported or voted out.
+        if (log->should_log(spdlog::level::trace)) {
+            std::vector<int> run_of(N, -1);
+            for (size_t k = 0; k < res.runs.size(); ++k)
+                for (int i : res.runs[k].blobs) run_of[i] = int(k);
+            std::vector<char> voted(N, 0);
+            for (int i : res.removed_by_vote) voted[i] = 1;
+            for (int i = 0; i < N; ++i) {
+                SPDLOG_LOGGER_TRACE(log, "BADBLOBPT ident={} apa={} face={} i={} slice={} sup={} comp={} voted={} run={} craw=({:.2f},{:.2f},{:.2f})",
+                                    cluster.ident(), apa, face, i, slice[i], supported[i] ? 1 : 0, res.component[i],
+                                    int(voted[i]), run_of[i],
+                                    centers[i].x() / units::cm, centers[i].y() / units::cm, centers[i].z() / units::cm);
+            }
+        }
+    }
+
+    std::vector<const Blob*> blobs_to_remove;
+    if (m_bad_blob_max_run > 0) {
+        std::vector<int> rm(res.removed_by_vote);
+        rm.insert(rm.end(), res.removed_by_run.begin(), res.removed_by_run.end());
+        std::sort(rm.begin(), rm.end());
+        rm.erase(std::unique(rm.begin(), rm.end()), rm.end());
+        for (int i : rm) blobs_to_remove.push_back(all_new_blobs[i]);
+    } else {
+        // report-only: the legacy vote, unchanged
+        for (int i : legacy_rm) blobs_to_remove.push_back(all_new_blobs[i]);
+    }
+    return blobs_to_remove;
+}
+
 std::vector<IBlob::pointer> ImproveCluster_1::make_iblobs_improved(std::map<std::pair<int, int>, std::vector<WRG::measure_t> >& map_slices_measures, int apa, int face) const
 {
     std::vector<IBlob::pointer> ret;
@@ -790,22 +1119,69 @@ std::vector<IBlob::pointer> ImproveCluster_1::make_iblobs_improved(std::map<std:
             
             auto wire_plane = planes[plane_idx];
             const auto& channels = wire_plane->channels();
-            
+            const auto& pwires = wire_plane->wires();
+
+            // doc pdvd/31 round 5.  `plane_measures` is indexed by WIRE index
+            // (it is sized total_wires and filled that way by
+            // get_activity_improved from the wind-keyed ctpc clouds), but
+            // `channels` is Gen::AnodePlane's channel LIST, built by walking the
+            // plane's wires and SKIPPING every segment>0 wire
+            // (AnodePlane.cxx:242-256).  So
+            //     channels[i]->ident() == wires[i]->channel()
+            // holds only until the first continuation is skipped, and
+            // channels.size() == wires.size() - n_seg_gt0.  On the 16 PDVD
+            // planes carrying continuations the legacy lookup below therefore
+            // writes each slice's activity under the WRONG channel -- shifted by
+            // the whole 98-wire band on the 8 planes whose band starts at wire
+            // index 0 -- and drops the top band outright.  Measured consequence
+            // (doc 31 section 8.2): along the starved stretch of PDVD 039349/14
+            // the retiled cluster holds U != 0 on 0.000 and V != 0 on 0.004 of
+            // its points, so 99.8% carry fewer than the two non-zero planes
+            // Cluster::calc_charge_wcp requires and can never be Steiner
+            // terminal candidates at any threshold.
+            //
+            // The fix resolves the channel by IDENT through the anode, which
+            // knows every channel of both its faces.  The "round5" doctest pins
+            // its precondition: every continuation's channel has a segment-0
+            // wire somewhere in the SAME anode, on all four production
+            // geometries, so channel() never returns nullptr for one.
+            //
+            // SBND and uBooNE have no segment>0 wire at all, so both branches
+            // agree there by construction, not merely by gate.
+            IAnodePlane::pointer ianode = nullptr;
+            if (m_wrapped_channel_activity) {
+                auto ait = m_anode.find(apa);
+                if (ait != m_anode.end()) ianode = ait->second;
+            }
+
             // Map wire indices to channels and populate activity
             for (size_t wire_idx = 0; wire_idx < plane_measures.size(); ++wire_idx) {
-                if (plane_measures[wire_idx] > 0.0) {
-                    // Find the channel corresponding to this wire index
-                    if (wire_idx < channels.size()) {
-                        auto ichan = channels[wire_idx];
-                        if (ichan) {
-                            // Set activity with value and zero uncertainty
-                            if (plane_measures[wire_idx]==1e-3){
-                                slice_activity[ichan] = ISlice::value_t(0.0, 1e12);
-                            } else {
-                                slice_activity[ichan] = ISlice::value_t(plane_measures[wire_idx], 0.0);
-                            }
-                        }
+                if (plane_measures[wire_idx] <= 0.0) continue;
+
+                IChannel::pointer ichan = nullptr;
+                if (ianode) {
+                    // Two wires of one plane may share a channel (PDHD has 5568
+                    // such strips; PDVD none -- there every continuation's
+                    // partner is in the sibling face).  The second write is
+                    // benign: PointTreeBuilding::add_ctpc walks the activity
+                    // forward and writes the SAME channel charge into both
+                    // wires' ctpc rows, so the two measures agree.
+                    if (wire_idx < pwires.size()) {
+                        ichan = ianode->channel(pwires[wire_idx]->channel());
                     }
+                }
+                else if (wire_idx < channels.size()) {
+                    // Legacy, reproduced exactly: positional index into the
+                    // channel list, and wires past its end contribute nothing.
+                    ichan = channels[wire_idx];
+                }
+                if (!ichan) continue;
+
+                // Set activity with value and zero uncertainty
+                if (plane_measures[wire_idx]==1e-3){
+                    slice_activity[ichan] = ISlice::value_t(0.0, 1e12);
+                } else {
+                    slice_activity[ichan] = ISlice::value_t(plane_measures[wire_idx], 0.0);
                 }
             }
         }

@@ -34,6 +34,13 @@ namespace WireCell::Clus {
     
     bool FiducialUtils::inside_dead_region(const Point& p_raw, const int apa, const int face, const int minimal_views) const
     {
+        // A sentinel apa/face (contained_by() miss, or PR::Fit::paf left at
+        // its {-1,-1} default) would make convert_3Dpoint_time_ch abort via
+        // Grouping::fastgeom's m_anodes.at(-1) (the class-C crash shape,
+        // doc pr/11 sec 6.3).  A point without a detector volume has no dead
+        // region to be inside of.
+        if (apa < 0 || face < 0) return false;
+
          // Convert 3D point to time and wire indices
         const auto [tind_u, wind_u] = m_internal.live->convert_3Dpoint_time_ch(p_raw, apa, face,  0);
         const auto [tind_v, wind_v] = m_internal.live->convert_3Dpoint_time_ch(p_raw, apa, face,  1);
@@ -185,10 +192,18 @@ namespace WireCell::Clus {
                     double cluster_t0 = main_cluster.get_cluster_t0();
                     auto temp_p_raw = transform->backward(temp_p, cluster_t0, test_wpid.face(), test_wpid.apa());
 
-                    auto result_u = m_internal.live->get_closest_points(temp_p_raw,1.2*units::cm,test_wpid.apa(), test_wpid.face(), 0);
-                    auto result_v = m_internal.live->get_closest_points(temp_p_raw,1.2*units::cm,test_wpid.apa(), test_wpid.face(), 1);
+                    // Require the W (collection) plane to confirm charge.  The
+                    // induction planes (U, V) can register 2D activity by
+                    // projection ambiguity where there is no real 3D charge
+                    // (SBND evt284657 cluster 28: over 127 outward steps W=0 but
+                    // V=127, an induction-only shadow that falsely marked the
+                    // path "occupied" and vetoed a genuinely-contained track).
+                    // The collection plane essentially always carries signal
+                    // where real charge exists, so it is the reliable arbiter; a
+                    // U/V-only hit is not evidence the track continues.  Dead
+                    // regions are still counted (a real track could hide there).
                     auto result_w = m_internal.live->get_closest_points(temp_p_raw,1.2*units::cm,test_wpid.apa(), test_wpid.face(), 2);
-                    if (result_u.size() > 0 || result_v.size() > 0 || result_w.size() > 0 || inside_dead_region(temp_p_raw, test_wpid.apa(), test_wpid.face())) {
+                    if (result_w.size() > 0 || inside_dead_region(temp_p_raw, test_wpid.apa(), test_wpid.face())) {
                         num_points_dead ++;
                     }
                 }

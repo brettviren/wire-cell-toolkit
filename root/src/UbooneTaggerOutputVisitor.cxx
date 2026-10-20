@@ -1,18 +1,64 @@
 #include "WireCellRoot/UbooneTaggerOutputVisitor.h"
 
 #include "TFile.h"
+#include "WireCellUtil/Persist.h"
 #include "TTree.h"
 
 #include "WireCellUtil/NamedFactory.h"
+#include "WireCellUtil/String.h"
 #include "WireCellClus/TrackFitting.h"
 #include "WireCellClus/Facade_Grouping.h"
 #include "WireCellClus/NeutrinoTaggerInfo.h"
+#include "WireCellClus/PRGraph.h"    // sbnd_xin/docs/128-129: T_segment walk
+#include "WireCellClus/PRVertex.h"
+#include "WireCellClus/PRSegment.h"
+#include "WireCellClus/PRShower.h"
+#include "WireCellUtil/Units.h"
+
+#include <algorithm>
+#include <map>
 
 WIRECELL_FACTORY(UbooneTaggerOutputVisitor, WireCell::Root::UbooneTaggerOutputVisitor,
                  WireCell::IConfigurable, WireCell::Clus::IEnsembleVisitor)
 
 using namespace WireCell;
 using namespace WireCell::Clus;
+
+
+namespace {
+    /// One file per event when the configured name carries a printf
+    /// conversion.  A process that streams many events would otherwise have
+    /// every event RECREATE (or UPDATE) the same path, leaving only the last.
+    /// No '%' in the name => the name is returned unchanged, so a
+    /// one-event-per-process job writes exactly the file it always wrote.
+    /// Same idiom as QLMatching's calib dump.
+    std::string event_filename(const std::string& tmpl, int ident)
+    {
+        if (tmpl.find('%') == std::string::npos) return tmpl;
+        return WireCell::String::format(tmpl, ident);
+    }
+
+    /// sbnd_xin/docs/128-129: the particle-flow display id of a segment,
+    /// cluster_id*1000 + (id() if set, else graph_index) -- the Bee PF node
+    /// id, the calib dump's segments[].id and T_rec_charge.real_cluster_id.
+    /// A copy of PrDisplayDump.cxx pf_node_id (duplicated, not shared).
+    int seg_display_id(const Clus::PR::SegmentPtr& seg)
+    {
+        if (!seg) return -1;
+        int sid = seg->id();
+        if (sid < 0) sid = static_cast<int>(seg->get_graph_index());
+        const auto* cl = seg->cluster();
+        return cl ? cl->get_cluster_id() * 1000 + sid : sid;
+    }
+
+    /// Same encoding for a vertex (PrDisplayDump.cxx vertex_display_id).
+    int vtx_display_id(const Clus::PR::VertexPtr& vtx)
+    {
+        if (!vtx) return -1;
+        const auto* cl = vtx->cluster();
+        return (cl ? cl->get_cluster_id() : 0) * 1000 + static_cast<int>(vtx->get_graph_index());
+    }
+}
 
 Root::UbooneTaggerOutputVisitor::UbooneTaggerOutputVisitor()
   : log(Log::logger("tagger_output"))
@@ -25,6 +71,16 @@ void Root::UbooneTaggerOutputVisitor::configure(const WireCell::Configuration& c
 {
     m_output_filename = get<std::string>(cfg, "output_filename", "tracking_proj.root");
     m_grouping_name = get<std::string>(cfg, "grouping", "live");
+    // doc pr/36 §10.8 (F7): see the member comment in the header.
+    m_neutrino_type_bitmask = get<bool>(cfg, "neutrino_type_bitmask", m_neutrino_type_bitmask);
+    // doc pr/94 Phase 1: see the member comment in the header.
+    m_nu_per_bundle = get<bool>(cfg, "nu_per_bundle", m_nu_per_bundle);
+    // doc 80 round 3: see the member comment in the header.
+    m_mcs_output = get<bool>(cfg, "mcs_output", m_mcs_output);
+    // sbnd_xin/docs/109: see the member comment in the header.
+    m_nu_provenance = get<bool>(cfg, "nu_provenance", m_nu_provenance);
+    // sbnd_xin/docs/128-129: see the member comment in the header.
+    m_nu_particle_links = get<bool>(cfg, "nu_particle_links", m_nu_particle_links);
 }
 
 WireCell::Configuration Root::UbooneTaggerOutputVisitor::default_configuration() const
@@ -32,6 +88,11 @@ WireCell::Configuration Root::UbooneTaggerOutputVisitor::default_configuration()
     Configuration cfg;
     cfg["output_filename"] = "tracking_proj.root";
     cfg["grouping"] = "live";
+    cfg["neutrino_type_bitmask"] = m_neutrino_type_bitmask;  // false = branch not booked, schema-identical
+    cfg["nu_per_bundle"] = m_nu_per_bundle;  // false = branches not booked, schema-identical
+    cfg["mcs_output"] = m_mcs_output;  // false = kine_mcs_* branches not booked, schema-identical
+    cfg["nu_provenance"] = m_nu_provenance;  // sbnd_xin/docs/109; false = provenance branches not booked, schema-identical
+    cfg["nu_particle_links"] = m_nu_particle_links;  // sbnd_xin/docs/128-129; false = no T_segment, no new branches
     return cfg;
 }
 
@@ -54,10 +115,28 @@ void Root::UbooneTaggerOutputVisitor::visit(Clus::Facade::Ensemble& ensemble) co
     PR::TaggerInfo ti = tf->get_tagger_info();
     PR::KineInfo ki = tf->get_kine_info();
 
-    // Open existing ROOT file in UPDATE mode to add trees.
-    TFile* output_tf = TFile::Open(m_output_filename.c_str(), "UPDATE");
+    // doc pr/94 Phase 2: the per-bundle candidates TaggerCheckNeutrino
+    // published as "nu<i>" named slots.  Empty in legacy mode (the chain
+    // publishes none), and then everything below fills exactly one row from
+    // the unnamed slot, byte-identical.  Walking the slots rather than reading
+    // a count keeps this component free of a second knob.
+    std::vector<std::shared_ptr<Clus::TrackFitting>> nu_fitters;
+    for (int i = 0;; ++i) {
+        auto tfi = grouping.get_track_fitting("nu" + std::to_string(i));
+        if (!tfi) break;
+        nu_fitters.push_back(tfi);
+    }
+
+    // Open existing ROOT file in UPDATE mode to add trees.  Same template as
+    // the tracking visitor that RECREATE'd it earlier in the pipeline, so both
+    // land on this event's file.
+    const std::string outname = event_filename(m_output_filename, ensemble.ident());
+    // The per-event name may point into a directory (evt_subdir "pr_evt%1%/"); create it
+    // here rather than require the runner to (PR 535 review).
+    Persist::assuredir(outname);
+    TFile* output_tf = TFile::Open(outname.c_str(), "UPDATE");
     if (!output_tf || output_tf->IsZombie()) {
-        log->error("UbooneTaggerOutputVisitor: cannot open {} for update", m_output_filename);
+        log->error("UbooneTaggerOutputVisitor: cannot open {} for update", outname);
         return;
     }
 
@@ -71,6 +150,172 @@ void Root::UbooneTaggerOutputVisitor::visit(Clus::Facade::Ensemble& ensemble) co
     t_tagger->Branch("nu_x", &ki.kine_nu_x_corr, "nu_x/F");
     t_tagger->Branch("nu_y", &ki.kine_nu_y_corr, "nu_y/F");
     t_tagger->Branch("nu_z", &ki.kine_nu_z_corr, "nu_z/F");
+
+    // doc pr/36 §10.8 (F7 = P4): the prototype's per-tagger verdict bitmask,
+    // an /I branch (wire-cell-prod-nue-port.cxx:1485-1486).  Booked only when
+    // the knob is on so the knob-off T_tagger schema is byte-identical.
+    if (m_neutrino_type_bitmask)
+        t_tagger->Branch("neutrino_type", &ti.neutrino_type, "neutrino_type/I");
+
+    // doc pr/94 Phase 1: per-bundle identity + per-activity cosmic-flag
+    // branches.  Booked only when the knob is on so the knob-off T_tagger
+    // schema is byte-identical.  Nothing populates ti.cluster_id / act_* yet
+    // (see NeutrinoTaggerInfo.h) -- every row reads its struct default
+    // (-1 / empty) until a later phase's TaggerCheckNeutrino change fills
+    // them per bundle.
+    if (m_nu_per_bundle) {
+        t_tagger->Branch("cluster_id", &ti.cluster_id, "cluster_id/I");
+        t_tagger->Branch("matched_flash_gid", &ti.matched_flash_gid, "matched_flash_gid/I");
+        t_tagger->Branch("nu_index", &ti.nu_index, "nu_index/I");
+        t_tagger->Branch("act_cluster_id", &ti.act_cluster_id);
+        t_tagger->Branch("act_length_cm", &ti.act_length_cm);
+        t_tagger->Branch("act_is_selected", &ti.act_is_selected);
+        t_tagger->Branch("act_is_demoted", &ti.act_is_demoted);
+        t_tagger->Branch("act_tgm", &ti.act_tgm);
+        t_tagger->Branch("act_stm", &ti.act_stm);
+        t_tagger->Branch("act_fc", &ti.act_fc);
+        t_tagger->Branch("act_lm", &ti.act_lm);
+        t_tagger->Branch("act_evaluated", &ti.act_evaluated);
+    }
+
+    // sbnd_xin/docs/109: what the selection did, and which event this row is.
+    // The RSE is the triplet MultiAlgBlobClustering publishes on the ensemble
+    // (resolved metadata > ident > config), the same numbers Trun carries.
+    // Booked only under nu_provenance, so the knob-off schema is
+    // byte-identical.
+    int rse_run = ensemble.get_scalar<int>("runNo", -1);
+    int rse_subrun = ensemble.get_scalar<int>("subRunNo", -1);
+    int rse_event = ensemble.get_scalar<int>("eventNo", -1);
+    if (m_nu_provenance) {
+        t_tagger->Branch("run", &rse_run, "run/I");
+        t_tagger->Branch("subrun", &rse_subrun, "subrun/I");
+        t_tagger->Branch("event", &rse_event, "event/I");
+        t_tagger->Branch("sel_cluster_id", &ti.sel_cluster_id, "sel_cluster_id/I");
+        t_tagger->Branch("vertex_moved_cluster", &ti.vertex_moved_cluster, "vertex_moved_cluster/I");
+        t_tagger->Branch("has_vertex", &ti.has_vertex, "has_vertex/I");
+        t_tagger->Branch("flash_time_us", &ti.flash_time_us, "flash_time_us/F");
+        t_tagger->Branch("flash_pe", &ti.flash_pe, "flash_pe/F");
+        t_tagger->Branch("flash_tpc", &ti.flash_tpc, "flash_tpc/I");
+        t_tagger->Branch("flash_group", &ti.flash_group, "flash_group/I");
+        t_tagger->Branch("act_role", &ti.act_role);
+        t_tagger->Branch("act_in_pr", &ti.act_in_pr);
+        t_tagger->Branch("act_is_final", &ti.act_is_final);
+        // sbnd_xin/docs/133: the containment verdict the two top BDTs read
+        // (numu input 70, nue input 0), filled per candidate by
+        // TaggerCheckNeutrino on the candidate's main cluster.  Prototype
+        // tagger.h:2164 books it in T_tagger.  Not act_fc / T_cluster.fc
+        // (those are the TaggerCheckFC flag).
+        t_tagger->Branch("match_isFC", &ti.match_isFC, "match_isFC/F");
+    }
+
+    // sbnd_xin/docs/128-129 (P2 + P4): T_segment, one row per PR-graph
+    // segment per candidate, and three per-cluster counts on the T_tagger
+    // roster.  The segment -> T_kine row links come from fill_kine_tree
+    // (KineInfo link_seg_*); the rest is read off the candidate's graph the
+    // way PrDisplayDump::dump_graph does, so segment_id / shower_id /
+    // *_vertex_id equal the calib dump's and the Bee PF node ids.  Every
+    // segment is kept, fitted or not, so the kine_energy_excluded census can
+    // be recomputed from this tree alone.  Nothing is booked when the knob is
+    // off, so the knob-off file is byte-identical.
+    TTree* t_segment = nullptr;
+    int sg_nu_index = -1, sg_segment_id = -1, sg_cluster_id = -1, sg_shower_id = -1;
+    int sg_in_enu = 0, sg_kine_index = -1, sg_kine_n_rows = 0;
+    int sg_start_vertex_id = -1, sg_end_vertex_id = -1;
+    int sg_pdg = 0, sg_flag_shower = 0, sg_dirsign = 0, sg_n_fit = 0;
+    float sg_length_cm = -1, sg_ke_mev = -1;
+    std::vector<int> act_n_seg, act_n_seg_in_enu, act_in_enu;
+    if (m_nu_particle_links) {
+        t_segment = new TTree("T_segment", "T_segment");
+        t_segment->SetDirectory(output_tf);
+        t_segment->Branch("run", &rse_run, "run/I");
+        t_segment->Branch("subrun", &rse_subrun, "subrun/I");
+        t_segment->Branch("event", &rse_event, "event/I");
+        t_segment->Branch("nu_index", &sg_nu_index, "nu_index/I");
+        t_segment->Branch("segment_id", &sg_segment_id, "segment_id/I");
+        t_segment->Branch("cluster_id", &sg_cluster_id, "cluster_id/I");
+        t_segment->Branch("shower_id", &sg_shower_id, "shower_id/I");
+        t_segment->Branch("in_enu", &sg_in_enu, "in_enu/I");
+        t_segment->Branch("kine_index", &sg_kine_index, "kine_index/I");
+        t_segment->Branch("kine_n_rows", &sg_kine_n_rows, "kine_n_rows/I");
+        t_segment->Branch("start_vertex_id", &sg_start_vertex_id, "start_vertex_id/I");
+        t_segment->Branch("end_vertex_id", &sg_end_vertex_id, "end_vertex_id/I");
+        t_segment->Branch("pdg", &sg_pdg, "pdg/I");
+        t_segment->Branch("flag_shower", &sg_flag_shower, "flag_shower/I");
+        t_segment->Branch("dirsign", &sg_dirsign, "dirsign/I");
+        t_segment->Branch("length_cm", &sg_length_cm, "length_cm/F");
+        t_segment->Branch("n_fit", &sg_n_fit, "n_fit/I");
+        t_segment->Branch("ke_mev", &sg_ke_mev, "ke_mev/F");
+        // The roster exists only under nu_per_bundle; aligned to act_cluster_id.
+        if (m_nu_per_bundle) {
+            t_tagger->Branch("act_n_seg", &act_n_seg);
+            t_tagger->Branch("act_n_seg_in_enu", &act_n_seg_in_enu);
+            t_tagger->Branch("act_in_enu", &act_in_enu);
+        }
+    }
+
+    // Fill T_segment for one candidate and recompute the roster counts from
+    // the CURRENT ti/ki (called after they are assigned, before the fills).
+    auto fill_links = [&](const Clus::TrackFitting& tfc, int nu_idx) {
+        std::map<int, int> nseg_by_cl, nenu_by_cl;
+        auto graph = tfc.get_graph();
+        if (graph) {
+            std::map<int, std::pair<int, int>> link_by_gi;  // graph_index -> (row, n_rows)
+            const size_t nlink = std::min({ki.link_seg_graph_index.size(), ki.link_seg_kine_index.size(),
+                                           ki.link_seg_n_rows.size()});
+            for (size_t i = 0; i < nlink; ++i) {
+                link_by_gi[ki.link_seg_graph_index[i]] = {ki.link_seg_kine_index[i], ki.link_seg_n_rows[i]};
+            }
+            std::map<PR::SegmentPtr, PR::ShowerPtr, PR::SegmentIndexCmp> seg_to_shower;
+            for (const auto& shower : tfc.get_showers()) {
+                PR::IndexedVertexSet sv;
+                PR::IndexedSegmentSet ss;
+                shower->fill_sets(sv, ss, /*flag_exclude_start_segment=*/false);
+                for (const auto& seg : ss) seg_to_shower[seg] = shower;
+            }
+            for (auto ed : PR::ordered_edges(*graph)) {
+                auto seg = (*graph)[ed].segment;
+                if (!seg) continue;
+                const int gi = static_cast<int>(seg->get_graph_index());
+                const auto* cl = seg->cluster();
+                sg_nu_index = nu_idx;
+                sg_cluster_id = cl ? cl->get_cluster_id() : 0;
+                sg_segment_id = sg_cluster_id * 1000 + gi;
+                auto sit = seg_to_shower.find(seg);
+                sg_shower_id = (sit == seg_to_shower.end()) ? -1 : seg_display_id(sit->second->start_segment());
+                auto lit = link_by_gi.find(gi);
+                sg_in_enu = (lit != link_by_gi.end()) ? 1 : 0;
+                sg_kine_index = sg_in_enu ? lit->second.first : -1;
+                sg_kine_n_rows = sg_in_enu ? lit->second.second : 0;
+                auto [start_vtx, end_vtx] = PR::find_vertices(*graph, seg);
+                sg_start_vertex_id = vtx_display_id(start_vtx);
+                sg_end_vertex_id = vtx_display_id(end_vtx);
+                sg_flag_shower = (seg->flags_any(PR::SegmentFlags::kShowerTrajectory) ||
+                                  seg->flags_any(PR::SegmentFlags::kShowerTopology)) ? 1 : 0;
+                const bool has_pi = seg->has_particle_info() && seg->particle_info();
+                sg_pdg = has_pi ? seg->particle_info()->pdg() : (sg_flag_shower ? 1 : 4);
+                sg_dirsign = seg->dirsign();
+                sg_ke_mev = has_pi ? static_cast<float>(seg->particle_info()->kinetic_energy() / units::MeV) : -1.f;
+                const auto& fits = seg->fits();
+                sg_n_fit = static_cast<int>(fits.size());
+                double len = 0;
+                for (size_t i = 0; i + 1 < fits.size(); ++i) len += (fits[i + 1].point - fits[i].point).magnitude();
+                sg_length_cm = fits.empty() ? -1.f : static_cast<float>(len / units::cm);
+                t_segment->Fill();
+                ++nseg_by_cl[sg_cluster_id];
+                if (sg_in_enu) ++nenu_by_cl[sg_cluster_id];
+            }
+        }
+        const size_t nact = ti.act_cluster_id.size();
+        act_n_seg.assign(nact, 0);
+        act_n_seg_in_enu.assign(nact, 0);
+        act_in_enu.assign(nact, 0);
+        for (size_t i = 0; i < nact; ++i) {
+            const int cid = ti.act_cluster_id[i];
+            if (auto it = nseg_by_cl.find(cid); it != nseg_by_cl.end()) act_n_seg[i] = it->second;
+            if (auto it = nenu_by_cl.find(cid); it != nenu_by_cl.end()) act_n_seg_in_enu[i] = it->second;
+            act_in_enu[i] = act_n_seg_in_enu[i] > 0 ? 1 : 0;
+        }
+    };
 
     // ---- cosmic tagger (top-level flag) ----
     t_tagger->Branch("cosmic_flag", &ti.cosmic_flag, "cosmic_flag/F");
@@ -1080,7 +1325,14 @@ void Root::UbooneTaggerOutputVisitor::visit(Clus::Facade::Ensemble& ensemble) co
 #undef SCALAR_BR
 #undef VECTOR_BR
 
-    t_tagger->Fill();
+    // doc pr/94 Phase 2: legacy fills exactly here, exactly as before.  In
+    // per-bundle mode both trees are instead filled together in the loop below
+    // T_kine's booking, so T_tagger[i] and T_kine[i] are written in the same
+    // iteration and therefore refer to the same bundle by construction.
+    if (nu_fitters.empty()) {
+        if (t_segment) fill_links(*tf, 0);  // sbnd_xin/docs/128-129
+        t_tagger->Fill();
+    }
     log->debug("UbooneTaggerOutputVisitor: wrote T_tagger with {} branches", t_tagger->GetNbranches());
 
     // ================================================================
@@ -1111,14 +1363,93 @@ void Root::UbooneTaggerOutputVisitor::visit(Clus::Facade::Ensemble& ensemble) co
     t_kine->Branch("kine_pio_dis_2", &ki.kine_pio_dis_2, "kine_pio_dis_2/F");
     t_kine->Branch("kine_pio_angle", &ki.kine_pio_angle, "kine_pio_angle/F");
 
-    t_kine->Fill();
-    log->debug("UbooneTaggerOutputVisitor: wrote T_kine");
+    // doc 85 sec 9 (owner request 2026-08-30): the energy kine_reco_Enu does
+    // NOT carry.  Booked unconditionally, unlike the two knobbed blocks
+    // below: this is a production schema change the owner asked for, not an
+    // opt-in diagnostic, so an arm that has it must be readable as such.
+    // Filled by fill_kine_tree; see NeutrinoTaggerInfo.h for the definitions
+    // and for why kine_energy_flagged is NOT one of these (it is inside Enu).
+    t_kine->Branch("kine_energy_excluded", &ki.kine_energy_excluded, "kine_energy_excluded/F");
+    t_kine->Branch("kine_energy_excluded_main", &ki.kine_energy_excluded_main, "kine_energy_excluded_main/F");
+    t_kine->Branch("kine_energy_excluded_other", &ki.kine_energy_excluded_other, "kine_energy_excluded_other/F");
+    t_kine->Branch("kine_n_excluded", &ki.kine_n_excluded, "kine_n_excluded/I");
+    t_kine->Branch("kine_energy_flagged", &ki.kine_energy_flagged, "kine_energy_flagged/F");
+
+    // doc pr/94 Phase 2: the same identity triple T_tagger carries, so a row
+    // pairing can be VERIFIED rather than assumed from position.  Booked under
+    // the same knob, so the knob-off T_kine schema is byte-identical.
+    if (m_nu_per_bundle) {
+        t_kine->Branch("cluster_id", &ki.cluster_id, "cluster_id/I");
+        t_kine->Branch("matched_flash_gid", &ki.matched_flash_gid, "matched_flash_gid/I");
+        t_kine->Branch("nu_index", &ki.nu_index, "nu_index/I");
+    }
+
+    // sbnd_xin/docs/109: the event and the vertex-found flag, as on T_tagger.
+    if (m_nu_provenance) {
+        t_kine->Branch("run", &rse_run, "run/I");
+        t_kine->Branch("subrun", &rse_subrun, "subrun/I");
+        t_kine->Branch("event", &rse_event, "event/I");
+        t_kine->Branch("has_vertex", &ki.has_vertex, "has_vertex/I");
+    }
+
+    // doc 80 round 3: MCS muon momentum scalars + join key.  Booked only
+    // under the mcs_output knob, so the knob-off T_kine schema stays
+    // byte-identical (an added branch changes the schema even when MCS is
+    // off -- the one place "purely additive" reasoning fails, sec 8.5).
+    // Scalars, so the per-bundle struct-assign refill below handles them.
+    if (m_mcs_output) {
+        t_kine->Branch("kine_mcs_energy", &ki.kine_mcs_energy, "kine_mcs_energy/F");
+        t_kine->Branch("kine_mcs_ambiguity", &ki.kine_mcs_ambiguity, "kine_mcs_ambiguity/F");
+        t_kine->Branch("kine_mcs_tracklen", &ki.kine_mcs_tracklen, "kine_mcs_tracklen/F");
+        t_kine->Branch("kine_mcs_range_energy", &ki.kine_mcs_range_energy, "kine_mcs_range_energy/F");
+        t_kine->Branch("kine_mcs_segment_id", &ki.kine_mcs_segment_id, "kine_mcs_segment_id/I");
+    }
+
+    // sbnd_xin/docs/128-129 (P1): which particle each row is -- parallel to
+    // kine_energy_particle, filled by fill_kine_tree.  Join a row to
+    // T_segment on (nu_index, kine_index == row position), or on
+    // kine_particle_id == segment_id (a shower's id is its start segment's).
+    if (m_nu_particle_links) {
+        t_kine->Branch("kine_particle_id", &ki.kine_particle_id);
+        t_kine->Branch("kine_particle_is_shower", &ki.kine_particle_is_shower);
+        t_kine->Branch("kine_particle_cluster_id", &ki.kine_particle_cluster_id);
+        t_kine->Branch("kine_particle_nseg", &ki.kine_particle_nseg);
+        t_kine->Branch("kine_particle_pool", &ki.kine_particle_pool);
+        t_kine->Branch("kine_main_vertex_id", &ki.kine_main_vertex_id, "kine_main_vertex_id/I");
+    }
+
+    if (nu_fitters.empty()) {
+        t_kine->Fill();
+        log->debug("UbooneTaggerOutputVisitor: wrote T_kine");
+    }
+    else {
+        // doc pr/94 Phase 2 -- one row per in-beam-window bundle.  Assigning
+        // through `ti`/`ki` is safe: the branches hold the ADDRESS of these
+        // objects (and of their vector members), and struct assignment copies
+        // into them rather than rebinding, so no re-Branch() is needed.
+        //
+        // The whole loop stays inside this ONE visit() call on purpose:
+        // Write() below carries no kOverwrite, so invoking the visitor per
+        // bundle would leave invisible T_tagger;2 / T_kine;2 cycles that both
+        // uproot and every existing gate silently resolve to the last cycle
+        // of -- a duplicate-fill bug that would never show up.
+        for (size_t ci = 0; ci < nu_fitters.size(); ++ci) {
+            const auto& tfi = nu_fitters[ci];
+            ti = tfi->get_tagger_info();
+            ki = tfi->get_kine_info();
+            if (t_segment) fill_links(*tfi, static_cast<int>(ci));  // sbnd_xin/docs/128-129
+            t_tagger->Fill();
+            t_kine->Fill();
+        }
+        log->debug("UbooneTaggerOutputVisitor: nu_per_bundle wrote {} T_tagger/T_kine row(s)",
+                   nu_fitters.size());
+    }
 
     output_tf->Write();
     output_tf->Close();
     delete output_tf;
 
-    log->debug("UbooneTaggerOutputVisitor: updated {}", m_output_filename);
+    log->debug("UbooneTaggerOutputVisitor: updated {}", outname);
 }
 
 // Local Variables:

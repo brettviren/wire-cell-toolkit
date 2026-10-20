@@ -41,6 +41,59 @@ namespace {
 using WireCell::Clus::PR::ChargeMap;
 using WireCell::Clus::PR::WireMap;
 
+// doc pdvd/120 sec 9.4 (KineChargeOptions::t0_frame): per-(apa, face) drift
+// shift between the raw frame convert_time_wire_2Dpoint works in and the
+// t0-corrected frame the object's clouds live in, measured from the object's
+// own fit points the way CheckSTM_Michel.cxx (michel_q2d) does: the point run
+// backward(t0) into the raw frame, its x minus the point's x, median per
+// (apa, face).  An (apa, face) with no fit point gets no entry (its cells are
+// skipped by the consumers).  Deterministic: int-pair-keyed maps, sorted
+// vectors, segments in the caller's index order.
+using KineT0Shift = std::map<std::pair<int, int>, double>;
+template<typename SegRange>
+static KineT0Shift kine_t0_shift(const SegRange& segs, const IPCTransformSet::pointer& pcts)
+{
+    KineT0Shift out;
+    if (!pcts) return out;
+    std::map<std::pair<int, int>, std::vector<double>> acc;
+    for (const auto& sg : segs) {
+        if (!sg) continue;
+        auto* cl = sg->cluster();
+        if (!cl) continue;
+        const auto xform = pcts->pc_transform(cl->get_scope_transform(cl->get_default_scope()));
+        if (!xform) continue;
+        const double t0 = cl->get_cluster_t0();
+        for (const auto& f : sg->fits()) {
+            if (f.paf.first < 0 || f.paf.second < 0) continue;
+            const auto p_raw = xform->backward(f.point, t0, f.paf.second, f.paf.first);
+            acc[f.paf].push_back(p_raw.x() - f.point.x());
+        }
+    }
+    for (auto& [paf, v] : acc) {
+        std::sort(v.begin(), v.end());
+        out[paf] = v[v.size() / 2];
+    }
+    return out;
+}
+
+// wcp-porting-img wcfm/docs/25 (KineChargeOptions::all_wires): choose, among every
+// wire of a (wrapped) channel on plane_id, the one whose 2-D point is nearest a
+// cloud point.  dist(face, p2d) returns that distance (1e9 = no point).  face /
+// local_wire hold the legacy first-wire choice on entry and are replaced only by
+// a strictly nearer wire, so ties keep the legacy wire.
+template<typename DistFn>
+static void kine_pick_nearest_wire(const std::vector<std::tuple<int, int, int>>& wires, int plane_id,
+                                   int time_slice, int apa, Facade::Grouping* grouping, DistFn&& dist,
+                                   int& face, int& local_wire)
+{
+    double best = dist(face, grouping->convert_time_wire_2Dpoint(time_slice, local_wire, apa, face, plane_id));
+    for (const auto& [f, plane, wire] : wires) {
+        if (plane != plane_id || (f == face && wire == local_wire)) continue;
+        const double d = dist(f, grouping->convert_time_wire_2Dpoint(time_slice, wire, apa, f, plane_id));
+        if (d < best) { best = d; face = f; local_wire = wire; }
+    }
+}
+
 // Core charge-to-energy conversion given pre-collected 2D charge maps and point clouds.
 // CorrFn: callable with signature double(WireCell::Point&).
 // Both cal_kine_charge overloads and calculate_shower_kinematics use this.
@@ -56,7 +109,9 @@ static double kine_charge_from_maps(
     const WireMap& map_apa_ch_plane_wires,
     Facade::Grouping* grouping,
     CorrFn&& corr_fn,
-    double dis_cut)
+    double dis_cut,
+    const KineChargeOptions& kopts,
+    const KineT0Shift* t0_shift = nullptr)   // doc pdvd/120 sec 9.4; nullptr = legacy raw-frame test
 {
     const ChargeMap* maps[3] = {&charge_2d_u, &charge_2d_v, &charge_2d_w};
     double sums[3] = {0, 0, 0};
@@ -77,11 +132,37 @@ static double kine_charge_from_maps(
                 if (plane == plane_id) { face = f; local_wire = wire; break; }
             }
             if (face < 0 || local_wire < 0) continue;
+            // wcfm/docs/25: a wrapped channel's first wire may be on the other face.
+            if (kopts.all_wires) {
+                auto dist = [&](int f, const std::pair<double, double>& q) -> double {
+                    double drift = q.first;
+                    if (t0_shift) {
+                        auto sit = t0_shift->find({apa, f});
+                        if (sit == t0_shift->end()) return 1e9;
+                        drift -= sit->second;
+                    }
+                    double d = 1e9;
+                    for (const auto& pc : {pcloud1, pcloud2}) {
+                        if (!pc) continue;
+                        auto res = pc->get_closest_2d_point_info_direct(drift, q.second, plane_id, f, apa);
+                        if (std::get<1>(res) && std::get<0>(res) < d) d = std::get<0>(res);
+                    }
+                    return d;
+                };
+                kine_pick_nearest_wire(wire_it->second, plane_id, time_slice, apa, grouping, dist, face, local_wire);
+            }
 
             // Use local_wire (plane-local index from map_apa_ch_plane_wires), NOT the global
             // channel number. V channels start at ~2400 and W at ~4800, so passing channel
             // as the wire index gives enormous wrong p2d.second for V/W planes.
             auto p2d = grouping->convert_time_wire_2Dpoint(time_slice, local_wire, apa, face, plane_id);
+            // doc pdvd/120 sec 9.4: into the clouds' t0-corrected frame.
+            double drift = p2d.first;
+            if (t0_shift) {
+                auto sit = t0_shift->find({apa, face});
+                if (sit == t0_shift->end()) continue;
+                drift -= sit->second;
+            }
 
             double dis = 1e9;
             size_t point_index = 0;
@@ -91,7 +172,7 @@ static double kine_charge_from_maps(
             // wire-perpendicular space matching the KD2D tree storage; applying the angle
             // projection again in get_closest_2d_point_info would corrupt the coordinates.
             if (pcloud1) {
-                auto res    = pcloud1->get_closest_2d_point_info_direct(p2d.first, p2d.second, plane_id, face, apa);
+                auto res    = pcloud1->get_closest_2d_point_info_direct(drift, p2d.second, plane_id, face, apa);
                 dis             = std::get<0>(res);
                 closest_cluster = std::get<1>(res);
                 point_index     = std::get<2>(res);
@@ -102,12 +183,12 @@ static double kine_charge_from_maps(
 
             if (plane_sample < 3) {
                 ++plane_sample;
-                auto pcloud1_pts = pcloud1 ? pcloud1->get_points().size() : 0;
+                auto pcloud1_pts = pcloud1 ? pcloud1->npoints() : 0;
                 // Also sample first point in pcloud1 for coordinate comparison
                 double pc_x = 0, pc_y = 0, pc_z = 0;
                 if (pcloud1 && pcloud1_pts > 0) {
-                    const auto& pt0 = pcloud1->get_points()[0];
-                    pc_x = pt0.x; pc_y = pt0.y; pc_z = pt0.z;
+                    const auto pt0 = pcloud1->point3d(0);
+                    pc_x = pt0.x(); pc_y = pt0.y(); pc_z = pt0.z();
                 }
                 SPDLOG_LOGGER_TRACE(s_log,
                     "kine_charge_from_maps:   plane={} ts={} ch={} wire={} apa={} face={}"
@@ -124,15 +205,14 @@ static double kine_charge_from_maps(
             // Returns true if the charge was added.
             auto try_add = [&](std::shared_ptr<Facade::DynamicPointCloud> pc) -> bool {
                 if (!pc || dis >= dis_cut || !closest_cluster) return false;
-                const auto& pts = pc->get_points();
-                if (point_index >= pts.size()) return false;
-                WireCell::Point tp(pts[point_index].x, pts[point_index].y, pts[point_index].z);
+                if (point_index >= pc->npoints()) return false;
+                WireCell::Point tp = pc->point3d(point_index);
                 sums[plane_id] += charge_data.charge * corr_fn(tp);
                 return true;
             };
 
             if (!try_add(pcloud1) && pcloud2) {
-                auto res    = pcloud2->get_closest_2d_point_info_direct(p2d.first, p2d.second, plane_id, face, apa);
+                auto res    = pcloud2->get_closest_2d_point_info_direct(drift, p2d.second, plane_id, face, apa);
                 dis             = std::get<0>(res);
                 closest_cluster = std::get<1>(res);
                 point_index     = std::get<2>(res);
@@ -161,19 +241,31 @@ static double kine_charge_from_maps(
         min_idx = 0; med_idx = 1; max_idx = 2;
     }
 
-    const double weight[3] = {0.25, 0.25, 1.0};
+    // Per-plane weights, asymmetry switch and W-value are configurable
+    // (KineChargeOptions); the defaults are the uBooNE literals that used to sit
+    // here, so an unconfigured job is byte-identical.
+    const double weight[3] = {kopts.plane_weights[0], kopts.plane_weights[1], kopts.plane_weights[2]};
     const double weight_sum = weight[0] + weight[1] + weight[2];
 
     double max_asy = 0;
     if (sums[med_idx] + sums[max_idx] > 0)
         max_asy = std::abs(sums[med_idx] - sums[max_idx]) / (sums[med_idx] + sums[max_idx]);
 
-    double overall = (weight[0]*sums[0] + weight[1]*sums[1] + weight[2]*sums[2]) / weight_sum;
-    if (max_asy > 0.04)
-        overall = (weight[med_idx]*sums[med_idx] + weight[min_idx]*sums[min_idx])
-                  / (weight[med_idx] + weight[min_idx]);
+    // Denominator guards: only reachable with a configured all-zero (or
+    // two-zero) weight triple.  With the 0.25/0.25/1.0 defaults both are
+    // strictly positive, so the taken branch -- and the arithmetic -- is
+    // unchanged.
+    double overall = 0;
+    if (weight_sum > 0)
+        overall = (weight[0]*sums[0] + weight[1]*sums[1] + weight[2]*sums[2]) / weight_sum;
+    if (max_asy > kopts.plane_asym_switch) {
+        const double pair_sum = weight[med_idx] + weight[min_idx];
+        if (pair_sum > 0)
+            overall = (weight[med_idx]*sums[med_idx] + weight[min_idx]*sums[min_idx]) / pair_sum;
+        // else: both dropped planes carry zero weight -- keep the 3-plane average.
+    }
 
-    return overall / recom_factor / fudge_factor * 23.6 / 1e6 * units::MeV;
+    return overall / recom_factor / fudge_factor * kopts.w_value / 1e6 * units::MeV;
 }
 
 } // anonymous namespace
@@ -188,12 +280,12 @@ double PatternAlgorithms::cal_kine_charge(ShowerPtr shower,
     auto grouping = track_fitter.grouping();
     if (!grouping) return 0.0;
 
-    double fudge_factor = 0.95, recom_factor = 0.7;
+    double fudge_factor = m_kine_charge.fudge_factor, recom_factor = m_kine_charge.recom_factor;
     if (shower->get_flag_shower()) {
-        recom_factor = 0.5;
-        fudge_factor = 0.8;
+        recom_factor = m_kine_charge.shower_recom_factor;
+        fudge_factor = m_kine_charge.shower_fudge_factor;
     } else if (std::abs(shower->get_particle_type()) == 2212) {
-        recom_factor = 0.35;
+        recom_factor = m_kine_charge.proton_recom_factor;
     }
 
     auto pcloud1 = shower->get_pcloud("associate_points");
@@ -202,12 +294,19 @@ double PatternAlgorithms::cal_kine_charge(ShowerPtr shower,
     if (!pcloud1) pcloud1 = pcloud2;
     if (!pcloud2) pcloud2 = pcloud1;
 
+    // doc pdvd/120 sec 9.4: knob off => no shift object, legacy call.
+    KineT0Shift shift;
+    if (m_kine_charge.t0_frame) {
+        IndexedVertexSet sv; IndexedSegmentSet ss;
+        shower->fill_sets(sv, ss, /*flag_exclude_start_segment=*/false);
+        shift = kine_t0_shift(ss, m_sgp_pcts);
+    }
     return kine_charge_from_maps(
         pcloud1, pcloud2, fudge_factor, recom_factor,
         charge_2d_u, charge_2d_v, charge_2d_w, map_apa_ch_plane_wires,
         grouping,
         [&](WireCell::Point& pt) { return cal_corr_factor(pt, track_fitter, dv); },
-        0.6 * units::cm);
+        0.6 * units::cm, m_kine_charge, m_kine_charge.t0_frame ? &shift : nullptr);
 }
 
 
@@ -218,6 +317,9 @@ void PatternAlgorithms::collect_charge_maps(TrackFitting& track_fitter)
     m_charge_2d_w.clear();
     m_map_apa_ch_plane_wires.clear();
     track_fitter.collect_2D_charge(m_charge_2d_u, m_charge_2d_v, m_charge_2d_w, m_map_apa_ch_plane_wires);
+    // doc pr/35 §10.11a (F3): record when this cache was taken, for the
+    // staleness check in the segment cal_kine_charge overload.
+    m_charge_data_size_at_collect = track_fitter.get_charge_data().size();
 }
 
 
@@ -239,17 +341,37 @@ double PatternAlgorithms::cal_kine_charge(SegmentPtr segment, Graph& graph, Trac
     auto grouping = track_fitter.grouping();
     if (!grouping) return 0.0;
 
-    double fudge_factor = 0.95, recom_factor = 0.7;
+    double fudge_factor = m_kine_charge.fudge_factor, recom_factor = m_kine_charge.recom_factor;
     if (segment->flags_any(PR::SegmentFlags::kShowerTopology)) {
-        recom_factor = 0.5;
-        fudge_factor = 0.8;
+        recom_factor = m_kine_charge.shower_recom_factor;
+        fudge_factor = m_kine_charge.shower_fudge_factor;
     } else if (segment->has_particle_info() && std::abs(segment->particle_info()->pdg()) == 2212) {
-        recom_factor = 0.35;
+        recom_factor = m_kine_charge.proton_recom_factor;
     }
 
-    ChargeMap charge_2d_u, charge_2d_v, charge_2d_w;
-    WireMap   map_apa_ch_plane_wires;
-    track_fitter.collect_2D_charge(charge_2d_u, charge_2d_v, charge_2d_w, map_apa_ch_plane_wires);
+    // doc pr/35 §10.4/§10.11b (F3 = P4): reuse the cached charge maps the way
+    // the shower overload at :242 does, instead of re-collecting the whole 2-D
+    // charge map on every per-segment call (the prototype hoists this once via
+    // collect_2D_charges(); the port did not).  Output-identical: §5.6 shows
+    // this path reads only .charge, and the §10.11a growth check measured
+    // m_charge_data unchanged between cache time and every fill_kine_tree
+    // call over nueCC48 (33/48 events engaged, 0 growth).  The check below
+    // stays as the invariant's guard: if charge data ever grows after the
+    // cache is taken, the cached maps are stale and this becomes a behaviour
+    // question again -- warn loudly rather than silently drift.
+    {
+        const size_t now = track_fitter.get_charge_data().size();
+        if (m_charge_data_size_at_collect != 0 && now != m_charge_data_size_at_collect) {
+            SPDLOG_LOGGER_WARN(s_log, "cal_kine_charge(segment): charge data grew since cache: {} -> {} "
+                               "-- cached maps stale, kine_charge may be undercounting",
+                               m_charge_data_size_at_collect, now);
+        }
+        else {
+            SPDLOG_LOGGER_DEBUG(s_log, "cal_kine_charge(segment): charge data size {} == cache-time size",
+                                now);
+        }
+    }
+    if (m_charge_2d_u.empty()) collect_charge_maps(track_fitter);
 
     auto pcloud1 = segment->dpcloud("associate_points");
     auto pcloud2 = segment->dpcloud("fit");
@@ -257,12 +379,15 @@ double PatternAlgorithms::cal_kine_charge(SegmentPtr segment, Graph& graph, Trac
     if (!pcloud1) pcloud1 = pcloud2;
     if (!pcloud2) pcloud2 = pcloud1;
 
+    // doc pdvd/120 sec 9.4: knob off => no shift object, legacy call.
+    KineT0Shift shift;
+    if (m_kine_charge.t0_frame) shift = kine_t0_shift(std::vector<SegmentPtr>{segment}, m_sgp_pcts);
     return kine_charge_from_maps(
         pcloud1, pcloud2, fudge_factor, recom_factor,
-        charge_2d_u, charge_2d_v, charge_2d_w, map_apa_ch_plane_wires,
+        m_charge_2d_u, m_charge_2d_v, m_charge_2d_w, m_map_apa_ch_plane_wires,
         grouping,
         [&](WireCell::Point& pt) { return cal_corr_factor(pt, track_fitter, dv); },
-        0.6 * units::cm);
+        0.6 * units::cm, m_kine_charge, m_kine_charge.t0_frame ? &shift : nullptr);
 }
 
 
@@ -291,17 +416,21 @@ void PatternAlgorithms::calculate_shower_kinematics(IndexedShowerSet& showers, I
         if (!shower || shower->get_flag_kinematics()) continue;
 
         if (std::abs(shower->get_particle_type()) != 13) {
-            shower->calculate_kinematics(particle_data, recomb_model);
+            shower->calculate_kinematics(particle_data, recomb_model, m_shower_endpoint_exclude_start_vertex, m_shower_endpoint_skip_orphan_vtx, m_kine_charge.dqdx_skip_zero_dx);
         } else {
-            shower->calculate_kinematics_long_muon(segments_in_long_muon, particle_data, recomb_model);
+            shower->calculate_kinematics_long_muon(segments_in_long_muon, particle_data, recomb_model, m_shower_endpoint_exclude_start_vertex,
+                                                   m_kine_charge.long_muon_mode, m_kine_charge.long_muon_ratio_lo, m_kine_charge.long_muon_ratio_hi,
+                                                   m_kine_charge.long_muon_range_fallback,
+                                                   m_kine_charge.long_muon_members_geometry,
+                                                   m_kine_charge.dqdx_skip_zero_dx);  // doc pdvd/45 sec 5.4
         }
 
-        double fudge_factor = 0.95, recom_factor = 0.7;
+        double fudge_factor = m_kine_charge.fudge_factor, recom_factor = m_kine_charge.recom_factor;
         if (shower->get_flag_shower()) {
-            recom_factor = 0.5;
-            fudge_factor = 0.8;
+            recom_factor = m_kine_charge.shower_recom_factor;
+            fudge_factor = m_kine_charge.shower_fudge_factor;
         } else if (std::abs(shower->get_particle_type()) == 2212) {
-            recom_factor = 0.35;
+            recom_factor = m_kine_charge.proton_recom_factor;
         }
 
         auto pcloud1 = shower->get_pcloud("associate_points");
@@ -311,6 +440,7 @@ void PatternAlgorithms::calculate_shower_kinematics(IndexedShowerSet& showers, I
                 "calculate_shower_kinematics:   shower pdg={} nseg={} — no pclouds, kine_charge=0",
                 shower->get_particle_type(), shower->get_num_segments());
             shower->set_flag_kinematics(true);
+            apply_hadronic_dqdx_best(shower);   // doc pr/101 K3; no-op when off
             continue;
         }
         if (!pcloud1) pcloud1 = pcloud2;
@@ -319,12 +449,19 @@ void PatternAlgorithms::calculate_shower_kinematics(IndexedShowerSet& showers, I
         SPDLOG_LOGGER_TRACE(s_log,
             "calculate_shower_kinematics:   shower pdg={} nseg={} pcloud1_pts={} pcloud2_pts={}",
             shower->get_particle_type(), shower->get_num_segments(),
-            pcloud1->get_points().size(), pcloud2->get_points().size());
+            pcloud1->npoints(), pcloud2->npoints());
 
+        // doc pdvd/120 sec 9.4: knob off => no shift object, legacy call.
+        KineT0Shift shift;
+        if (m_kine_charge.t0_frame) {
+            IndexedVertexSet sv; IndexedSegmentSet ss;
+            shower->fill_sets(sv, ss, /*flag_exclude_start_segment=*/false);
+            shift = kine_t0_shift(ss, m_sgp_pcts);
+        }
         double kine_charge = kine_charge_from_maps(
             pcloud1, pcloud2, fudge_factor, recom_factor,
             m_charge_2d_u, m_charge_2d_v, m_charge_2d_w, m_map_apa_ch_plane_wires,
-            grouping, corr_fn, dis_cut);
+            grouping, corr_fn, dis_cut, m_kine_charge, m_kine_charge.t0_frame ? &shift : nullptr);
 
         SPDLOG_LOGGER_TRACE(s_log,
             "calculate_shower_kinematics:   shower pdg={} nseg={} kine_charge={:.1f}MeV",
@@ -332,5 +469,339 @@ void PatternAlgorithms::calculate_shower_kinematics(IndexedShowerSet& showers, I
 
         shower->set_kine_charge(kine_charge);
         shower->set_flag_kinematics(true);
+        apply_hadronic_dqdx_best(shower);   // doc pr/101 K3; no-op when off
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// doc pr/99 round 3 (C1/C1b) -- cross-shower charge-ownership dedup.
+// Design block at KineChargeOptions::dedup/rebuild (NeutrinoPatternBase.h).
+// The scan/finalize pair below is forked BY DUPLICATION from
+// kine_charge_from_maps (which stays byte-untouched, it is the production
+// path): the scan walks the three plane maps ONCE over all showers' contexts
+// and credits each 2D cell's full charge to the single context whose cloud
+// accepts it at the smallest distance (tie -> lowest context index = lowest
+// shower creation id, since contexts are built in IndexedShowerSet order).
+// A single-context input reproduces the legacy acceptance exactly.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct KineOwnedCtx {
+    std::shared_ptr<Facade::DynamicPointCloud> pcloud1, pcloud2;
+    double fudge{1.0}, recom{1.0};
+    double sums[3] = {0, 0, 0};
+    KineT0Shift shift;        // doc pdvd/120 sec 9.4; consulted only when use_shift
+    bool use_shift{false};
+};
+
+template<typename CorrFn>
+static void kine_charge_owned_scan(
+    std::vector<KineOwnedCtx>& ctxs,
+    const ChargeMap& charge_2d_u,
+    const ChargeMap& charge_2d_v,
+    const ChargeMap& charge_2d_w,
+    const WireMap& map_apa_ch_plane_wires,
+    Facade::Grouping* grouping,
+    CorrFn&& corr_fn,
+    double dis_cut,
+    bool all_wires = false)   // wcfm/docs/25 (KineChargeOptions::all_wires); false = legacy
+{
+    const ChargeMap* maps[3] = {&charge_2d_u, &charge_2d_v, &charge_2d_w};
+
+    for (int plane_id = 0; plane_id < 3; ++plane_id) {
+        for (const auto& [coord_key, charge_data] : *maps[plane_id]) {
+            int time_slice = coord_key.time;
+            int channel    = coord_key.channel;
+            int apa        = coord_key.apa;
+
+            auto wire_it = map_apa_ch_plane_wires.find({apa, channel});
+            if (wire_it == map_apa_ch_plane_wires.end()) continue;
+
+            int face = -1, local_wire = -1;
+            for (const auto& [f, plane, wire] : wire_it->second) {
+                if (plane == plane_id) { face = f; local_wire = wire; break; }
+            }
+            if (face < 0 || local_wire < 0) continue;
+            // wcfm/docs/25: a wrapped channel's first wire may be on the other face;
+            // the nearest wire over every context's clouds.
+            if (all_wires) {
+                auto dist = [&](int f, const std::pair<double, double>& q) -> double {
+                    double d = 1e9;
+                    for (const auto& c : ctxs) {
+                        double drift = q.first;
+                        if (c.use_shift) {
+                            auto sit = c.shift.find({apa, f});
+                            if (sit == c.shift.end()) continue;
+                            drift -= sit->second;
+                        }
+                        for (const auto& pc : {c.pcloud1, c.pcloud2}) {
+                            if (!pc) continue;
+                            auto res = pc->get_closest_2d_point_info_direct(drift, q.second, plane_id, f, apa);
+                            if (std::get<1>(res) && std::get<0>(res) < d) d = std::get<0>(res);
+                        }
+                    }
+                    return d;
+                };
+                kine_pick_nearest_wire(wire_it->second, plane_id, time_slice, apa, grouping, dist, face, local_wire);
+            }
+
+            auto p2d = grouping->convert_time_wire_2Dpoint(time_slice, local_wire, apa, face, plane_id);
+
+            // Per-context legacy acceptance (pcloud1 first, pcloud2 as the
+            // fallback -- the exact kine_charge_from_maps try_add order),
+            // then the min-distance context wins the whole cell.  Strict `<`
+            // with in-order iteration = tie goes to the lowest index.
+            int win = -1;
+            double win_dis = 1e9;
+            size_t win_idx = 0;
+            const Facade::DynamicPointCloud* win_pc = nullptr;
+            for (size_t k = 0; k < ctxs.size(); ++k) {
+                auto& c = ctxs[k];
+                // doc pdvd/120 sec 9.4: into this context's t0-corrected frame.
+                double drift = p2d.first;
+                if (c.use_shift) {
+                    auto sit = c.shift.find({apa, face});
+                    if (sit == c.shift.end()) continue;
+                    drift -= sit->second;
+                }
+                double dis = 1e9;
+                size_t point_index = 0;
+                const Facade::Cluster* closest_cluster = nullptr;
+                const Facade::DynamicPointCloud* pc = nullptr;
+                if (c.pcloud1) {
+                    auto res        = c.pcloud1->get_closest_2d_point_info_direct(drift, p2d.second, plane_id, face, apa);
+                    dis             = std::get<0>(res);
+                    closest_cluster = std::get<1>(res);
+                    point_index     = std::get<2>(res);
+                    pc              = c.pcloud1.get();
+                }
+                bool accepted = (pc && dis < dis_cut && closest_cluster && point_index < pc->npoints());
+                if (!accepted && c.pcloud2) {
+                    auto res        = c.pcloud2->get_closest_2d_point_info_direct(drift, p2d.second, plane_id, face, apa);
+                    dis             = std::get<0>(res);
+                    closest_cluster = std::get<1>(res);
+                    point_index     = std::get<2>(res);
+                    pc              = c.pcloud2.get();
+                    accepted = (dis < dis_cut && closest_cluster && point_index < pc->npoints());
+                }
+                if (accepted && dis < win_dis) {
+                    win = static_cast<int>(k);
+                    win_dis = dis;
+                    win_idx = point_index;
+                    win_pc  = pc;
+                }
+            }
+            if (win >= 0) {
+                WireCell::Point tp = win_pc->point3d(win_idx);
+                ctxs[win].sums[plane_id] += charge_data.charge * corr_fn(tp);
+            }
+        }
+    }
+}
+
+// Duplicate of the kine_charge_from_maps finalization tail (min/med/max,
+// asymmetry switch, per-plane weights, W-value) -- byte-for-byte arithmetic.
+static double kine_charge_finalize(const double sums[3], double fudge_factor, double recom_factor,
+                                   const KineChargeOptions& kopts)
+{
+    int min_idx = 0, max_idx = 0, med_idx = 0;
+    double min_q = 1e9, max_q = -1e9;
+    for (int i = 0; i < 3; ++i) {
+        if (sums[i] < min_q) { min_q = sums[i]; min_idx = i; }
+        if (sums[i] > max_q) { max_q = sums[i]; max_idx = i; }
+    }
+    if (min_idx != max_idx) {
+        for (int i = 0; i < 3; ++i) {
+            if (i != min_idx && i != max_idx) { med_idx = i; break; }
+        }
+    } else {
+        min_idx = 0; med_idx = 1; max_idx = 2;
+    }
+
+    const double weight[3] = {kopts.plane_weights[0], kopts.plane_weights[1], kopts.plane_weights[2]};
+    const double weight_sum = weight[0] + weight[1] + weight[2];
+
+    double max_asy = 0;
+    if (sums[med_idx] + sums[max_idx] > 0)
+        max_asy = std::abs(sums[med_idx] - sums[max_idx]) / (sums[med_idx] + sums[max_idx]);
+
+    double overall = 0;
+    if (weight_sum > 0)
+        overall = (weight[0]*sums[0] + weight[1]*sums[1] + weight[2]*sums[2]) / weight_sum;
+    if (max_asy > kopts.plane_asym_switch) {
+        const double pair_sum = weight[med_idx] + weight[min_idx];
+        if (pair_sum > 0)
+            overall = (weight[med_idx]*sums[med_idx] + weight[min_idx]*sums[min_idx]) / pair_sum;
+    }
+
+    return overall / recom_factor / fudge_factor * kopts.w_value / 1e6 * units::MeV;
+}
+
+} // anonymous namespace
+
+
+bool PatternAlgorithms::apply_hadronic_dqdx_best(const ShowerPtr& shower)
+{
+    if (!m_kine_charge.hadronic_dqdx || !shower) return false;
+    const int type = std::abs(shower->get_particle_type());
+    if (type != 2212 && type != 211 && type != 2112) return false;
+    // A single-segment object with no shower flag is a track wearing a
+    // Shower wrapper (conn-3/4 proton stubs): it keeps the track rule
+    // (range >= 4 cm, dQdx below) that calculate_kinematics already applied.
+    if (shower->get_num_segments() <= 1 && !shower->get_flag_shower()) return false;
+    const double dqdx = shower->get_kine_dQdx();
+    const double before = shower->get_kine_best();
+    const bool write = dqdx > 0;
+    if (write) shower->set_kine_best(dqdx);
+    auto [sv, conn] = shower->get_start_vertex_and_type();
+    (void)sv;
+    SPDLOG_LOGGER_DEBUG(s_log,
+        "kine_hadronic: shower id={} pdg={} conn={} nseg={} charge={:.1f} dqdx={:.1f} range={:.1f} best {:.1f} -> {:.1f} MeV used={}",
+        shower->get_shower_id(), shower->get_particle_type(), conn, shower->get_num_segments(),
+        shower->get_kine_charge() / units::MeV, dqdx / units::MeV, shower->get_kine_range() / units::MeV,
+        before / units::MeV, shower->get_kine_best() / units::MeV, write ? "dqdx" : "legacy");
+    return write;
+}
+
+
+void PatternAlgorithms::recompute_shower_kine_charge_final(IndexedShowerSet& showers, Graph& graph, TrackFitting& track_fitter, IDetectorVolumes::pointer dv)
+{
+    if (!m_kine_charge.dedup && !m_kine_charge.rebuild) return;  // both knobs off => byte-identical
+    auto grouping = track_fitter.grouping();
+    if (!grouping) return;
+    if (m_charge_2d_u.empty()) collect_charge_maps(track_fitter);
+
+    auto corr_fn = [&](WireCell::Point& pt) { return cal_corr_factor(pt, track_fitter, dv); };
+    const double dis_cut = 0.6 * units::cm;
+
+    // Contexts in IndexedShowerSet order = stable shower creation-id order.
+    std::vector<ShowerPtr> shs;
+    std::vector<KineOwnedCtx> ctxs;
+    for (auto& shower : showers) {
+        if (!shower) continue;
+        std::shared_ptr<Facade::DynamicPointCloud> pcloud1, pcloud2;
+        if (m_kine_charge.rebuild) {
+            pcloud1 = shower->rebuild_pcloud("associate_points");
+            pcloud2 = shower->rebuild_pcloud("fit");
+        } else {
+            pcloud1 = shower->get_pcloud("associate_points");
+            pcloud2 = shower->get_pcloud("fit");
+        }
+        // Cloudless showers were left at kine_charge=0 by the production
+        // pass; leave them alone here too.
+        if (!pcloud1 && !pcloud2) continue;
+        if (!pcloud1) pcloud1 = pcloud2;
+        if (!pcloud2) pcloud2 = pcloud1;
+
+        KineOwnedCtx c;
+        c.pcloud1 = pcloud1;
+        c.pcloud2 = pcloud2;
+        c.fudge = m_kine_charge.fudge_factor;
+        c.recom = m_kine_charge.recom_factor;
+        if (shower->get_flag_shower()) {
+            c.recom = m_kine_charge.shower_recom_factor;
+            c.fudge = m_kine_charge.shower_fudge_factor;
+        } else if (std::abs(shower->get_particle_type()) == 2212) {
+            c.recom = m_kine_charge.proton_recom_factor;
+        }
+        if (m_kine_charge.t0_frame) {   // doc pdvd/120 sec 9.4
+            IndexedVertexSet sv; IndexedSegmentSet ss;
+            shower->fill_sets(sv, ss, /*flag_exclude_start_segment=*/false);
+            c.shift = kine_t0_shift(ss, m_sgp_pcts);
+            c.use_shift = true;
+        }
+        shs.push_back(shower);
+        ctxs.push_back(std::move(c));
+    }
+    if (shs.empty()) return;
+    const size_t n_shower_ctx = ctxs.size();
+
+    // doc pr/101 (K1): ownership contexts for every graph segment that is
+    // in no shower.  Appended AFTER the shower contexts so shower-vs-shower
+    // tie-breaks are unchanged; their winnings are discarded (census only).
+    std::vector<SegmentPtr> track_segs;
+    if (m_kine_charge.track_ctx) {
+        if (!m_kine_charge.dedup) {
+            SPDLOG_LOGGER_WARN(s_log, "kine_charge_track_ctx set without kine_charge_dedup -- no effect");
+        }
+        else {
+            IndexedVertexSet  member_vtx;
+            IndexedSegmentSet members;
+            for (auto& shower : showers) {
+                if (shower) shower->fill_sets(member_vtx, members, /*flag_exclude_start_segment=*/false);
+            }
+            for (auto edesc : ordered_edges(graph)) {
+                SegmentPtr seg = graph[edesc].segment;
+                if (!seg || !seg->descriptor_valid()) continue;
+                if (members.count(seg)) continue;
+                auto pcloud1 = seg->dpcloud("associate_points");
+                auto pcloud2 = seg->dpcloud("fit");
+                if (!pcloud1 && !pcloud2) continue;
+                if (!pcloud1) pcloud1 = pcloud2;
+                if (!pcloud2) pcloud2 = pcloud1;
+                KineOwnedCtx c;
+                c.pcloud1 = pcloud1;
+                c.pcloud2 = pcloud2;
+                c.fudge = m_kine_charge.fudge_factor;
+                c.recom = m_kine_charge.recom_factor;
+                if (seg->flags_any(PR::SegmentFlags::kShowerTopology)) {
+                    c.recom = m_kine_charge.shower_recom_factor;
+                    c.fudge = m_kine_charge.shower_fudge_factor;
+                } else if (seg->has_particle_info() && std::abs(seg->particle_info()->pdg()) == 2212) {
+                    c.recom = m_kine_charge.proton_recom_factor;
+                }
+                if (m_kine_charge.t0_frame) {   // doc pdvd/120 sec 9.4
+                    c.shift = kine_t0_shift(std::vector<SegmentPtr>{seg}, m_sgp_pcts);
+                    c.use_shift = true;
+                }
+                track_segs.push_back(seg);
+                ctxs.push_back(std::move(c));
+            }
+        }
+    }
+
+    if (m_kine_charge.dedup) {
+        kine_charge_owned_scan(ctxs, m_charge_2d_u, m_charge_2d_v, m_charge_2d_w,
+                               m_map_apa_ch_plane_wires, grouping, corr_fn, dis_cut,
+                               m_kine_charge.all_wires);   // wcfm/docs/25
+    }
+
+    for (size_t t = 0; t < track_segs.size(); ++t) {
+        const auto& c = ctxs[n_shower_ctx + t];
+        const SegmentPtr& seg = track_segs[t];
+        const double won = kine_charge_finalize(c.sums, c.fudge, c.recom, m_kine_charge);
+        SPDLOG_LOGGER_DEBUG(s_log,
+            "kine_track_ctx: seg idx={} cluster={} pdg={} len_cm={:.1f} ke_mev={:.1f} won_mev={:.1f}",
+            seg->get_graph_index(), (seg->cluster() ? seg->cluster()->get_cluster_id() : -1),
+            (seg->has_particle_info() ? seg->particle_info()->pdg() : 0),
+            segment_track_length(seg) / units::cm,
+            (seg->has_particle_info() ? seg->particle_info()->kinetic_energy() / units::MeV : 0.0),
+            won / units::MeV);
+    }
+    if (!track_segs.empty()) {
+        SPDLOG_LOGGER_DEBUG(s_log, "kine_track_ctx: {} track context(s) beside {} shower context(s)",
+                            track_segs.size(), n_shower_ctx);
+    }
+
+    for (size_t k = 0; k < shs.size(); ++k) {
+        double e_new;
+        if (m_kine_charge.dedup) {
+            e_new = kine_charge_finalize(ctxs[k].sums, ctxs[k].fudge, ctxs[k].recom, m_kine_charge);
+        } else {
+            // rebuild-only: legacy independent scan, member-true clouds.
+            e_new = kine_charge_from_maps(
+                ctxs[k].pcloud1, ctxs[k].pcloud2, ctxs[k].fudge, ctxs[k].recom,
+                m_charge_2d_u, m_charge_2d_v, m_charge_2d_w, m_map_apa_ch_plane_wires,
+                grouping, corr_fn, dis_cut, m_kine_charge,
+                ctxs[k].use_shift ? &ctxs[k].shift : nullptr);   // doc pdvd/120 sec 9.4
+        }
+        const double e_old = shs[k]->get_kine_charge();
+        SPDLOG_LOGGER_DEBUG(s_log,
+            "kine final recompute: shower id={} pdg={} nseg={} kine_charge {:.1f} -> {:.1f} MeV (dedup={} rebuild={} track_ctx={})",
+            shs[k]->get_shower_id(), shs[k]->get_particle_type(), shs[k]->get_num_segments(),
+            e_old / units::MeV, e_new / units::MeV,
+            m_kine_charge.dedup, m_kine_charge.rebuild, !track_segs.empty());
+        shs[k]->set_kine_charge(e_new);
     }
 }

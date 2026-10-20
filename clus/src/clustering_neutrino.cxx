@@ -19,10 +19,15 @@ using namespace WireCell::PointCloud::Tree;
 
 
 static void clustering_neutrino(
-    Grouping &live_grouping, 
-    int num_try, 
+    Grouping &live_grouping,
+    int num_try,
     IDetectorVolumes::pointer dv,
-    const Tree::Scope& scope
+    const Tree::Scope& scope,
+    bool use_flash_t0 = false,
+    double flash_t0_window = 80*units::ns,
+    bool protect_iso_band = false,
+    double protect_iso_band_xext = 0,
+    bool record_band_veto = false
     );
 
 class ClusteringNeutrino :  public IConfigurable, public Clus::IEnsembleVisitor, private NeedDV, private NeedScope {
@@ -33,31 +38,120 @@ public:
     void configure(const WireCell::Configuration& config) {
         NeedDV::configure(config);
         NeedScope::configure(config);
-        
+
         num_try_ = get(config, "num_try", 1);
+        use_flash_t0_ = get(config, "use_flash_t0", false);
+        flash_t0_window_ = get(config, "flash_t0_window", 80*units::ns);
+        // Decline to merge an isochronous band (narrow drift slab, large y-z
+        // footprint) with a non-band cluster unless the two genuinely touch
+        // (default OFF => byte-identical).  See iso_band_like().
+        protect_iso_band_ = get(config, "protect_iso_band", false);
+        // Stricter band/non-band veto: refuse the merge REGARDLESS of touch
+        // when the non-band partner extends more than this in drift x -- an
+        // isochronous band cannot legitimately claim charge that spans tens
+        // of cm of drift (doc pr/18, SBND evt 10550: the nu candidate's
+        // 45.6 cm drift-spanning tip touches the cosmic band at 0.31 cm, so
+        // the 6 cm touch rule alone cannot discriminate).  0 (default) =>
+        // off => byte-identical; only read when protect_iso_band is on.
+        protect_iso_band_xext_ = get(config, "protect_iso_band_xext", protect_iso_band_xext_);
+        // Record each iso-band refusal as a per-blob "nu_band_veto_role"
+        // provenance array (doc pr/66) so the ALL-APA clustering chain -- a
+        // SEPARATE MultiAlgBlobClustering pnode with no iso-band guard of its
+        // own -- can honor a refusal THIS pass made, instead of re-merging the
+        // pair.  C++ default false => the array is never created => no
+        // "perblob" key-set change and merge_clusters()'s veto (gated purely
+        // on the array's presence) is structurally unreachable =>
+        // byte-identical.  Only meaningful with protect_iso_band on; has no
+        // effect on this visitor's own output either way (it only stamps
+        // provenance at the point a merge is already being declined).
+        record_band_veto_ = get(config, "record_band_veto", false);
     }
-    
+
     void visit(Ensemble& ensemble) const {
         auto& live = *ensemble.with_name("live").at(0);
         for (int i = 0; i != num_try_; i++) {
-            clustering_neutrino(live, i, m_dv, m_scope);
+            clustering_neutrino(live, i, m_dv, m_scope, use_flash_t0_, flash_t0_window_, protect_iso_band_,
+                                protect_iso_band_xext_, record_band_veto_);
         }
     }
-    
+
 private:
     int num_try_{1};
+    bool use_flash_t0_{false};
+    double flash_t0_window_{80*units::ns};
+    bool protect_iso_band_{false};
+    double protect_iso_band_xext_{0};
+    bool record_band_veto_{false};
 };
 
 // The original developers do not care.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wparentheses"
 
+// An isochronous band lives in ONE narrow drift slab while spanning a large
+// y-z footprint; a real track of comparable length also spans drift x.  Used
+// by the protect_iso_band veto (PDVD 39324 evt 339850: a 23 cm distant
+// drift-spanning track was merged into a band complex via the extended-cloud
+// prolongations).
+static bool iso_band_like(const Cluster* c)
+{
+    const double len = c->get_length();
+    if (len < 80 * units::cm) return false;
+    double xmin = 1e300, xmax = -1e300;
+    for (const Blob* b : c->children()) {
+        const double x = b->center_pos().x();
+        xmin = std::min(xmin, x);
+        xmax = std::max(xmax, x);
+    }
+    return (xmax - xmin) < std::max(25 * units::cm, 0.18 * len);
+}
+
+// Blob-center drift-x extent, same measure iso_band_like uses.  Used by the
+// protect_iso_band_xext veto (doc pr/18).
+static double blob_center_xext(const Cluster* c)
+{
+    double xmin = 1e300, xmax = -1e300;
+    for (const Blob* b : c->children()) {
+        const double x = b->center_pos().x();
+        xmin = std::min(xmin, x);
+        xmax = std::max(xmax, x);
+    }
+    return xmax - xmin;
+}
+
+// Stamp every blob of `c` with `role` in the "nu_band_veto_role" per-blob
+// array (record_band_veto knob, doc pr/66), preserving any earlier stamp.
+// iso_band_like() is an intrinsic property of a cluster, so a second refusal
+// involving the same cluster can only re-assert the same value -- the
+// preserve-existing-stamp behavior is defensive, not policy.  Read back by
+// band_veto_forbids() (ClusteringFuncs.cxx), which every all-APA merge stage
+// consults through merge_clusters().
+static void stamp_band_veto(Cluster* c, int role)
+{
+    const size_t nb = (size_t) c->nchildren();
+    if (!nb) return;
+    std::vector<int> roles(nb, band_veto_none);
+    if (c->has_pcarray<int>("nu_band_veto_role", "perblob")) {
+        auto sp = c->get_pcarray<int>("nu_band_veto_role", "perblob");
+        if (sp.size() == nb) roles.assign(sp.begin(), sp.end());
+    }
+    for (size_t i = 0; i < nb; ++i) {
+        if (roles[i] == band_veto_none) roles[i] = role;
+    }
+    c->put_pcarray(roles, "nu_band_veto_role", "perblob");
+}
+
 // handle all APA/Face
 static void clustering_neutrino(
     Grouping &live_grouping,
-    int num_try, 
+    int num_try,
     IDetectorVolumes::pointer dv,
-    const Tree::Scope& scope)
+    const Tree::Scope& scope,
+    bool use_flash_t0,
+    double flash_t0_window,
+    bool protect_iso_band,
+    double protect_iso_band_xext,
+    bool record_band_veto)
 {
     // Get all the wire plane IDs from the grouping
     const auto& wpids = live_grouping.wpids();
@@ -108,15 +202,18 @@ static void clustering_neutrino(
     for (const auto& wpid : wpids) {
         map_wpid_time_slice_width[wpid] = dv->metadata(wpid)["nticks_live_slice"].asDouble()  * dv->metadata(wpid)["tick_drift"].asDouble() ;
     }
-    WirePlaneId wpid_all(0);
-    double det_FV_xmin = dv->metadata(wpid_all)["FV_xmin"].asDouble();
-    double det_FV_xmax = dv->metadata(wpid_all)["FV_xmax"].asDouble();
-    double det_FV_ymin = dv->metadata(wpid_all)["FV_ymin"].asDouble();
-    double det_FV_ymax = dv->metadata(wpid_all)["FV_ymax"].asDouble();
-    double det_FV_zmin = dv->metadata(wpid_all)["FV_zmin"].asDouble();
-    double det_FV_zmax = dv->metadata(wpid_all)["FV_zmax"].asDouble();
-    double det_FV_xmin_margin = dv->metadata(wpid_all)["FV_xmin_margin"].asDouble();
-    double det_FV_xmax_margin = dv->metadata(wpid_all)["FV_xmax_margin"].asDouble();
+    // Scope-aware fiducial volume (see select_scope_fv): in a per-APA pass this is
+    // the FV of the drift volume being clustered; in an all-APA (multi-APA) pass it
+    // is the global cryostat envelope.
+    const ScopeFV fv = select_scope_fv(dv);
+    const double det_FV_xmin = fv.xmin;
+    const double det_FV_xmax = fv.xmax;
+    const double det_FV_ymin = fv.ymin;
+    const double det_FV_ymax = fv.ymax;
+    const double det_FV_zmin = fv.zmin;
+    const double det_FV_zmax = fv.zmax;
+    const double det_FV_xmin_margin = fv.xmin_margin;
+    const double det_FV_xmax_margin = fv.xmax_margin;
 
 
 
@@ -126,25 +223,8 @@ static void clustering_neutrino(
     // in the current code, we do not care about the actual direction of drift_dir, so just picking up the first instance 
     geo_point_t drift_dir_abs(1,0,0);
 
-    geo_point_t vertical_dir(0, 1, 0);
-    geo_point_t beam_dir(0, 0, 1);
-    // Get vertical_dir from metadata
-    Json::Value vertical_dir_json = dv->metadata(wpid_all)["vertical_dir"];
-    Json::Value beam_dir_json = dv->metadata(wpid_all)["beam_dir"];
-    if (!vertical_dir_json.isNull() && vertical_dir_json.isArray() && vertical_dir_json.size() >= 3) {
-        vertical_dir = geo_point_t(
-            vertical_dir_json[0].asDouble(),
-            vertical_dir_json[1].asDouble(),
-            vertical_dir_json[2].asDouble()
-        );
-    } 
-    if (!beam_dir_json.isNull() && beam_dir_json.isArray() && beam_dir_json.size() >= 3) {
-        beam_dir = geo_point_t(
-            beam_dir_json[0].asDouble(),
-            beam_dir_json[1].asDouble(),
-            beam_dir_json[2].asDouble()
-        );
-    } 
+    const geo_point_t vertical_dir = fv.vertical_dir;
+    const geo_point_t beam_dir = fv.beam_dir;
 
     // find all the clusters that are inside the box ...
     std::vector<Cluster *> contained_clusters;
@@ -167,8 +247,8 @@ static void clustering_neutrino(
         // el_wcps.first.x()/units::cm << " " << el_wcps.second.x()/units::cm << std::endl;
 
         // if (el_wcps.first.x() < -1 * units::cm || el_wcps.second.x() > 257 * units::cm ||
-        // Use global detector-envelope bounds (wpid_all=0) to cover all TPCs, consistent
-        // with the clustering_separate convention (clustering_separate.cxx:360-380).
+        // Scope-aware bounds (select_scope_fv): the per-APA drift volume's FV in a
+        // per-APA pass, the cryostat envelope in an all-APA pass.
         if (el_wcps.first.x() < det_FV_xmin - det_FV_xmin_margin || el_wcps.second.x() > det_FV_xmax + det_FV_xmax_margin || cluster->get_length() < 6.0 * units::cm)
             continue;
 
@@ -406,32 +486,41 @@ static void clustering_neutrino(
                         }
                     }
 
-                    temp_extreme_pts = largest_cluster->get_two_extreme_points();
-                    center = largest_cluster->get_pca().center;
-                    main_dir.set(largest_cluster->get_pca().axis.at(0).x(), largest_cluster->get_pca().axis.at(0).y(),
-                                 largest_cluster->get_pca().axis.at(0).z());
-                    num_clusters = sep_clusters.size();
-                    // largest_cluster->Create_point_cloud();
+                    // largest_cluster stays null when Separate_2 yields no
+                    // clusters with points (max_num_points starts at 0, the
+                    // loop assigns only on npoints() > 0): dereferencing it
+                    // was a segfault.  Skip the temp refinement
+                    // (flag_enable_temp stays false, i.e. "no separation
+                    // result") but still merge back below.
+                    if (largest_cluster) {
+                        temp_extreme_pts = largest_cluster->get_two_extreme_points();
+                        center = largest_cluster->get_pca().center;
+                        main_dir.set(largest_cluster->get_pca().axis.at(0).x(), largest_cluster->get_pca().axis.at(0).y(),
+                                     largest_cluster->get_pca().axis.at(0).z());
+                        num_clusters = sep_clusters.size();
+                        // largest_cluster->Create_point_cloud();
 
-                    if (orig_cluster_length > 25 * units::cm) {
-                        temp_extreme_pts.first = largest_cluster->calc_ave_pos(temp_extreme_pts.first, 5 * units::cm);
-                        temp_extreme_pts.second = largest_cluster->calc_ave_pos(temp_extreme_pts.second, 5 * units::cm);
+                        if (orig_cluster_length > 25 * units::cm) {
+                            temp_extreme_pts.first = largest_cluster->calc_ave_pos(temp_extreme_pts.first, 5 * units::cm);
+                            temp_extreme_pts.second = largest_cluster->calc_ave_pos(temp_extreme_pts.second, 5 * units::cm);
+                        }
+
+                        flag_enable_temp = true;
+                        temp_dir1 = largest_cluster->vhough_transform(temp_extreme_pts.first, 30 * units::cm);
+                        temp_dir2 = largest_cluster->vhough_transform(temp_extreme_pts.second, 30 * units::cm);
                     }
-
-                    flag_enable_temp = true;
-                    temp_dir1 = largest_cluster->vhough_transform(temp_extreme_pts.first, 30 * units::cm);
-                    temp_dir2 = largest_cluster->vhough_transform(temp_extreme_pts.second, 30 * units::cm);
 
                     // for (size_t j = 0; j != sep_clusters.size(); j++) {
                     //     delete sep_clusters.at(j);
                     // }
                     // merge back ...
                     // cluster1 = &(live_grouping.make_child());
-                    for (size_t j = 0; j != sep_clusters.size(); j++) {
-                        cluster1->take_children(*sep_clusters.at(j), true);
-                        live_grouping.destroy_child(sep_clusters.at(j));
-                        assert(sep_clusters.at(j) == nullptr);
-                    }
+                    // Grouping::merge == the old take_children/destroy_child
+                    // loop (ascending gid adoption, shells destroyed), plus it
+                    // carries any node-local "perblob" Dataset through the
+                    // round trip (doc 52 §13, option 2; the Dataset is absent
+                    // at this pipeline stage today, so this is a no-op).
+                    live_grouping.merge(sep_clusters, cluster1);
                     // std::cout  << "[neutrino] cluster1->npoints() " << cluster1->npoints() << " " << cluster1->point(0) << std::endl;
                 }
 
@@ -582,33 +671,34 @@ static void clustering_neutrino(
                             largest_cluster = sep_cluster;
                         }
                     }
-                    temp_extreme_pts = largest_cluster->get_two_extreme_points();
-                    center = largest_cluster->get_pca().center;
-                    main_dir.set(largest_cluster->get_pca().axis.at(0).x(), largest_cluster->get_pca().axis.at(0).y(),
-                                 largest_cluster->get_pca().axis.at(0).z());
-                    num_clusters = sep_clusters.size();
+                    // Same null-largest_cluster skip (and reason) as the
+                    // cluster1 block above.
+                    if (largest_cluster) {
+                        temp_extreme_pts = largest_cluster->get_two_extreme_points();
+                        center = largest_cluster->get_pca().center;
+                        main_dir.set(largest_cluster->get_pca().axis.at(0).x(), largest_cluster->get_pca().axis.at(0).y(),
+                                     largest_cluster->get_pca().axis.at(0).z());
+                        num_clusters = sep_clusters.size();
 
-                    // largest_cluster->Create_point_cloud();
+                        // largest_cluster->Create_point_cloud();
 
-                    if (orig_cluster_length > 25 * units::cm) {
-                        temp_extreme_pts.first = largest_cluster->calc_ave_pos(temp_extreme_pts.first, 5 * units::cm);
-                        temp_extreme_pts.second = largest_cluster->calc_ave_pos(temp_extreme_pts.second, 5 * units::cm);
+                        if (orig_cluster_length > 25 * units::cm) {
+                            temp_extreme_pts.first = largest_cluster->calc_ave_pos(temp_extreme_pts.first, 5 * units::cm);
+                            temp_extreme_pts.second = largest_cluster->calc_ave_pos(temp_extreme_pts.second, 5 * units::cm);
+                        }
+
+                        flag_enable_temp = true;
+                        temp_dir1 = largest_cluster->vhough_transform(temp_extreme_pts.first, 30 * units::cm);
+                        temp_dir2 = largest_cluster->vhough_transform(temp_extreme_pts.second, 30 * units::cm);
                     }
-
-                    flag_enable_temp = true;
-                    temp_dir1 = largest_cluster->vhough_transform(temp_extreme_pts.first, 30 * units::cm);
-                    temp_dir2 = largest_cluster->vhough_transform(temp_extreme_pts.second, 30 * units::cm);
 
                     // for (size_t j = 0; j != sep_clusters.size(); j++) {
                     //     delete sep_clusters.at(j);
                     // }
                     // merge back ...
                     // cluster2 = &(live_grouping.make_child());
-                    for (size_t j = 0; j != sep_clusters.size(); j++) {
-                        cluster2->take_children(*sep_clusters.at(j), true);
-                        live_grouping.destroy_child(sep_clusters.at(j));
-                        assert(sep_clusters.at(j) == nullptr);
-                    }
+                    // Same merge-back as the cluster1 round trip above (doc 52 §13).
+                    live_grouping.merge(sep_clusters, cluster2);
                     // std::cout  << "[neutrino] cluster2->npoints() " << cluster2->npoints() << " " << cluster2->point(0) << std::endl;
                 }
 
@@ -965,6 +1055,11 @@ static void clustering_neutrino(
     typedef cluster_connectivity_graph_t Graph;
     Graph g;
     const auto live_all = live_grouping.children();  // stable, deterministic order
+    // When flash-aware, only merge clusters coincident in matched flash time.
+    std::map<const Cluster*, int> flash_t0_group;
+    if (use_flash_t0) {
+        flash_t0_group = assign_flash_t0_groups(live_all, flash_t0_window);
+    }
     std::unordered_map<const Cluster*, int> map_cluster_index;
     map_cluster_index.reserve(live_all.size());
     for (size_t ilive = 0; ilive < live_all.size(); ++ilive) {
@@ -973,6 +1068,52 @@ static void clustering_neutrino(
     }
     for (auto [cluster1, cluster2] : to_be_merged_pairs) {
         // std::cout <<cluster1->get_length()/units::cm << " " << cluster2->get_length()/units::cm << " " << cluster1->get_pca().center << " " << cluster2->get_pca().center << std::endl;
+        if (use_flash_t0 && flash_t0_group.at(cluster1) != flash_t0_group.at(cluster2)) continue;
+        // Band/non-band pairs may only merge when they genuinely touch: the
+        // extended clouds above bridge tens of cm, gluing drift-spanning
+        // tracks onto isochronous bands.
+        if (protect_iso_band && iso_band_like(cluster1) != iso_band_like(cluster2)) {
+            const auto res = cluster1->get_closest_points(*cluster2);
+            if (std::get<2>(res) > 6 * units::cm) {
+                // Marker only when the xext knob is active (SBND): PDHD/PDVD
+                // run protect_iso_band without it and keep their exact stdout.
+                if (protect_iso_band_xext > 0) {
+                    std::cout << "Neutrino iso_band_guard: refused band/non-band far merge, gap "
+                              << std::get<2>(res) / units::cm << " cm, lens " << cluster1->get_length() / units::cm
+                              << "/" << cluster2->get_length() / units::cm << " cm" << std::endl;
+                }
+                continue;
+            }
+            // Even a genuine touch cannot justify a band claiming a
+            // drift-spanning partner (doc pr/18, SBND evt 10550: nu candidate
+            // tip touches the cosmic band at 0.31 cm).
+            if (protect_iso_band_xext > 0) {
+                Cluster* band = iso_band_like(cluster1) ? cluster1 : cluster2;
+                Cluster* nonband = iso_band_like(cluster1) ? cluster2 : cluster1;
+                const double xext = blob_center_xext(nonband);
+                if (xext > protect_iso_band_xext) {
+                    std::cout << "Neutrino iso_band_guard: refused band/non-band merge, nonband xext "
+                              << xext / units::cm << " cm, lens " << cluster1->get_length() / units::cm << "/"
+                              << cluster2->get_length() / units::cm << " cm, touch "
+                              << std::get<2>(res) / units::cm << " cm" << std::endl;
+                    // Record the refusal as per-blob provenance (doc pr/66) so
+                    // the SEPARATE all-APA clustering chain -- which has no
+                    // iso-band guard of its own -- can honor it instead of
+                    // re-merging this exact pair.  Default OFF; the array is
+                    // never created when off, so this costs nothing and does
+                    // not touch this visitor's own output either way.
+                    if (record_band_veto) {
+                        stamp_band_veto(band, band_veto_band);
+                        stamp_band_veto(nonband, band_veto_nonband);
+                        std::cout << "nu_band_veto: record band len " << band->get_length() / units::cm
+                                  << " cm, nonband len " << nonband->get_length() / units::cm
+                                  << " cm, nonband xext " << xext / units::cm
+                                  << " cm, touch " << std::get<2>(res) / units::cm << " cm" << std::endl;
+                    }
+                    continue;
+                }
+            }
+        }
         boost::add_edge(map_cluster_index[cluster1], map_cluster_index[cluster2], g);
     }
 

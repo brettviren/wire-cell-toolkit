@@ -14,8 +14,10 @@
 #include "WireCellIface/IAnodePlane.h"
 #include "WireCellIface/IAnodeFace.h"
 #include "WireCellIface/IDetectorVolumes.h"
+#include "WireCellIface/IFiducial.h"
 
 #include "WireCellClus/Facade_Mixins.h"
+#include "WireCellClus/Facade_Flash.h"
 #include "WireCellClus/Facade_Util.h"
 
 // Include PRGraphType for PR::Graph (it's a type alias, not a class, so can't forward declare)
@@ -27,6 +29,7 @@ namespace WireCell::Clus {
     class FiducialUtils;
     using FiducialUtilsPtr = std::shared_ptr<FiducialUtils>;
     class TrackFitting;
+    namespace PR { struct NuBundleCensus; }
 }
 
 namespace WireCell::Clus::Facade {
@@ -62,7 +65,13 @@ namespace WireCell::Clus::Facade {
             
             // [plane][wire_index] -> (start_x_position, end_x_position)
             std::array<std::map<int, std::pair<double, double>>, 3> dead_wires;
-            
+
+            // Hand-declared "dead gap" W winds (collection plane only):
+            // [W wire_index] -> (xbeg, xend).  A W wind maps to a single z over the
+            // full y extent, so these define a full-vertical dead COLUMN treated as
+            // dead on all three planes (see Grouping::in_dead_gap).  Default empty.
+            std::map<int, std::pair<double, double>> dead_gap_w;
+
             // Track which planes have been cached
             std::array<bool, 3> cached = {false, false, false};
         };
@@ -78,6 +87,64 @@ namespace WireCell::Clus::Facade {
 
         std::map<int, IAnodePlane::pointer> m_anodes;
         IDetectorVolumes::pointer m_dv{nullptr};
+        // doc pdvd/36; see set_ctpc_aniso_metric().  Default OFF = legacy.
+        bool m_ctpc_aniso_metric{false};
+        // doc icarus/04 sec 8; see set_dead_region().  Default null = no region.
+        IFiducial::pointer m_dead_region{nullptr};
+
+        // Memoized per-(apa,face,pind) state for kd2d().  The scope string ("ctpc_a*f*p*")
+        // depends only on the indices, not on event content, so it is built once per key
+        // instead of via boost::format on every kd2d() call -- that format was ~40% of
+        // clustering CPU (see clustering-timing-profile.md §2).  We additionally cache the
+        // resolved ScopedView* and a pointer to its "indices valid" flag so that, while the
+        // flag is true, kd2d() returns the view's k-d tree directly and skips the
+        // scoped_view() Scope hash-lookup (~16% of clustering, §4); the flag is cleared by
+        // the tree on any insert/remove, dropping us back to the safe scoped_view() path.
+        // Both pointers are stable: the ctpc scoped views are never erased (one ScopedView
+        // per (tree,scope), verified).  All output-identical.
+        struct kd2d_cache_t {
+            Tree::Scope scope;
+            const Tree::ScopedView<float_t>* sv{nullptr};
+            const bool* valid{nullptr};
+        };
+        mutable std::map<int, std::map<int, std::map<int, kd2d_cache_t>>> m_kd2d_scope_cache;
+
+        // Memoized per-(apa,face) conversion constants.  These copy values out
+        // of the GroupingCache nested maps (wire angles, pitch, projection
+        // center, time offset, drift speed, tick) plus the IAnodeFace pointer,
+        // all of which are fixed for the lifetime of this grouping.
+        // convert_3Dpoint_time_ch() and has_closest_point() run per point per
+        // plane inside the good-point tests, where the nested .at() map chains,
+        // a per-call std::vector for the angles and the by-value
+        // IAnodePlane::faces() vector dominated their cost.  Output-identical:
+        // the memo holds exactly the values those lookups return.
+        struct fastgeom_t {
+            std::array<double, 3> angle, pitch, center;
+            double time_offset, drift_speed, tick;
+            IAnodeFace::pointer iface;
+            // doc pdvd/36: the ctpc lattice constants for the anisotropic
+            // metric (CtpcAnisoMetric.h).  drift_step = nticks_live_slice *
+            // tick * drift_speed is the x edge of a ctpc cell; yscale[pind] =
+            // min(1, drift_step / pitch[pind]) is the pitch-axis scale.  Both
+            // are filled unconditionally (one multiply and three divides per
+            // (apa, face), once) but only READ when m_ctpc_aniso_metric is on.
+            double drift_step{0.0};
+            std::array<double, 3> yscale{1.0, 1.0, 1.0};
+            // doc sbnd_xin/119 round 3: the rest of what the per-point projection used to
+            // re-derive on every call.  cos_angle/sin_angle are cos/sin of angle[pind]; xsign and
+            // xorig are the two IAnodeFace constants drift2time() dug out of
+            // anodeface->planes()[2]->wires().front()->center() per call.  Same reasoning, and
+            // the same output-identity argument, as the memo above: these hold exactly the values
+            // the per-call derivation returns.  On SBND nuecc evt 2925 that derivation was 4.2 %
+            // of the job in drift2time and a further ~1.4 % in sin/cos under point2wind.
+            std::array<double, 3> cos_angle{}, sin_angle{};
+            double xsign{0.0}, xorig{0.0};
+        };
+        // Dense by key = apa*2+face (called per point in the good-point
+        // tests; a hash lookup here was ~5% of busy clustering).  unique_ptr
+        // keeps the returned references stable across growth.
+        mutable std::vector<std::unique_ptr<fastgeom_t>> m_fastgeom;
+        const fastgeom_t& fastgeom(const int apa, const int face) const;
 
         /// TODO: remove these in the future
         // IAnodePlane::pointer m_anode{nullptr};
@@ -116,6 +183,43 @@ namespace WireCell::Clus::Facade {
                                          bool remove=false,
                                          bool notify_value=true);
 
+        /// Merge, enforcing the "perblob" row-order invariant.
+        ///
+        /// These overloads HIDE the NaryTree::FacadeParent merge() methods on
+        /// purpose (clus/docs/perblob_invariant.md): the base merge appends
+        /// each part's blob children at the END of the target's child list
+        /// but knows nothing of the cluster-level N-row "perblob" Dataset
+        /// whose row i must describe child i.  separate() above carves that
+        /// Dataset across the survivor and the splits; these merges
+        /// concatenate the parts' Datasets onto the target's in the SAME
+        /// order the children are adopted, so any separate/merge sequence
+        /// keeps row i == child i with no caller-side realign.  When the
+        /// Datasets cannot be concatenated truthfully (a stale row count, a
+        /// part carrying no Dataset while others do, mismatched key sets)
+        /// the target's Dataset is DROPPED with a warning -- a loud absence
+        /// instead of a silent misalignment.  Clusters carrying no "perblob"
+        /// Dataset pay one map lookup each and are otherwise untouched, and
+        /// the returned cc array is exactly the base merge's.
+        ///
+        /// The map version keeps the base behavior of using the map keys as
+        /// the returned cc group ids.  With keep=true the emptied part
+        /// shells survive; any "perblob" entry they still hold is erased
+        /// (their children are gone).
+        std::vector<int> merge(std::map<int, Cluster*>& splits,
+                               Cluster* target,
+                               bool keep=false, int existingID=-1);
+        std::vector<int> merge(std::vector<Cluster*>& parts,
+                               Cluster* target=nullptr,
+                               bool keep=false, int existingID=-1);
+        template<typename ChildIt>
+        std::vector<int> merge(ChildIt cbeg, ChildIt cend,
+                               Cluster* target=nullptr,
+                               bool keep=false, int existingID=-1)
+        {
+            std::vector<Cluster*> parts(cbeg, cend);
+            return merge(parts, target, keep, existingID);
+        }
+
 
         // TODO: remove this in the future
         // void set_params(const TPCParams& tp) { m_tp = tp; }
@@ -128,6 +232,44 @@ namespace WireCell::Clus::Facade {
         std::map<int, std::map<int, double> > get_drift_speed() const { return cache().map_drift_speed;}
         std::map<int, std::map<int, int> > get_drift_dir() const { return cache().map_drift_dir;}
         std::map<int, std::map<int, int> > get_nticks_per_slice() const { return cache().map_nticks_per_slice;}
+
+        /// Build the Facade::Flash for a given row of the grouping-level "flash"
+        /// PC (owns the flashlight-join walk).  Returns an invalid Flash
+        /// (operator bool() == false) if there is no "flash" PC or the index is
+        /// out of range.  Cluster::get_flash() delegates here.
+        ::WireCell::Clus::Facade::Flash flash_at(int flash_index) const;
+
+        /// Enumerate ALL flashes from the grouping-level optical PCs (the
+        /// pre-match read path).  Empty if there is no "flash" PC.
+        std::vector<::WireCell::Clus::Facade::Flash> flashes() const;
+
+        /// Resolve a flash by its globally-unique matched-flash gid, read from
+        /// the merge-safe "opflash" PC (gid/time/ch/pe, one row per
+        /// (flash, channel); written by QLMatching::write_opflash_pc and
+        /// concatenated across inputs by its root_pcs_to_merge).
+        ///
+        /// Why this exists.  The canonical "flash" PC is NOT merge-safe: the
+        /// multi-APA merge keeps only the PRIMARY input's list, so the "flash"
+        /// row index a cluster stores (Cluster::get_flash()) is meaningless for
+        /// clusters matched on any other input.  "opflash" survives the merge
+        /// intact and its gid is the same number QLMatching stamps on the
+        /// cluster as "matched_flash_gid", so this path resolves every matched
+        /// cluster, on every input.  See Cluster::get_matched_flash().
+        ///
+        /// Returns an invalid Flash (operator bool() == false) when gid < 0,
+        /// when there is no "opflash" PC, or when no row carries that gid.
+        ///
+        /// PRECONDITION -- gid uniqueness.  QLMatching builds
+        ///   gid = gid_side * 1000000 + index-into-this-input's-flash-list
+        /// with gid_side = the input's anode ident (SBND production), which is
+        /// unique across inputs.  A config setting `opflash_phys_gid` makes
+        /// gid_side the flash's PHYSICAL drift side instead, and two inputs
+        /// holding DIFFERENT flash lists can then emit the same gid.  This
+        /// method detects that (a channel appearing twice under one gid) and
+        /// returns an invalid Flash rather than a silently doubled PE sum.  Do
+        /// not enable a gid-resolving consumer on such a config until its gid
+        /// encoding has been checked.  (sbnd_xin/docs/99)
+        ::WireCell::Clus::Facade::Flash flash_by_gid(int gid) const;
         IChannel::vector get_plane_channels(const int apa, const int face, const WirePlaneLayer_t layer) const{return cache().map_plane_channels.at(apa).at(face).at(layer);}
         std::shared_ptr<const WireCell::IChannel> get_plane_channel_wind(const int apa, const int face, const WirePlaneLayer_t layer, const int wind) const{ return cache().map_plane_channels.at(apa).at(face).at(layer).at(wind);}
 
@@ -146,14 +288,71 @@ namespace WireCell::Clus::Facade {
         void set_detector_volumes(const IDetectorVolumes::pointer dv) { m_dv = dv; }
         // const IDetectorVolumes::pointer get_detector_volumes() const { return m_dv; }
 
+        /// doc pdvd/36: switch the two ctpc radius queries
+        /// (get_closest_points / has_closest_point, and through them every
+        /// good-point test and charge average on this grouping) from the
+        /// legacy isotropic Euclidean metric to the lattice-normalised one of
+        /// CtpcAnisoMetric.h: d^2 = dx^2 + (s*dy)^2 with s = min(1,
+        /// drift_step/pitch) per (apa, face, plane).  OFF (default) is the
+        /// legacy code path, statement for statement.  ON is the identity on
+        /// any plane whose pitch is finer than the drift step (SBND: 3.13 mm
+        /// step vs 3.00 mm pitch, s clamps to 1) and loosens only the pitch
+        /// axis elsewhere (PDVD U/V s = 0.387, W 0.581; PDHD ~0.67; uBooNE
+        /// 0.73 -- its 2.20 mm step is FINER than its 3.00 mm pitch, so it is
+        /// not the identity there and must stay OFF).  Set once per job by
+        /// MultiAlgBlobClustering::load_grouping from its "ctpc_aniso_metric"
+        /// config key, and carried to derived groupings by from().  It is a
+        /// grouping-wide property on purpose: every ctpc caller must see the
+        /// same metric, or the good-point tests, the connectors and the
+        /// charge averages disagree about what "within 0.6 cm" means.
+        void set_ctpc_aniso_metric(bool on) { m_ctpc_aniso_metric = on; }
+        bool ctpc_aniso_metric() const { return m_ctpc_aniso_metric; }
+
+        /// doc icarus/04 sec 8: a 3-D region with no data (ICARUS: the slab
+        /// |z| of a few cm where an anode's two faces meet and the Collection
+        /// plane records no charge).  A point inside it counts as dead on all
+        /// three planes in is_good_point / is_good_point_wc / test_good_point
+        /// and get_closest_dead_chs, and the path walkers treat an off-face
+        /// step inside it as dead instead of bad.  Unlike the W-wind dead gap
+        /// (in_dead_gap) it is geometric, so it works for any wire angle and
+        /// across the face boundary.  Set once per job by
+        /// MultiAlgBlobClustering::load_grouping from its "dead_region" config
+        /// key.  Null (default) = no region, every test is the legacy path.
+        void set_dead_region(IFiducial::pointer fid) { m_dead_region = fid; }
+        bool in_dead_region(const geo_point_t& point) const {
+            return m_dead_region && m_dead_region->contained(point);
+        }
+
         // Return a value representing the content of this grouping.
         size_t hash() const;
 
         std::set<WireCell::WirePlaneId> wpids() const { return cache().cluster_wpids; }
         std::set<WireCell::WirePlaneId> dv_wpids() const { return cache().dv_wpids; }
 
+        // icarus/docs/04 (G1): the (apa, face) a tagger falls back to for an
+        // uncontained vertex.  (0, 0) -- the legacy fallback -- whenever the
+        // detector volumes carry that face (uBooNE, SBND, PDHD, PDVD, ICARUS
+        // east), else the lowest (apa, face) they do carry (ICARUS west,
+        // anodes {2,3}, where the keyed lookups wire_angles(0,0) /
+        // get_drift_dir().at(0) would throw).  (0, 0) with no detector volumes.
+        std::pair<int, int> fallback_apa_face() const { return fallback_apa_face(cache().dv_wpids); }
+        static std::pair<int, int> fallback_apa_face(const std::set<WireCell::WirePlaneId>& ws) {
+            for (const auto& w : ws) {
+                if (w.apa() == 0 && w.face() == 0) return {0, 0};
+            }
+            if (ws.empty()) return {0, 0};
+            std::pair<int, int> best{ws.begin()->apa(), ws.begin()->face()};
+            for (const auto& w : ws) best = std::min(best, std::make_pair(w.apa(), w.face()));
+            return best;
+        }
+
         const std::map<int, mapfp_t<std::map<int, std::pair<double, double>>>>& all_dead_winds() const;
         std::map<int, std::pair<double, double>>& get_dead_winds(const int apa, const int face, const int pind) const;
+
+        /// @brief Mutable W-only "dead gap" registry for (apa, face): hand-declared
+        /// W winds whose full-vertical column is treated as dead on all planes.
+        /// Populated by PointTreeBuilding from inject_dead_winds entries flagged gap.
+        std::map<int, std::pair<double, double>>& get_dead_gap_winds(const int apa, const int face) const;
         
 
         using sv2d_t = Tree::ScopedView<float_t>;
@@ -169,17 +368,45 @@ namespace WireCell::Clus::Facade {
             return cache().pitch_mags;
         }
 
+        /// @param pitch_frac doc pdvd/32 round 3: per-plane floor on `radius`,
+        /// expressed as a fraction of that plane's wire pitch.  The ctpc is an
+        /// exact (drift-step x pitch) lattice (PointTreeBuilding.cxx:312,313),
+        /// so a radius below half a pitch cannot be satisfied for a whole band
+        /// of phases however much charge is present -- at PDVD's 0.765 cm U/V
+        /// pitch the shipped 0.2 cm spans 0.52 of a pitch and an interior
+        /// trajectory point passes only 17.5 % of the time, against 62.4 % at
+        /// SBND's 0.300 cm.  Applied as max(radius, pitch_frac*pitch[plane]),
+        /// so it can only ever LOOSEN a plane's test and is inert wherever the
+        /// pitch is fine enough (at 0.6: SBND/uBooNE 0.180 cm < 0.200 cm =>
+        /// byte-identical; PDHD 0.280 cm and PDVD 0.306/0.459 cm => loosened).
+        /// 0 (the default at every call site) => r == radius => no fastgeom
+        /// lookup and no behaviour change.
         bool is_good_point(const geo_point_t& point, const int apa, const int face, const double radius = 0.6 * units::cm, const int ch_range = 1,
-                           const int allowed_bad = 1) const;
+                           const int allowed_bad = 1, const double pitch_frac = 0.0) const;
         // In Facade_Grouping.h, inside the Grouping class declaration
         bool is_good_point_wc(const geo_point_t& point, const int apa, const int face, const double radius = 0.6 * units::cm, 
                             const int ch_range = 1, const int allowed_bad = 1) const;
         // In the Grouping class declaration in Facade_Grouping.h
         std::vector<int> test_good_point(const geo_point_t& point, const int apa, const int face, 
                                 double radius = 0.6 * units::cm, int ch_range = 1) const;
+        /// Allocation-free form of the above: fills a caller-owned [6] instead of
+        /// returning a freshly heap-allocated 6-element vector.  The per-pair 1 cm
+        /// path walks in connect_graph_relaxed{,_strict} call this once per step,
+        /// millions of times per busy cluster, and each of those was an
+        /// allocate-fill-move-free round trip for 24 bytes.  Same computation, same
+        /// values, same order; the vector form below now delegates to it, so the two
+        /// cannot drift.
+        void test_good_point(const geo_point_t& point, const int apa, const int face,
+                             int (&num_planes)[6],
+                             double radius = 0.6 * units::cm, int ch_range = 1) const;
 
 
-        /// @brief
+        /// @brief All ctpc points of one plane within `radius` of `point`
+        /// (the point is projected to the plane's (x, y) lattice first).
+        /// Pairs of (flat index into the plane's ctpc, SQUARED isotropic
+        /// distance).  With ctpc_aniso_metric() on, membership is decided by
+        /// the lattice-normalised ellipse of CtpcAnisoMetric.h instead of the
+        /// circle; the distances stay isotropic (physical length squared).
         /// @param point
         /// @param radius
         /// @param face
@@ -187,11 +414,30 @@ namespace WireCell::Clus::Facade {
         /// @return
         kd_results_t get_closest_points(const geo_point_t& point, const double radius, const int apa, const int face, int pind) const;
 
+        /// @brief Existence-only form of get_closest_points: true iff at least one ctpc
+        /// point for this plane lies within `radius` of `point`.  Uses a single
+        /// nearest-neighbour (knn=1) query instead of collecting every in-radius point, for
+        /// the callers (good-point tests) that only need `size() > 0`.  Matches
+        /// get_closest_points(...).size() > 0 exactly (same projection; nanoflann's radius
+        /// search keeps points with dist < radius^2, so the same strict comparison is used).
+        /// With ctpc_aniso_metric() on it answers the same ellipse as
+        /// get_closest_points, exactly (CtpcAnisoMetric.h).
+        bool has_closest_point(const geo_point_t& point, const double radius, const int apa, const int face, int pind) const;
+
         /// @brief true if the point is within the dead region, [wind+ch_range, wind-ch_range] and [xmin, xmax]
         bool get_closest_dead_chs(const geo_point_t& point, const int ch_range, const int apa , const int face, int pind) const;
 
+        /// @brief true if the point's W projection falls in a hand-declared dead-gap
+        /// W wind (within ch_range, x in window).  A dead W wind spans the full
+        /// vertical column, so this flags the whole gap (all three planes treated as
+        /// dead).  Always false when the gap registry is empty (default).
+        bool in_dead_gap(const geo_point_t& point, const int ch_range, const int apa, const int face) const;
+
         /// @brief convert_3Dpoint_time_ch
         std::tuple<int, int> convert_3Dpoint_time_ch(const geo_point_t& point, const int apa, const int face, const int pind) const;
+        /// @brief doc pdvd/101: the UNROUNDED wire coordinate convert_3Dpoint_time_ch
+        /// rounds (wire k's centre at k).  std::round of it is exactly that wind.
+        double convert_3Dpoint_wire_cont(const geo_point_t& point, const int apa, const int face, const int pind) const;
         // In class Grouping definition
         /// @param wire  local wire index within the plane (NOT global channel number)
         std::pair<double,double> convert_time_wire_2Dpoint(const int timeslice, const int wire, const int apa, const int face, const int plane) const;
@@ -228,8 +474,16 @@ namespace WireCell::Clus::Facade {
             const int face, const int pind) const;
 
         // Get wire charge and uncertainty for specific wire/time
-        std::pair<double, double> get_wire_charge(int apa, int face, int plane, 
+        std::pair<double, double> get_wire_charge(int apa, int face, int plane,
                                                 int wire_index, int time_slice) const;
+
+        // Read-only view of the cached charge row for one (apa, face, plane,
+        // time_slice): wire_index -> (charge, uncertainty), or nullptr when
+        // the slice has no data.  The same data get_wire_charge() consults,
+        // exposed so per-blob wire loops can hoist the per-wire
+        // cache()/find(time_slice) chain (doc 54 round 2).
+        const std::unordered_map<int, std::pair<double, double>>*
+        wire_charge_row(int apa, int face, int plane, int time_slice) const;
         
         // Check if a wire is dead at a specific time
         bool is_wire_dead(int apa, int face, int plane, 
@@ -254,12 +508,34 @@ namespace WireCell::Clus::Facade {
         std::shared_ptr<WireCell::Clus::TrackFitting> get_track_fitting() const { return m_track_fitting; }
         void set_track_fitting(std::shared_ptr<WireCell::Clus::TrackFitting> tf) { m_track_fitting = tf; }
 
+        // Named TrackFitting slots so several taggers can each persist their own
+        // fitter without colliding with the unnamed slot the neutrino-PR chain
+        // uses (e.g. TaggerCheckSTM save_stm_fit stores under "stm" for
+        // SbndMagnifyTrackingVisitor).  Unknown name returns nullptr.
+        std::shared_ptr<WireCell::Clus::TrackFitting> get_track_fitting(const std::string& name) const {
+            auto it = m_named_track_fitting.find(name);
+            return it == m_named_track_fitting.end() ? nullptr : it->second;
+        }
+        void set_track_fitting(const std::string& name, std::shared_ptr<WireCell::Clus::TrackFitting> tf) {
+            m_named_track_fitting[name] = tf;
+        }
+
         // Convenience accessor for PRGraph (delegates to TrackFitting)
         std::shared_ptr<WireCell::Clus::PR::Graph> get_pr_graph() const;
+
+        // sbnd_xin/docs/109: TaggerCheckNeutrino's selection census (per-bundle
+        // reasons, event counters, the flash table), carried to the ROOT
+        // writers the same way the TrackFitting is.  Null unless
+        // TaggerCheckNeutrino's nu_provenance knob is on.  Not a PC array, so
+        // it is never serialized.
+        std::shared_ptr<const WireCell::Clus::PR::NuBundleCensus> get_nu_census() const { return m_nu_census; }
+        void set_nu_census(std::shared_ptr<const WireCell::Clus::PR::NuBundleCensus> c) { m_nu_census = c; }
 
       private:
         FiducialUtilsPtr m_fiducialutils;
         std::shared_ptr<WireCell::Clus::TrackFitting> m_track_fitting;
+        std::map<std::string, std::shared_ptr<WireCell::Clus::TrackFitting>> m_named_track_fitting;
+        std::shared_ptr<const WireCell::Clus::PR::NuBundleCensus> m_nu_census;
 
         // Build cache for a specific APA/face/plane
         void build_wire_cache(int apa, int face, int plane) const;

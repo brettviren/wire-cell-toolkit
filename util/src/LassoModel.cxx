@@ -4,6 +4,7 @@
 
 using namespace Eigen;
 
+#include <algorithm>
 #include <iostream>
 using namespace std;
 
@@ -28,6 +29,16 @@ void WireCell::LassoModel::Set_init_values(std::vector<double> values)
     }
 }
 
+void WireCell::LassoModel::SetXsparse(const Eigen::SparseMatrix<double>& X)
+{
+    // Mirror ElasticNetModel::SetX (reset beta + unit lambda weights) but store the
+    // response sparsely; the caller may override the weights afterwards.
+    _Xsp = X;
+    _use_sparse = true;
+    _beta = Eigen::VectorXd::Zero(X.cols());
+    SetLambdaWeight(Eigen::VectorXd::Constant(X.cols(), 1.));
+}
+
 std::vector<size_t> WireCell::LassoModel::Fit()
 {
     std::vector<size_t> below_threshold;
@@ -35,7 +46,7 @@ std::vector<size_t> WireCell::LassoModel::Fit()
     // initialize solution to zero unless user set beta already
     Eigen::VectorXd beta = _beta;
     if (0 == beta.size()) {
-        beta = VectorXd::Zero(_X.cols());
+        beta = VectorXd::Zero(_use_sparse ? _Xsp.cols() : _X.cols());
     }
 
     // initialize active_beta to true
@@ -43,11 +54,31 @@ std::vector<size_t> WireCell::LassoModel::Fit()
     _active_beta = vector<bool>(nbeta, true);
 
     Eigen::VectorXd y = Gety();
-    Eigen::MatrixXd X = GetX();
+
+    // Build the per-column norm, the X^T y vector (ydX) and the X^T X Gram (XdX) the
+    // coordinate descent needs.  Two paths, identical up to FP accumulation order: the
+    // historical DENSE path over _X (kept verbatim below), and a SPARSE path over _Xsp
+    // that forms ydX/XdX by sparse products -- skipping the ~98% zero work on a block-
+    // sparse response (QLMatching sparse_lasso) and never densifying X.
+    double tol2 = TOL * TOL * nbeta;
+    VectorXd norm(nbeta);
+    Eigen::VectorXd ydX(nbeta);
+    Eigen::SparseMatrix<double> XdX(nbeta, nbeta);
+
+    if (_use_sparse) {
+        const Eigen::SparseMatrix<double>& X = _Xsp;
+        for (int j = 0; j < nbeta; j++) {
+            norm(j) = X.col(j).squaredNorm();
+            if (norm(j) < 1e-6) { below_threshold.push_back(j); norm(j) = 1; }
+        }
+        ydX = X.transpose() * y;   // X^T y  (== y.dot(X.col(i)) per row, sparsely)
+        XdX = X.transpose() * X;   // X^T X  (skips the ~98% zero dot-products)
+    }
+    else {
+    const Eigen::MatrixXd& X = GetX();   // reference, not a copy of the (GB-scale) Gram
 
     // cooridate decsent
     // int N = y.size();
-    VectorXd norm(nbeta);
     for (int j = 0; j < nbeta; j++) {
         norm(j) = X.col(j).squaredNorm();
         if (norm(j) < 1e-6) {
@@ -56,13 +87,10 @@ std::vector<size_t> WireCell::LassoModel::Fit()
             norm(j) = 1;
         }
     }
-    double tol2 = TOL * TOL * nbeta;
 
     // const double inner_product_complexity = nbeta * nbeta * X.rows();
 
     // calculate the inner product
-    Eigen::VectorXd ydX(nbeta);
-    Eigen::SparseMatrix<double> XdX(nbeta, nbeta);
     // std::cout << "Lasso begin inner product nbeta "  << nbeta << " X.rows " << X.rows() << " X.cols " << X.cols() << std::endl;
     // double sum_non_zeros = 0;
 
@@ -83,27 +111,134 @@ std::vector<size_t> WireCell::LassoModel::Fit()
 
     // triplet
     {
-        // std::cout << " triplet method " << std::endl;
-        const size_t estimated_nonzeros = nbeta * (nbeta / 2);
-        XdX.reserve(Eigen::VectorXi::Constant(nbeta, nbeta/2));
+        // Right-size the XdX / triplet reservations to the actual sparsity of X.
+        // XdX = X^T X.  For a DENSE X (e.g. the imaging CSGraph response) it is ~dense,
+        // so keep the historical nbeta-scale reservations (no growth reallocs at the
+        // hd-max sizes the author tuned for).  For a block-sparse X (the QL normal-
+        // equations Gram, ~2% full) the nbeta^2 triplet reserve and the nbeta/2-per-
+        // column XdX reserve over-allocate by >10x (multiple GB on run 29107 evt 1015);
+        // detect that case and reserve a small seed, letting both grow (amortized;
+        // transient peak << nbeta^2).  Capacity only -> the assembled XdX, and the fit,
+        // are byte-identical either way.  size_t: int nbeta*nbeta overflows beyond 46340.
+        size_t xnnz = 0;
+        std::vector<std::vector<int>> col_rows(nbeta);
+        for (int c = 0; c < nbeta; ++c)
+            for (int r = 0; r < X.rows(); ++r)
+                if (X(r, c) != 0.0) { ++xnnz; col_rows[c].push_back(r); }
+        const size_t nb2 = size_t(nbeta) * size_t(nbeta);
+        const bool dense_X = (xnnz * 2 > nb2);
+        // Row -> columns adjacency of the nonzero pattern, for the support-overlap
+        // pair enumeration below (sparse X only).
+        std::vector<std::vector<int>> row_cols;
+        if (!dense_X) {
+            row_cols.assign(X.rows(), {});
+            for (int c = 0; c < nbeta; ++c)
+                for (int r : col_rows[c]) row_cols[r].push_back(c);
+        }
+        const long col_reserve =
+            dense_X ? (long)(nbeta / 2)
+                    : std::max(8L, std::min((long)nbeta, (long)(4 * xnnz / std::max(nbeta, 1))));
+        if (dense_X) XdX.reserve(Eigen::VectorXi::Constant(nbeta, (int)col_reserve));   // sparse X: sized exactly below
         typedef Eigen::Triplet<double> T;
         std::vector<T> tripletList;
-        tripletList.reserve(estimated_nonzeros);
-        for (int i = 0; i < nbeta; i++) {
-            ydX(i) = y.dot(X.col(i));
-            for (int j = 0; j < nbeta; j++) {
-                double value = X.col(i).dot(X.col(j));
-                if (value != 0)
-                    tripletList.push_back(T(i,j,value));
-                // sum_non_zeros += value;
+        // Worst case (dense X) is nbeta diagonal + 2 mirrored per off-diagonal pair =
+        // nbeta^2 triplets; for sparse X size to ~2 per XdX nonzero (mirrored).
+        if (dense_X) tripletList.reserve(nb2);   // sparse X: no triplets (see below)
+        // XdX is symmetric and dot() is element-wise commutative (identical
+        // multiply/accumulate sequence under operand swap), so compute each
+        // off-diagonal dot once and mirror it -- bit-identical to the full
+        // i,j loop at half the cost.  No duplicate triplets are produced, so
+        // setFromTriplets() yields the same matrix regardless of list order.
+        // For a sparse X, only column pairs with overlapping row support can have a
+        // nonzero dot: a non-overlapping pair's dense dot sums only exact-zero
+        // products (+-0.0), which the legacy `value != 0` guard already dropped.  So
+        // enumerate the overlapping j > i via the row->cols adjacency and run the
+        // UNCHANGED dense dot on just those pairs -- identical triplets, identical
+        // XdX, at a fraction of the nbeta^2 * nrows cost (the dominant hd-max
+        // imaging term).  Dense X keeps the plain double loop.
+        if (dense_X) {
+            for (int i = 0; i < nbeta; i++) {
+                ydX(i) = y.dot(X.col(i));
+                {
+                    double value = X.col(i).dot(X.col(i));
+                    if (value != 0)
+                        tripletList.push_back(T(i,i,value));
+                }
+                for (int j = i + 1; j < nbeta; j++) {
+                    double value = X.col(i).dot(X.col(j));
+                    if (value != 0) {
+                        tripletList.push_back(T(i,j,value));
+                        tripletList.push_back(T(j,i,value));
+                    }
+                }
             }
-            // if ( nbeta == 5582) {
-            //     std::cout << " inner_product nbeta == 5582 " << i << std::endl;
-            // }
+            XdX.setFromTriplets(tripletList.begin(), tripletList.end());
         }
-        XdX.setFromTriplets(tripletList.begin(), tripletList.end());
+        else {
+            // Sparse X: assemble XdX directly in compressed-column order instead of
+            // triplets + setFromTriplets() + a copy.  The support-overlap enumeration
+            // below emits, for each i in ascending order, the diagonal (i,i) and then the
+            // pairs (i,j), j > i ascending.  Scattered as (row i, col j) and (row j, col
+            // i), every column therefore receives its rows in ascending order: rows i < c
+            // from the earlier outer iterations, then c, then j > c from its own sorted
+            // list -- exactly the row-sorted, duplicate-free matrix setFromTriplets()
+            // built, entry for entry and double for double, so the coordinate-descent
+            // sweep reads the same (row, value) sequence per column.  Byte-identical fit;
+            // no triplet list, no transposed temporary, no sort inside Eigen.  On the
+            // FD-HD 4-wire sub-blob tier (components of ~13 k blobs x 12 measures, a
+            // near-dense Gram) the assembly was 27 % of the imaging job and a 3.3 GB
+            // transient (wcp-porting-img/wcfm/docs/08 sec 3, 2026-09-25).
+            struct pair_t { int i, j; double v; };
+            std::vector<pair_t> pairs;
+            pairs.reserve((size_t)nbeta * (size_t)col_reserve);
+            std::vector<double> diag(nbeta, 0.0);
+            std::vector<char> hasdiag(nbeta, 0);
+            Eigen::VectorXi colcount = Eigen::VectorXi::Zero(nbeta);
+            std::vector<int> jstamp(nbeta, -1);
+            std::vector<int> jlist;
+            for (int i = 0; i < nbeta; i++) {
+                ydX(i) = y.dot(X.col(i));
+                {
+                    double value = X.col(i).dot(X.col(i));
+                    if (value != 0) {
+                        diag[i] = value;
+                        hasdiag[i] = 1;
+                        ++colcount(i);
+                    }
+                }
+                jlist.clear();
+                for (int r : col_rows[i])
+                    for (int j : row_cols[r])
+                        if (j > i && jstamp[j] != i) { jstamp[j] = i; jlist.push_back(j); }
+                std::sort(jlist.begin(), jlist.end());
+                for (int j : jlist) {
+                    double value = X.col(i).dot(X.col(j));
+                    if (value != 0) {
+                        pairs.push_back({i, j, value});
+                        ++colcount(i);
+                        ++colcount(j);
+                    }
+                }
+            }
+            XdX.resize(nbeta, nbeta);
+            XdX.reserve(colcount);      // uncompressed mode, exact per-column capacity
+            size_t ip = 0;
+            const size_t npairs = pairs.size();
+            for (int i = 0; i < nbeta; i++) {
+                if (hasdiag[i]) {
+                    XdX.insertBackUncompressed(i, i) = diag[i];
+                }
+                for (; ip < npairs && pairs[ip].i == i; ++ip) {
+                    const auto& p = pairs[ip];
+                    XdX.insertBackUncompressed(i, p.j) = p.v;   // row i in column j
+                    XdX.insertBackUncompressed(p.j, i) = p.v;   // row j in column i
+                }
+            }
+            XdX.makeCompressed();
+        }
     }
-    // std::cout << "Lasso end inner product. sum_non_zeros " << sum_non_zeros << " XdX.nonZeros() " << XdX.nonZeros() 
+    }  // end dense Gram build (the sparse path is handled above)
+    // std::cout << "Lasso end inner product. sum_non_zeros " << sum_non_zeros << " XdX.nonZeros() " << XdX.nonZeros()
     //           << " XdX.rows() " << XdX.rows() << " XdX.cols() " << XdX.cols() << std::endl;
 
     // start interation ...
@@ -119,8 +254,16 @@ std::vector<size_t> WireCell::LassoModel::Fit()
             }
             beta(j) = ydX(j);
             for (SparseMatrix<double>::InnerIterator it(XdX, j); it; ++it) {
-                // if (it.row()!=j && beta(it.row())!=0)
-                if (it.row() != j) beta(j) -= it.value() * beta(it.row());
+                // Skip exact-zero betas: their term is (value * +-0.0) = +-0.0 and
+                // "x -= +-0.0" is a bitwise no-op for every x that is not itself -0.0
+                // (zero betas here are always +0.0: VectorXd::Zero init or the literal-0
+                // soft-threshold return).  After the first sweeps most betas are exactly
+                // 0 (LASSO support is sparse), so this skips the bulk of the
+                // multiply-subtract work in the dominant coordinate-descent loop with a
+                // bit-identical result.  (This guard was present in the original
+                // prototype as a comment.)
+                const double br = beta(it.row());
+                if (it.row() != j && br != 0.0) beta(j) -= it.value() * br;
             }
             beta(j) = _soft_thresholding(beta(j) / norm(j), lambda * lambda_weight(j));
 

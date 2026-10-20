@@ -1,0 +1,895 @@
+local wc = import "wirecell.jsonnet";
+local g = import "pgraph.jsonnet";
+local f = import 'pgrapher/common/funcs.jsonnet';
+local clus = import "pgrapher/common/clus.jsonnet";
+
+
+// Top-level function: parameters overridable by the importing entry point.
+//   output_dir: directory for mabc-*.zip and trash-*.tar.gz ('' = ./data)
+//   time_offset: event-T0 / readout-tick0 compensation applied by the live
+//     BlobSampler when converting slice time to drift x
+//     (x = xorig + dirx*(t_slice + time_offset)*drift_speed) and recorded in
+//     the DetectorVolumes metadata used by T0Correction (x_t0cor scope).
+//     Readout tick0 sits at -250us relative to the trigger, so -250us would
+//     place trigger-time activity at its true x -- but PDHD has no per-event
+//     T0 determination, so the default is 0 (250us = 40cm at 1.6 mm/us): no
+//     activity maps behind the anode and the points stay consistent with the
+//     (offset-free) imaging frame.  Restore a real value once a T0
+//     measurement exists.
+//   trigger_offset: per-event readout-vs-trigger offset (the opflash metadata
+//     offset_us, ~250us) applied DOWNSTREAM rather than baked into x_raw -- with
+//     time_offset=0 here the raw imaging x stays offset-free, and T0Correction
+//     (x_t0cor scope) adds (cluster_t0 + trigger_offset) so the flash-matched
+//     charge lands on the trigger time base.  QLMatching folds the same value into
+//     its matching geometry.  Default 0 => x_t0cor unchanged (bit-identical).
+function (output_dir='', runNo=1, subRunNo=1, eventNo=1,
+          time_offset=0 * wc.us, trigger_offset=0 * wc.us)
+
+// Calibrated from PDHD data.  1.565 = anode->cathode crossing-track x-span midpoint
+// [~1.55 over-merge, ~1.57 truncation]; 1.585 = first cathode-end pass on two evt-983
+// crossers.  n=4 evt-983 crossers then showed 1.585 over-shoots the cathode (3 of 4
+// ends +0.9..+2.9 cm past it); the four ends hold a fixed ~3.5 cm spread (irreducible
+// t0/velocity/SCE residual), so v only slides the centroid.  1.576 puts the most-
+// overshooting crosser just INSIDE the cathode (clus62 +0.84 cm), so the QLMatching
+// cathode_ext1 containment edge reverts to ~the C++ default (1.5 cm) and the undershoot
+// residual lands on the benign flag window (cathode_ext2 -2.0->-3.0).  MUST match
+// params.lar.drift_speed (QLMatching + img dump read that).  See pdhd/docs/clustering-algorithm.md.
+local drift_speed = 1.576 * wc.mm / wc.us;
+
+local initial_index = "0";
+local index = std.parseInt(initial_index);
+
+
+local common_coords = ["x", "y", "z"];
+local common_corr_coords = ["x_t0cor", "y", "z"];
+
+// Drift-side groups: x-aligned APAs viewed through a COMMON face, i.e. one
+// drift volume: APA0+APA2 face0 (drift -x) and APA1+APA3 face1 (drift +x).
+// These define both the stage-3 per-drift-group clustering scope
+// (clus_per_group) and the Bee display groups (clustering points + dead-area
+// output in the all-TPC dump), so each pair shows as a single Bee instance.
+// The opposite-face groups (APA0+APA2 face1, APA1+APA3 face0) are PDHD wall
+// faces that do not image, so they carry no data and are not wired.
+local apa_drift_groups = [
+    { name: "group02", apas: [0, 2], face: 0 },
+    { name: "group13", apas: [1, 3], face: 1 },
+];
+
+
+local dvm = {
+    overall: {
+        FV_xmin: -3579.85 * wc.mm,
+        FV_xmax: 3579.85 * wc.mm,
+        FV_ymin: 226.1 * wc.mm,    // active 76.1 mm + 15 cm inset (see clus/docs/clustering-separate-fv.md)
+        FV_ymax: 5910.0 * wc.mm,   // active 6060.0 mm - 15 cm inset
+        FV_zmin: 152.34345 * wc.mm, // active 2.34345 mm + 15 cm inset
+        FV_zmax: 4472.97 * wc.mm,  // active 4622.97 mm - 15 cm inset
+        FV_xmin_margin: 2 * wc.cm,
+        FV_xmax_margin: 2 * wc.cm,
+        FV_ymin_margin: 2.5 * wc.cm,
+        FV_ymax_margin: 2.5 * wc.cm,
+        FV_zmin_margin: 3 * wc.cm,
+        FV_zmax_margin: 3 * wc.cm,
+        vertical_dir: [0,1,0],
+        beam_dir: [0,0,1]
+    },
+    a0f0pA: {
+        drift_speed: drift_speed,
+        tick: 0.5 * wc.us,  // 0.5 mm per tick
+        tick_drift: self.drift_speed * self.tick,
+        time_offset: time_offset,
+        trigger_offset: trigger_offset,
+        nticks_live_slice: 4,
+        FV_xmin: -3579.85 * wc.mm,
+        FV_xmax: -25.4 * wc.mm,
+        FV_xmin_margin: 2 * wc.cm,
+        FV_xmax_margin: 2 * wc.cm,
+    },
+    a0f1pA: $.a0f0pA + {
+        FV_xmin: -3579.85 * wc.mm,
+        FV_xmax: -3579.85 * wc.mm,
+    },
+    a1f0pA: $.a0f0pA + {
+        FV_xmin: 3579.85 * wc.mm,
+        FV_xmax: 3579.85 * wc.mm,
+    },
+    a1f1pA: $.a0f0pA + {
+        FV_xmin: 25.4 * wc.mm,
+        FV_xmax: 3579.85 * wc.mm,
+    },
+    a2f0pA: $.a0f0pA,
+    a2f1pA: $.a0f1pA,
+    a3f0pA: $.a1f0pA,
+    a3f1pA: $.a1f1pA,
+};
+
+local anodes_name(anodes, face="") =
+    std.join("-", [std.toString(a.data.ident) for a in anodes]) + if face == "" then "" else "-" + std.toString(face);
+
+
+// The face argument scopes the NAME only (e.g. dv-apa0-2-0 = the {APA0,APA2}
+// face-0 drift volume).  The metadata always carries BOTH faces of every
+// anode: Grouping::fill_dv_cache reads the drift parameters (time_offset,
+// drift_speed, tick, nticks_live_slice) for every geometry face of the
+// configured anodes, so dropping the off-scope face's entry would silently
+// zero those cache values.  The off-scope entries are inert for clustering
+// decisions -- no data wpid carries them, and examine_x_boundary enforces
+// same-face/aligned-x on the wpids actually present.
+local detector_volumes(anodes, face="") = {
+    "type": "DetectorVolumes",
+    "name": "dv-apa" + anodes_name(anodes, face),
+    "data": {
+        "anodes": [wc.tn(anode) for anode in anodes],
+        metadata:
+            {overall: dvm["overall"]} +
+            {
+                [ "a" + std.toString(a.data.ident) + "f0pA" ]:
+                    dvm[ "a" + std.toString(a.data.ident) + "f0pA" ]
+                for a in anodes
+            } +
+            {
+                [ "a" + std.toString(a.data.ident) + "f1pA" ]:
+                    dvm[ "a" + std.toString(a.data.ident) + "f1pA" ]
+                for a in anodes
+            }
+    },
+    uses: anodes
+};
+
+
+local pctransforms(dv) = {
+    type: "PCTransformSet",
+    name: dv.name,
+    data: { detector_volumes: wc.tn(dv) },
+    uses: [dv]
+};
+
+
+
+local bs_live_face(apa, face, wrapped_channel_charge=true, half_pitch=false, min_step_size=null,
+                   strategy_name='stepped', wire_product=null, charge_threshold=null) = {
+    assert strategy_name == 'stepped' || strategy_name == 'charge_stepped' :
+        "bs_live_face: strategy_name must be 'stepped' or 'charge_stepped'",
+    type: "BlobSampler",
+    name: "live-%s-%d"%[apa, face],
+    data: {
+        drift_speed: drift_speed,
+        time_offset: time_offset,
+        // doc pdvd/101: half_pitch (C++ Stepped default false) adds the half-pitch
+        // crossings; min_step_size (C++ default 3 wires) is the stepped spacing.
+        // Passed only by the PR job's retile samplers (live_sampler).  Both at
+        // their defaults => the legacy string form => byte-identical config.
+        // doc pdvd/102: strategy_name 'charge_stepped' selects the port of the
+        // prototype's RETILE sampler, WCPPID::calc_sampling_points(...,
+        // disable_mix_dead_cell=false) (prototype ImprovePR3DCluster.cxx:59,
+        // CalcPoints.cxx:75-160): every wire of the min/max views when
+        // N_max*N_min <= max_wire_product_threshold (C++ 2500), stepped wires
+        // otherwise, non-stepped wires kept only above charge_threshold_* (C++
+        // 4000).  The toolkit Stepped strategy is the 2dtoy variant with no
+        // all-wire rule.  wire_product / charge_threshold null => the C++
+        // defaults.  Default 'stepped' => this branch is never taken =>
+        // byte-identical compiled config.
+        strategy: if strategy_name == 'charge_stepped' then
+            [{name: "charge_stepped",
+              disable_mix_dead_cell: false,
+              [if min_step_size != null then 'min_step_size']: min_step_size,
+              [if wire_product != null then 'max_wire_product_threshold']: wire_product,
+              [if charge_threshold != null then 'charge_threshold_max']: charge_threshold,
+              [if charge_threshold != null then 'charge_threshold_min']: charge_threshold,
+              [if charge_threshold != null then 'charge_threshold_other']: charge_threshold}]
+        else if half_pitch || min_step_size != null then
+            [{name: "stepped",
+              [if half_pitch then 'half_pitch']: true,
+              [if min_step_size != null then 'min_step_size']: min_step_size}]
+        else ["stepped"],
+        extra: [".*wire_index", ".*charge_val", ".*charge_unc", "wpid"],
+        // wrapped_channel_charge: read a sampled point's induction charge by
+        // channel IDENT when its wire is a wrapped strip's continuation.  PDHD
+        // APAs WRAP their induction planes: each (anode, face, U or V) plane
+        // holds 1148 wires on only 800 channels -- 400 segment-0, 400
+        // segment-1, 348 segment-2 (protodunehd-wires-larsoft-v1), i.e. 65 % of
+        // the wires on an imaging face are continuations.  IWirePlane::channels()
+        // omits them (AnodePlane.cxx:244-247), so the legacy operator[] lookup
+        // reads the wrong channel and can leave charge_val AND charge_unc at 0,
+        // which calc_charge_wcp reads as "no signal".  This is the same defect
+        // doc pdvd/31 round 3 fixed on PDVD (which wraps 11.3 %).
+        // ON since 2026-09-06 (doc pdhd/04 sec 8-9, owner decision).  THIS is the
+        // sampler that writes the PERSISTED pctree, so it is the one the cosmic
+        // taggers' per-point charge comes from: with it off, is_point_good threw
+        // away 29 % of every cluster's points on 029107/12 and a 790 cm
+        // through-going muon read TGM=false.  The PR job's same-named knob (true
+        // since 2026-09-05) feeds only ImproveCluster_2's retiler, whose cloud is
+        // discarded -- fixing that one did NOT fix this one.
+        // NOT byte-identical: it changes clustering AND Q/L output.
+        // BUG FIX, C++ DEFAULT TRUE since 2026-09-06 (doc pdhd/04 sec 9, owner
+        // decision).  Emitted UNCONDITIONALLY: with a true C++ default the old
+        // key-suppression idiom `[if x then 'x']: true` would make `false`
+        // unreachable, so an explicit false must reach the compiled config.
+        wrapped_channel_charge: wrapped_channel_charge,
+    }
+};
+local bs_dead_face(apa, face) = {
+    type: "BlobSampler",
+    name: "dead-%s-%d"%[apa, face],
+    data: {
+        strategy: ["center"],
+        extra: [".*"] // want all the extra
+    }
+};
+// The factory used to give blob samplers to ClusteringRetile ("rt").
+local bs_rt_face = bs_live_face;
+
+
+local clus_per_face (
+    anode,
+    face,
+    dump = true,
+    bee_dir = "data",
+    runNo = 1,
+    subRunNo = 1,
+    eventNo = 1,
+    // Wrapped-plane induction charge for the SAMPLED points (doc
+    // pdhd/stm-tagger-chain.md sec 12).  C++ default false; key omitted when
+    // off => byte-identical compiled config.  DEFAULT FALSE: turning it on
+    // changes the pctree the Q/L job writes, hence production Q/L output.
+    wrapped_channel_charge = true,
+    ) =
+{
+
+    local dv = detector_volumes([anode], face),
+    local pcts = pctransforms(dv),
+
+
+    local cluster_scope_filter_live = g.pnode({
+        type: "ClusterScopeFilter",
+        name: "csf-live-%s-%d"%[anode.name, face],
+        data: {
+            face_index: face,
+        }
+    }, nin=1, nout=1, uses=[]),
+
+    local cluster_scope_filter_dead = g.pnode({
+        type: "ClusterScopeFilter",
+        name: "csf-dead-%s-%d"%[anode.name, face],
+        data: {
+            face_index: face,
+        }
+    }, nin=1, nout=1, uses=[]),
+
+    local bsl = bs_live_face(anode.name, face, wrapped_channel_charge=wrapped_channel_charge),
+    local bsd = bs_dead_face(anode.name, face),
+
+    local ptb = g.pnode({
+        type: "PointTreeBuilding",
+        name: "%s-%d"%[anode.name, face],
+        data:  {
+            samplers: {
+                "3d": wc.tn(bsl),
+                "dead": wc.tn(bsd),
+            },
+            multiplicity: 2,
+            tags: ["live", "dead"],
+            anode: wc.tn(anode),
+            face: face,
+            detector_volumes: wc.tn(dv),
+        }
+    }, nin=2, nout=1, uses=[bsl, bsd, dv]),
+
+    local cluster2pct = g.intern(
+        innodes = [cluster_scope_filter_live, cluster_scope_filter_dead],
+        centernodes = [],
+        outnodes = [ptb],
+        edges = [
+            g.edge(cluster_scope_filter_live, ptb, 0, 0),
+            g.edge(cluster_scope_filter_dead, ptb, 0, 1)
+        ]
+    ),
+    // local cluster2pct = ptb,
+
+    local face_name = "%s-%d"%[anode.name, face],
+
+    local cm = clus.clustering_methods(prefix=face_name,
+                                       detector_volumes=dv,
+                                       pc_transforms=pcts,
+                                       coords=common_coords),
+    local cm_pipeline = [
+        cm.pointed(),
+        // cm.ctpointcloud(),
+        cm.live_dead(dead_live_overlap_offset=2),
+        cm.extend(flag=4, length_cut=60*wc.cm, num_try=0, length_2_cut=15*wc.cm, num_dead_try=1),
+        cm.regular(name="-one", length_cut=60*wc.cm, flag_enable_extend=false),
+        cm.regular(name="_two", length_cut=30*wc.cm, flag_enable_extend=true),
+        cm.parallel_prolong(length_cut=35*wc.cm),
+        cm.close(length_cut=1.2*wc.cm),
+        cm.extend_loop(num_try=3),
+        // separate moved to the per-drift-group stage (stage 3)
+        cm.connect1(),
+        // cm.isolated(),
+        // cm.retile(cut_time_low=3*wc.us, cut_time_high=5*wc.us, anodes=[anode], samplers=[clus.sampler(bsl, apa=anode.data.ident, face=face)]),
+    ],
+
+    local mabc = g.pnode({
+        local name = "%s-%d"%[anode.name, face],
+        type: "MultiAlgBlobClustering",
+        name: name,
+        data:  {
+            inpath: "pointtrees/%d",
+            outpath: "pointtrees/%d",
+            // grouping2file_prefix: "grouping%s-%d"%[anode.name, face],
+            perf: true,
+            bee_dir: bee_dir, // "data/0/0", // not used
+            bee_zip: "%s/mabc-%s-face%d.zip"%[bee_dir, anode.name, face],
+            bee_detector: "protodunehd",
+            initial_index: index,   // New RSE configuration
+            use_config_rse: true,  // Enable use of configured RSE
+            runNo: runNo,
+            subRunNo: subRunNo,
+            eventNo: eventNo,
+            save_deadarea: true,
+            dead_area_version: 2,  // v2 wrapper (tpc=apa) so the dead slab lands on the correct PD anode face
+            anodes: [wc.tn(anode)],
+            face: face,
+            detector_volumes: wc.tn(dv),
+            bee_points_sets: [  // New configuration for multiple bee points sets
+                {
+                    name: "clustering",         // Name of the bee points set
+                    detector: "protodunehd",         // Detector name
+                    algorithm: "clustering",    // Algorithm identifier
+                    pcname: "3d",           // Which scope to use
+                    coords: ["x", "y", "z"],    // Coordinates to use
+                    individual: true            // Output individual APA/Face
+                }
+            ],
+            pipeline: wc.tns(cm_pipeline),
+        }
+    }, nin=1, nout=1, uses=[dv, anode, pcts]+cm_pipeline),
+
+    local sink = g.pnode({
+        type: "TensorFileSink",
+        name: "clus_per_face-%s-%d"%[anode.name, face],
+        data: {
+            outname: "%s/trash-%s-face%d.tar.gz"%[bee_dir, anode.name, face],
+            prefix: "clustering_", // json, numpy, dummy
+            dump_mode: true,
+        }
+    }, nin=1, nout=0),
+
+    local end = if dump
+    then g.pipeline([mabc, sink])
+    else g.pipeline([mabc]),
+
+    ret :: g.pipeline([cluster2pct, end], "clus_per_face-%s-%d"%[anode.name, face])
+}.ret;
+
+local clus_per_apa (
+    anode,
+    dump = true,
+    bee_dir = "data",
+    runNo = 1,
+    subRunNo = 1,
+    eventNo = 1,
+    // Wrapped-plane induction charge for the SAMPLED points (doc
+    // pdhd/stm-tagger-chain.md sec 12).  C++ default false; key omitted when
+    // off => byte-identical compiled config.  DEFAULT FALSE: turning it on
+    // changes the pctree the Q/L job writes, hence production Q/L output.
+    wrapped_channel_charge = true,
+    ) =
+{
+    local cfout_live = g.pnode({
+        type:'ClusterFanout',
+        name: 'clus_per_apa-cfout_live-%s'%anode.name,
+        data: {
+            multiplicity: 2
+        }}, nin=1, nout=2),
+
+    local cfout_dead = g.pnode({
+        type:'ClusterFanout',
+        name: 'clus_per_apa-cfout_dead-%s'%anode.name,
+        data: {
+            multiplicity: 2
+        }}, nin=1, nout=2),
+
+    local per_face_pipes = [
+        clus_per_face(anode, face=0, dump=false, bee_dir=bee_dir, runNo=runNo, subRunNo=subRunNo, eventNo=eventNo, wrapped_channel_charge=wrapped_channel_charge),
+        clus_per_face(anode, face=1, dump=false, bee_dir=bee_dir, runNo=runNo, subRunNo=subRunNo, eventNo=eventNo, wrapped_channel_charge=wrapped_channel_charge),
+    ],
+
+    local pcmerging = g.pnode({
+        type: "PointTreeMerging",
+        name: "%s"%[anode.name],
+        data:  {
+            multiplicity: 2,
+            inpath: "pointtrees/%d",
+            outpath: "pointtrees/%d",
+        }
+    }, nin=2, nout=1),
+
+    local dv = detector_volumes([anode]),
+    local pcts = pctransforms(dv),
+
+    local cm = clus.clustering_methods(prefix=anode.name,
+                                       detector_volumes=dv,
+                                       pc_transforms=pcts,
+                                       coords=common_coords),
+    local cm_pipeline = [
+        cm.deghost(),
+        cm.protect_overclustering(),
+    ],
+
+    local mabc = g.pnode({
+        local name = anode.name,
+        type: "MultiAlgBlobClustering",
+        name: "clus_per_apa-%s"%[name],
+        data:  {
+            inpath: "pointtrees/%d",
+            outpath: "pointtrees/%d",
+            // grouping2file_prefix: "grouping%s-%d"%[anode.name, face],
+            perf: true,
+            bee_dir: bee_dir, // "data/0/0", // not used
+            bee_zip: "%s/mabc-%s.zip"%[bee_dir, anode.name],
+            bee_detector: "protodunehd",
+            initial_index: index,   // New RSE configuration
+            use_config_rse: true,  // Enable use of configured RSE
+            runNo: runNo,
+            subRunNo: subRunNo,
+            eventNo: eventNo,
+            save_deadarea: true,
+            dead_area_version: 2,  // v2 wrapper (tpc=apa) so the dead slab lands on the correct PD anode face
+            anodes: [wc.tn(anode)],
+            detector_volumes: wc.tn(dv),
+            bee_points_sets: [
+                {
+                    name: "clustering",
+                    detector: "protodunehd",
+                    algorithm: "clustering",
+                    pcname: "3d",
+                    coords: ["x", "y", "z"],
+                    individual: false,
+                }
+            ],
+            pipeline: wc.tns(cm_pipeline),
+        }
+    }, nin=1, nout=1, uses=[anode, dv, pcts]+cm_pipeline),
+
+    local sink = g.pnode({
+        type: "TensorFileSink",
+        name: "clus_per_apa-%s"%[anode.name],
+        data: {
+            outname: "%s/trash-%s.tar.gz"%[bee_dir, anode.name],
+            prefix: "clustering_", // json, numpy, dummy
+            dump_mode: true,
+        }
+    }, nin=1, nout=0),
+
+    local end = if dump
+    then g.pipeline([mabc, sink])
+    else g.pipeline([mabc]),
+
+    ret :: g.intern(
+        innodes = [cfout_live, cfout_dead],
+        centernodes = per_face_pipes + [pcmerging],
+        outnodes = [end],
+        edges = [
+            g.edge(cfout_live, per_face_pipes[0], 0, 0),
+            g.edge(cfout_dead, per_face_pipes[0], 0, 1),
+            g.edge(cfout_live, per_face_pipes[1], 1, 0),
+            g.edge(cfout_dead, per_face_pipes[1], 1, 1),
+            g.edge(per_face_pipes[0], pcmerging, 0, 0),
+            g.edge(per_face_pipes[1], pcmerging, 0, 1),
+            g.edge(pcmerging, end, 0, 0),
+        ]
+    ),
+}.ret;
+
+// Stage 3: per drift-side group = x-aligned APAs viewed through a COMMON
+// face, i.e. one drift volume ({APA0,APA2} face0 drift -x, {APA1,APA3} face1
+// drift +x), raw x,y,z coordinates.  Runs the long-range merge family across
+// the two stacked APAs of one drift side, then the topology passes (separate
+// moved here from the per-face stage; examine_x_boundary requires all wpids
+// in the group's data to be same-face with the same FV_x metadata -- the C++
+// raises on mixed faces or differing drift-x ranges, so a wrongly-composed
+// group fails loudly instead of applying a wrong FV window).
+local clus_per_group (
+    anodes,
+    group_name,
+    face,
+    dump = true,
+    bee_dir = "data",
+    runNo = 1,
+    subRunNo = 1,
+    eventNo = 1,
+    // doc pdhd/06: record what clustering_isolated merged, so the PR job can undo
+    // it (cm.unmerge_bundle with id_aname='assoc_cluster_id').  cm.isolated()
+    // MERGES a main cluster with the small clusters that are near it but NOT
+    // connected to it -- the prototype only GROUPS them -- so the STM endpoint
+    // finder and the Steiner build walk across empty space into a detached
+    // clump.  Counterpart of protodunevd/clus.jsonnet save_assoc_id (doc
+    // pdvd/39 round 2); SBND carries the same pair.  PDHD DOES run
+    // cm.isolated() at this stage -- the pipeline comment in run_pr_evt.sh that
+    // said otherwise was wrong -- it simply never saved the provenance, so
+    // there was nothing to undo.  Writes the isolated/assoc_cluster_id/
+    // assoc_cluster_main perblob arrays ONLY; cluster membership is untouched.
+    // false => both keys omitted => byte-identical compiled config and pctree.
+    save_assoc_id = false,
+    // doc pdhd/11: make drift_side_fv_x below actually apply on PDHD.
+    // select_scope_fv() adopts the drift group's x-range only if EVERY configured
+    // face of the group agrees on FV_xmin/FV_xmax -- and DetectorVolumes registers
+    // both faces of every anode, including the insensitive "wall" face whose block
+    // here is degenerate (a0f1pA/a2f1pA carry FV_xmin == FV_xmax == -3579.85 mm).
+    // One such face always disagrees, so on PDHD the drift-side x-range is never
+    // adopted and the pass silently runs against the cryostat-wide overall x
+    // (+/-357.985 cm, BOTH drift volumes) -- which makes JudgeSeparateDec_2's
+    // surface-contact count zero, exactly the failure clus/docs/clustering-separate-fv.md
+    // describes.  PDVD is immune: its per-face blocks already agree.
+    // false => key omitted => byte-identical compiled config.  NOT set by the
+    // PDHD driver: this is a graded knob, not a production flip.
+    ) = {
+    local nanodes = std.length(anodes),
+    local pcmerging = g.pnode({
+        type: "PointTreeMerging",
+        name: "clus_per_group-%s"%group_name,
+        data:  {
+            multiplicity: nanodes,
+            inpath: "pointtrees/%d",
+            outpath: "pointtrees/%d",
+            tolerate_missing: true,
+        }
+    }, nin=nanodes, nout=1),
+
+    local dv = detector_volumes(anodes, face),
+    local pcts = pctransforms(dv),
+
+    local cm = clus.clustering_methods(prefix=group_name,
+                                       detector_volumes=dv,
+                                       pc_transforms=pcts,
+                                       coords=common_coords),
+    local cm_pipeline = [
+        cm.extend(flag=4, length_cut=60*wc.cm, num_try=0, length_2_cut=15*wc.cm, num_dead_try=1),
+        cm.regular(name="1", length_cut=60*wc.cm, flag_enable_extend=false),
+        cm.regular(name="2", length_cut=30*wc.cm, flag_enable_extend=true),
+        cm.parallel_prolong(length_cut=35*wc.cm),
+        cm.close(length_cut=1.2*wc.cm),
+        cm.extend_loop(num_try=3),
+        // max_hull_points raised from the 10k default: get_hull() bailing silently
+        // disabled the separation decision on exactly the clusters that need it
+        // (a 102k-pt giant in PDVD 39324 evt 339890 slipped past the earlier 100k).
+        cm.separate(use_ctpc=true, max_hull_points=1000000, collinear_recover=true, collinear_interior=true,
+                    collinear_member_merge=true,
+                    track_repartition=true, band_merge_back=true, band_recarve=true, drift_side_fv_x=true,
+                    far_point_x_cut=14*wc.cm, far_point_mid_dis=60*wc.cm, track_recarve=true, dec1_guard_main_angle=45,
+                    iso_slab_split=true, tag_family=true, collinear_global_merge=true),
+        // MicroBooNE order after separate: connect1 (reconnect dashed-line
+        // fragments, e.g. drift-direction tracks split across the group) then
+        // deghost (remove ghosts that only the group scope can adjudicate).
+        // empty_view_unique: required at group scope -- see common clus.jsonnet.
+        cm.connect1(respect_separate_family=true),
+        cm.deghost(empty_view_unique=true),
+        cm.examine_x_boundary(),
+        cm.neutrino(protect_iso_band=true),
+        // save_assoc_id: see the clus_per_group argument.  false => key omitted.
+        cm.isolated(save_assoc_id=save_assoc_id),
+        // examine_bundles() DISABLED at the per-drift-group stage (2026-06-14).
+        // It rewrites the "isolated"/"perblob" array, splitting a cluster into a
+        // main spine (-1) + associated sub-clusters at connectivity gaps (e.g. where
+        // `separate` carved out a crossing cosmic).  QLMatching then reads that array
+        // and matches/flags on the MAIN sub-cluster only -- so a track whose anode end
+        // sits in an associated sub-cluster (e.g. run27305 evt150 cluster 386) is
+        // never flagged at_x_boundary / close_to_PMT even though the full track reaches
+        // the anode.  With this commented out, the perblob comes from `isolated` (no -1
+        // main), so QLMatching leaves the cluster whole (decompose_cluster_groups: a
+        // perblob with no -1 is a single component -> no split) and computes the
+        // boundary flags over the FULL track.  Cluster grouping is unchanged (at this
+        // stage examine_bundles only rewrites perblob, never cluster membership;
+        // use_flash_t0=false so its flash-time merge is skipped).  Re-enable later in
+        // the all-TPC stage if the main/associated structure is needed there.
+        // cm.examine_bundles(),
+    ],
+
+    local mabc = g.pnode({
+        type: "MultiAlgBlobClustering",
+        name: "clus_per_group-%s"%group_name,
+        data:  {
+            inpath: "pointtrees/%d",
+            outpath: "pointtrees/%d",
+            perf: true,
+            bee_dir: bee_dir, // "data/0/0", // not used
+            bee_zip: "%s/mabc-%s.zip"%[bee_dir, group_name],
+            bee_detector: "protodunehd",
+            initial_index: index,   // New RSE configuration
+            use_config_rse: true,  // Enable use of configured RSE
+            runNo: runNo,
+            subRunNo: subRunNo,
+            eventNo: eventNo,
+            save_deadarea: true,
+            dead_area_version: 2,  // v2 wrapper (tpc=apa) so the dead slab lands on the correct PD anode face
+            // doc pdhd/06: homogenize the perblob key set so the isolated
+            // grouping's provenance pair survives Dataset::append into the next
+            // stage and, from there, into the saved pctree -- the serializer
+            // silently DROPS heterogeneous keys, and clusters that
+            // clustering_isolated never touched have no perblob PC at all.
+            // C++ default false; key omitted when off => byte-identical.
+            [if save_assoc_id then 'save_assoc_cluster_id']: true,
+            anodes: [wc.tn(a) for a in anodes],
+            detector_volumes: wc.tn(dv),
+            bee_points_sets: [
+                {
+                    name: "clustering",
+                    detector: "protodunehd",
+                    algorithm: "clustering",
+                    pcname: "3d",
+                    coords: ["x", "y", "z"],
+                    individual: false,
+                }
+            ],
+            pipeline: wc.tns(cm_pipeline),
+        }
+    }, nin=1, nout=1, uses=anodes+[dv, pcts]+cm_pipeline),
+
+    local sink = g.pnode({
+        type: "TensorFileSink",
+        name: "clus_per_group-%s"%group_name,
+        data: {
+            outname: "%s/trash-%s.tar.gz"%[bee_dir, group_name],
+            prefix: "clustering_", // json, numpy, dummy
+            dump_mode: true,
+        }
+    }, nin=1, nout=0),
+
+    local end = if dump
+    then g.pipeline([mabc, sink])
+    else g.pipeline([mabc]),
+
+    ret :: g.intern(
+        innodes = [pcmerging],
+        centernodes = [],
+        outnodes = [end],
+        edges = [
+            g.edge(pcmerging, end, 0, 0),
+        ]
+    ),
+}.ret;
+
+// Stage 4: all-TPC, merging the two drift-side groups.  switch_scope applies
+// the per-cluster T0 correction (x_t0cor; with no flash matching on PDHD this
+// is the apparent x) and its containment scope filter.
+local clus_all_tpc (
+    anodes,
+    ngroups = 2,
+    dump = true,
+    bee_dir = "data",
+    runNo = 1,
+    subRunNo = 1,
+    eventNo = 1,
+    save_opflash = false,
+    premerged = false,   // skip the input PointTreeMerging (joint QLMatching already merged)
+    // Persist the post-Q/L point-cloud tree so the PDHD PR job can reload it
+    // (pdhd/docs/stm-tagger-chain.md sec 3; PDVD parity, protodunevd/clus.jsonnet).
+    // '' (default) keeps the inert dump_mode sink writing trash-all-apa.tar.gz =>
+    // compiled config byte-identical.  A non-empty path turns the SAME
+    // TensorFileSink into a real TensorDM writer (prefix 'clustering_',
+    // dump_mode false) so pdhd/wct-pr-perevt.jsonnet's TensorFileSource can load
+    // the tree.  Runner flag: run_clus_evt.sh -save-pctree ->
+    // work/<RUN6>_<EVT>/pctree-evt<ID>.tar.gz.
+    tensor_outname = '',
+    // doc pdhd/06: see clus_per_group's save_assoc_id.  This stage does not run
+    // cm.isolated(); it only needs the same key-set homogenization so the group
+    // stage's provenance arrays survive into the saved pctree.
+    save_assoc_id = false,
+    ) = {
+    local pcmerging = g.pnode({
+        type: "PointTreeMerging",
+        name: "clus_all_tpc",
+        data:  {
+            multiplicity: ngroups,
+            inpath: "pointtrees/%d",
+            outpath: "pointtrees/%d",
+            tolerate_missing: true,
+        }
+    }, nin=ngroups, nout=1),
+
+    local dv = detector_volumes(anodes),
+    local pcts = pctransforms(dv),
+
+
+    local cm_old = clus.clustering_methods(prefix="all",
+                                           detector_volumes=dv,
+                                           pc_transforms=pcts,
+                                           coords=common_coords),
+
+
+    local cm = clus.clustering_methods(prefix="all",
+                                       detector_volumes=dv,
+                                       pc_transforms=pcts,
+                                       coords=common_corr_coords),
+
+    local cm_pipeline = [
+        cm_old.switch_scope(),
+
+        // Cathode-crossing connector.  PDHD central cathode is at x=0 (the C++
+        // default cathode_x).  QLMatching runs BEFORE this all-TPC stage (see the
+        // premerged=false note above), so every cluster carries its matched
+        // cluster_t0 + "flash" scalar here: use_flash_t0=true gates pairs on
+        // flash-time coincidence (flash_t0_window=1us, matching the ql_scan
+        // cross-side coincidence window) so only same-crossing halves can merge.
+        // tip_touch_cut=3cm: when the two cathode tips nearly touch, drop the
+        // cc_pca connection-alignment term in the both-long PCA branch (over a
+        // ~1cm gap that vector is sub-cm-jitter noise, ~perpendicular even for a
+        // genuine crosser) and accept on PCA collinearity alone -- recovers
+        // same-flash crossers like run29107 evt983 cl36<->cl89.
+        // tip_touch_angle_cut=12deg: in the same tip-touch branch, also accept when
+        // the LOCAL (charge-weighted Hough) arms are collinear within 12deg even if a
+        // curved half inflates the GLOBAL PCA above angle_cut (10deg) -- recovers
+        // run29107 evt991 cl26<->cl67 (global 15deg, Hough 10deg); the Hough still
+        // rejects oblique/perpendicular touchers (49/90deg).
+        cm.cathode_connect(cathode_x_cut=5*wc.cm, drift_cut=8*wc.cm,
+                           min_length_short=2*wc.cm, short_dir_len=25*wc.cm,
+                           conn_short_cut=30.0, tip_touch_cut=3*wc.cm,
+                           tip_touch_angle_cut=12.0,
+                           use_flash_t0=true, flash_t0_window=1*wc.us),
+        #cm.retile(cut_time_low=3*wc.us,
+        #          cut_time_high=5*wc.us,
+        #          anodes=anodes,
+        #          samplers=[
+        #              clus.sampler(bs_rt_face(0,0), apa=0, face=0),
+        #              clus.sampler(bs_rt_face(0,1), apa=0, face=1),
+        #              clus.sampler(bs_rt_face(1,0), apa=1, face=0),
+        #              clus.sampler(bs_rt_face(1,1), apa=1, face=1),
+        #              clus.sampler(bs_rt_face(2,0), apa=2, face=0),
+        #              clus.sampler(bs_rt_face(2,1), apa=2, face=1),
+        #              clus.sampler(bs_rt_face(3,0), apa=3, face=0),
+        #              clus.sampler(bs_rt_face(3,1), apa=3, face=1),
+        #          ]),
+    ],
+
+    local mabc = g.pnode({
+        type: "MultiAlgBlobClustering",
+        name: "clus_all_tpc",
+        data:  {
+            inpath: "pointtrees/%d",
+            outpath: "pointtrees/%d",
+            // grouping2file_prefix: "grouping%s-%d"%[anode.name, face],
+            perf: true,
+            bee_dir: bee_dir, // "data/0/0", // not used
+            bee_zip: "%s/mabc-all-apa.zip"%[bee_dir],
+            bee_detector: "protodunehd",
+            initial_index: index,   // New RSE configuration
+            use_config_rse: true,  // Enable use of configured RSE
+            runNo: runNo,
+            subRunNo: subRunNo,
+            eventNo: eventNo,
+            save_deadarea: true,
+            // doc pdhd/06: see the save_assoc_id argument.  This is the node
+            // whose TensorFileSink writes the pctree the PR job reads, so the
+            // key must be set HERE for unmerge_assoc to have provenance.
+            [if save_assoc_id then 'save_assoc_cluster_id']: true,
+            // Dump the optical "op" bee instance (measured flash PE + Q/L
+            // predicted PE per matched cluster) at the pre-pipeline point.
+            // Needs do_qlmatch (the QLMatching "opflash" root PC); no-op
+            // otherwise.  Default false => bit-identical.
+            save_opflash: save_opflash,
+            // Emit one "op" row per flash carrying ALL its matched cluster ids
+            // (summed predicted PE), so a flash matched to several clusters shows
+            // them together instead of one row per cluster (SBND parity).
+            bee_flash_per_flash: true,
+            // Pair the two per-side flashes of a cathode-crosser within this time
+            // window and stash a per-flash "op_flash_group" array on the root
+            // opflash PC.  PDHD's opaque cathode makes a crosser scintillate
+            // independently in each volume -> TWO coincident per-side flashes, each
+            // matched as its own cluster half; the Bee viewer shows the pair as one
+            // group (one physical event).  Grouping is MATCHED-ONLY and closest-pair:
+            // only flashes with a matched cluster are eligible, and within each
+            // window-coincident neighborhood just the single closest cross-side pair
+            // (one per side) is grouped (see store_flash_groups).  1 us matches the
+            // ql_scan hand-scan tool's cross-side window; the matched-only + closest-
+            // pair logic keeps the wide window from merging unrelated busy-event
+            // flashes.  0 = off (no column => bit-identical ungrouped display).
+            flash_group_window: 1 * wc.us,
+            // Greedy disjoint pairing: when two distinct close crossers fall in one
+            // window-coincident neighborhood, group BOTH closest cross-side pairs
+            // instead of just the single closest one.  Default false (one pair per
+            // neighborhood); true here so a second real crosser pair is not dropped.
+            flash_group_greedy: true,
+            dead_area_version: 2,  // v2 wrapper (tpc=apa) so the dead slab lands on the correct PD anode face
+            dead_apa_groups: apa_drift_groups,  // group dead area by drift side -> 2 dead instances
+            anodes: [wc.tn(a) for a in anodes],
+            detector_volumes: wc.tn(dv),
+            bee_points_sets: [  // New configuration for multiple bee points sets
+            //    {
+            //        name: "img",                // Name of the bee points set
+            //        detector: "protodunehd",         // Detector name
+            //        algorithm: "img",           // Algorithm identifier
+            //        pcname: "3d",           // Which scope to use
+            //        coords: ["x", "y", "z"],    // Coordinates to use
+            //        individual: false           // Whether to output as a whole or individual APA/Face
+            //    },
+            {
+                    name: "clustering",         // Name of the bee points set
+                    detector: "protodunehd",         // Detector name
+                    algorithm: "clustering",    // Algorithm identifier
+                    pcname: "3d",           // Which scope to use
+                    // T0-corrected drift coords (x_t0cor = x_raw - dirx*(cluster_t0 +
+                    // trigger_offset)*drift_speed), materialised by switch_scope above from
+                    // the QLMatching cluster_t0.  SBND parity (sbnd clus.jsonnet clus_all_apa
+                    // uses common_corr_coords for its clustering-global set).  A matched
+                    // cluster is drawn at its flash drift position; an UNMATCHED cluster
+                    // (cluster_t0=-1e12) lands far outside the volume, fails the containment
+                    // filter (scope_filter=false) and is dropped here -- it still appears in
+                    // img-global (raw, below).
+                    coords: common_corr_coords,
+                    individual: false            // Output individual APA/Face
+                },
+            {
+                    // The hard-coded "img" name is MABC's pre-pipeline hook: this
+                    // set is dumped from the live grouping BEFORE the all-TPC
+                    // clustering pipeline runs -- i.e. the raw imaged charge (the
+                    // per-APA matched clusters).  With no apa_groups it is dumped
+                    // whole -> img-global (cf. SBND clus.jsonnet).  The "clustering"
+                    // set above (post-pipeline) gives clustering-global.  (This hook
+                    // can host only one set; emitting img-global here replaces the
+                    // former per-drift-side stage-3 clustering-group02/13 dump.)
+                    name: "img",
+                    detector: "protodunehd",
+                    algorithm: "img",           // -> img-global (raw imaged charge)
+                    pcname: "3d",
+                    coords: ["x", "y", "z"],
+                    individual: false,
+                }
+            ],
+            pipeline: wc.tns(cm_pipeline),
+        },
+    }, nin=1, nout=1, uses=anodes+[dv, pcts]+cm_pipeline),
+
+    local sink = g.pnode({
+        type: "TensorFileSink",
+        name: "clus_all_tpc",
+        data: {
+            outname: if tensor_outname == '' then "%s/trash-all-apa.tar.gz"%[bee_dir] else tensor_outname,
+            prefix: "clustering_", // json, numpy, dummy
+            dump_mode: tensor_outname == '',
+        }
+    }, nin=1, nout=0),
+    local end = if dump
+    then g.pipeline([mabc, sink])
+    else g.pipeline([mabc]),
+    // premerged: the upstream joint QLMatching node already emits ONE merged tree, so
+    // feed mabc directly (its single input is the all-TPC stage's input).  Else merge the
+    // ngroups per-side outputs through PointTreeMerging first (historical path).
+    ret :: if premerged then end else g.intern(
+        innodes = [pcmerging],
+        centernodes = [],
+        outnodes = [end],
+        edges = [
+            g.edge(pcmerging, end, 0, 0),
+        ]
+    ),
+}.ret;
+
+
+{
+    local bee_dir = if output_dir == '' then 'data' else output_dir,
+    per_face(anode, face=0, dump=true, wrapped_channel_charge=true) :: clus_per_face(anode, face=face, dump=dump, bee_dir=bee_dir, runNo=runNo, subRunNo=subRunNo, eventNo=eventNo, wrapped_channel_charge=wrapped_channel_charge),
+    per_apa(anode, dump=true, wrapped_channel_charge=true) :: clus_per_apa(anode, dump=dump, bee_dir=bee_dir, runNo=runNo, subRunNo=subRunNo, eventNo=eventNo, wrapped_channel_charge=wrapped_channel_charge),
+    per_group(anodes, group_name, face, dump=true, save_assoc_id=false) :: clus_per_group(anodes, group_name, face, dump=dump, bee_dir=bee_dir, runNo=runNo, subRunNo=subRunNo, eventNo=eventNo, save_assoc_id=save_assoc_id),
+    all_tpc(anodes, ngroups=2, dump=true, save_opflash=false, premerged=false, tensor_outname='', save_assoc_id=false) :: clus_all_tpc(anodes, ngroups=ngroups, dump=dump, bee_dir=bee_dir, runNo=runNo, subRunNo=subRunNo, eventNo=eventNo, save_opflash=save_opflash, premerged=premerged, tensor_outname=tensor_outname, save_assoc_id=save_assoc_id),
+    // Expose the DetectorVolumes node builder so the Q/L matching graph can
+    // reference the SAME per-group DV the clustering uses (deterministic by name).
+    detector_volumes(anodes, face="") :: detector_volumes(anodes, face),
+    // Primitives the PDHD pattern-recognition builder
+    // (pgrapher/experiment/pdhd/pr.jsonnet) needs to rebuild the SAME geometry
+    // objects the clustering used: the PCTransformSet for a DV, the
+    // per-(anode,face) 'stepped' live sampler, and the T0 scope coordinates.
+    // Hidden fields (::) => nothing here reaches a compiled clustering config.
+    // PDVD parity (protodunevd/clus.jsonnet), minus the per-crate drift speed:
+    // PDHD has ONE global drift speed.
+    pc_transforms(dv) :: pctransforms(dv),
+    live_sampler(anode, face, wrapped_channel_charge=true, half_pitch=false, min_step_size=null,
+                 strategy_name='stepped', wire_product=null, charge_threshold=null) ::
+        bs_live_face(anode.name, face, wrapped_channel_charge=wrapped_channel_charge,
+                     half_pitch=half_pitch, min_step_size=min_step_size,   // doc pdvd/101
+                     strategy_name=strategy_name, wire_product=wire_product,   // doc pdvd/102
+                     charge_threshold=charge_threshold),
+    drift_speed :: drift_speed,
+    time_offset :: time_offset,
+    scope_coords :: common_coords,
+    t0cor_coords :: common_corr_coords,
+}

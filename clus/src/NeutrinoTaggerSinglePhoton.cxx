@@ -63,6 +63,32 @@ static inline Point vtx_fit_pt(VertexPtr v) {
     return v->fit().valid() ? v->fit().point : v->wcpt().point;
 }
 
+// doc 75 -- consistent-FV containment for bad_reconstruction_2_sp, same
+// shape as NeutrinoTaggerCosmic.cxx's contained_tol (doc 74 G1) / the nue
+// tagger's contained_tol_nue (doc 75).  Deliberate per-file duplication
+// (M10); negative tolerance = required inset, size 6/3/1 accepted.  Only
+// called when the configured fiducial (PatternAlgorithms::m_nue_fiducial)
+// is non-null.
+static bool contained_tol_sp(const IFiducial::pointer& fid, const Point& p,
+                              const std::vector<double>& tol) {
+    if (tol.empty()) return fid->contained(p);
+    double txl, txh, tyl, tyh, tzl, tzh;
+    if (tol.size() >= 6) {
+        txl = tol[0]; txh = tol[1]; tyl = tol[2]; tyh = tol[3]; tzl = tol[4]; tzh = tol[5];
+    } else if (tol.size() >= 3) {
+        txl = txh = tol[0]; tyl = tyh = tol[1]; tzl = tzh = tol[2];
+    } else {
+        txl = txh = tyl = tyh = tzl = tzh = tol[0];
+    }
+    if (!fid->contained(Point(p.x() - txl, p.y(), p.z()))) return false;
+    if (!fid->contained(Point(p.x() + txh, p.y(), p.z()))) return false;
+    if (!fid->contained(Point(p.x(), p.y() - tyl, p.z()))) return false;
+    if (!fid->contained(Point(p.x(), p.y() + tyh, p.z()))) return false;
+    if (!fid->contained(Point(p.x(), p.y(), p.z() - tzl))) return false;
+    if (!fid->contained(Point(p.x(), p.y(), p.z() + tzh))) return false;
+    return true;
+}
+
 // Number of graph edges (segments) at a vertex.
 // Replaces prototype's map_vertex_segments[vtx].size().
 static inline int vtx_degree(VertexPtr vtx, const Graph& graph) {
@@ -92,6 +118,49 @@ static Point seg_endpoint_near(SegmentPtr seg, const Point& ref_pt) {
     Point back  = fits.back().point;
     return (ray_length(Ray{ref_pt, front}) <= ray_length(Ray{ref_pt, back}))
            ? front : back;
+}
+
+// doc pr/36 §10.6 (F5 = P6).  Prototype wcpt-identity endpoint rule with the
+// legacy proximity fallback -- twin of NeutrinoTaggerNuE.cxx's
+// seg_endpoint_near_vtx (fork-by-duplication file convention); see the full
+// rationale there.  Site ids 13-17 belong to this file.
+static Point seg_endpoint_near_vtx(const PatternAlgorithms& pa, int site,
+                                   SegmentPtr seg, VertexPtr vtx) {
+    const Point legacy = seg_endpoint_near(seg, vtx_fit_pt(vtx));
+    if (!vtx) return legacy;
+    auto& audit = PR::g_pr36_audit;
+    audit.f5_calls[site].fetch_add(1, std::memory_order_relaxed);
+    const auto& fits  = seg->fits();
+    const auto& wcpts = seg->wcpts();
+    const bool front_match = !wcpts.empty() && wcpts.front().point == vtx->wcpt().point;
+    const bool back_match  = !wcpts.empty() && wcpts.back().point  == vtx->wcpt().point;
+    if (!front_match && !back_match) {
+        audit.f5_neither[site].fetch_add(1, std::memory_order_relaxed);
+        // Premise classification (doc pr/36 §10.15b): ~zero distances would
+        // mean arithmetic drift broke an identity the prototype's integer
+        // index test would keep (redesign needed); large distances mean the
+        // vertex is genuinely a different skeleton node, where the prototype
+        // rule ALSO picks back -- faithful.
+        SPDLOG_LOGGER_INFO(s_log,
+            "PR36AUDIT f5 site {} neither-match: d_front={:.6g} cm d_back={:.6g} cm",
+            site, ray_length(Ray{vtx->wcpt().point, wcpts.front().point}) / units::cm,
+            ray_length(Ray{vtx->wcpt().point, wcpts.back().point}) / units::cm);
+    }
+    // Prototype rule (NeutrinoID_nue_tagger.h:71-75): front on an exact
+    // front match, otherwise back.
+    const Point proto = front_match ? fits.front().point : fits.back().point;
+    if (proto != legacy)
+        audit.f5_disagree[site].fetch_add(1, std::memory_order_relaxed);
+    return pa.m_stem_endpoint_wcpt_parity ? proto : legacy;
+}
+
+// doc pr/36 §10.3 (F2 = P12).  Twin of NeutrinoTaggerNuE.cxx's
+// pr36_count_gate_skip; this file's gate id is 10.
+static inline void pr36_count_gate_skip(SegmentPtr sg, int gate) {
+    if (sg && !sg->has_particle_info() &&
+        (sg->flags_any(SegmentFlags::kShowerTrajectory) ||
+         sg->flags_any(SegmentFlags::kShowerTopology)))
+        PR::g_pr36_audit.f2_gate_skip[gate].fetch_add(1, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +568,7 @@ static bool bad_reconstruction_1_sp(SpContext& ctx, ShowerPtr shower,
 
     // Overall shower direction from the vertex end.
     // Prototype: dir_shower = shower->cal_dir_3vector(vertex_point, 100*units::cm)
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 13, sg, vertex);
     Vector dir_shower  = shower_cal_dir_3vector(*shower, vertex_point, 100 * units::cm);
 
     // PCA of shower points → main axis.
@@ -543,9 +612,9 @@ static bool bad_reconstruction_1_sp(SpContext& ctx, ShowerPtr shower,
     if (other_vertex) {
         Point other_pt  = vtx_fit_pt(other_vertex);
         Vector dir_stem = segment_cal_dir_3vector(sg, other_pt, 10 * units::cm);
-        auto [eit, eend] = boost::out_edges(other_vertex->get_descriptor(), ctx.graph);
-        for (; eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        const auto eit_edges = sorted_out_edges(other_vertex->get_descriptor(), ctx.graph);
+        for (auto eit : eit_edges) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             Vector dir_other = segment_cal_dir_3vector(sg1, other_pt, 10 * units::cm);
             double ang = dir_stem.angle(dir_other) / M_PI * 180.0;
@@ -675,7 +744,7 @@ static bool bad_reconstruction_2_sp(SpContext& ctx,
     int n_ele = 0, n_other = 0;
     for (SegmentPtr sg1 : shower_segs) {
         if (sg1->cluster() != sg->cluster()) continue;
-        double med   = segment_median_dQ_dx(sg1) / (43e3/units::cm);
+        double med   = segment_median_dQ_dx(sg1) / ctx.self.m_mip_dqdx_median;
         double ratio = segment_track_direct_length(sg1) / segment_track_length(sg1);
         if (sg1->flags_any(SegmentFlags::kShowerTopology) ||
             (sg1->flags_any(SegmentFlags::kShowerTrajectory) && med < 1.3) ||
@@ -688,8 +757,20 @@ static bool bad_reconstruction_2_sp(SpContext& ctx,
     FiducialUtilsPtr fiducial_utils;
     if (ctx.main_cluster && ctx.main_cluster->grouping())
         fiducial_utils = ctx.main_cluster->grouping()->get_fiducialutils();
-    bool other_fid = fiducial_utils
+    // doc 75 -- nue_sp_consistent_fv.  Same shape as the nue tagger's
+    // bad_reconstruction_2 (NeutrinoTaggerNuE.cxx): the prototype's
+    // NULL-tolerance bad_reconstruction_2_sp (NeutrinoID_singlephoton_tagger.h:
+    // 3538,3546) resolves to non-SCB polygons with a baked-in uniform -3cm
+    // boundary_dis_cut, so the faithful fix is the configured fiducial WITH a
+    // uniform -3cm tolerance, not the bare box.
+    bool other_fid;
+    if (ctx.self.m_nue_fiducial) {
+        other_fid = contained_tol_sp(ctx.self.m_nue_fiducial, vtx_fit_pt(other_vertex),
+                                      std::vector<double>(6, -3.0*units::cm));
+    } else {
+        other_fid = fiducial_utils
                      ? fiducial_utils->inside_fiducial_volume(vtx_fit_pt(other_vertex)) : true;
+    }
 
     if (Eshower < 150*units::MeV && total_main_length/total_length > 0.95 &&
         ((n_ele == 0 && n_other > 0) ||
@@ -709,7 +790,7 @@ static bool bad_reconstruction_2_sp(SpContext& ctx,
     // br3_3 / br3_4: backward segments in main cluster.
     // Prototype lines 3556-3617.
     // -------------------------------------------------------------------
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 14, sg, vertex);
     Point other_point  = (ray_length(Ray{vtx_fit_pt(vertex), sg_fits.front().point}) <=
                           ray_length(Ray{vtx_fit_pt(vertex), sg_fits.back().point}))
                          ? sg_fits.back().point : sg_fits.front().point;
@@ -812,9 +893,8 @@ static bool bad_reconstruction_2_sp(SpContext& ctx,
     if (other_vertex && other_vertex->descriptor_valid()) {
         Point  ovp = vtx_fit_pt(other_vertex);
         size_t n_other_vtx_segs = boost::out_degree(other_vertex->get_descriptor(), ctx.graph);
-        for (auto [eit, eend] = boost::out_edges(other_vertex->get_descriptor(), ctx.graph);
-             eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(other_vertex->get_descriptor(), ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             VertexPtr vtx_1 = find_other_vertex(ctx.graph, sg1, other_vertex);
             if (!vtx_1) continue;
@@ -865,7 +945,7 @@ static bool bad_reconstruction_2_sp(SpContext& ctx,
         if (sg1->cluster() != vertex->cluster()) continue;
         int n = (int)sg1->fits().size();
         for (int i = 0; i < n - 5; ++i) {
-            double med = segment_median_dQ_dx(sg1, i, i+5) / (43e3/units::cm);
+            double med = segment_median_dQ_dx(sg1, i, i+5) / ctx.self.m_mip_dqdx_median;
             if (med > max_dQ_dx) max_dQ_dx = med;
         }
     }
@@ -1001,7 +1081,7 @@ static bool bad_reconstruction_3_sp(SpContext& ctx,
     // -------------------------------------------------------------------
     {
         SegmentPtr sg = shower->start_segment();
-        Point vp = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+        Point vp = seg_endpoint_near_vtx(ctx.self, 15, sg, vertex);
 
         Vector dir_sg = segment_cal_dir_3vector(sg, vp, 15*units::cm);
         Vector dir;
@@ -1124,7 +1204,7 @@ static int mip_identification_sp(SpContext& ctx,
     Vector dir_drift(1, 0, 0);
     double Eshower = shower_energy(shower);
 
-    Point vertex_point = seg_endpoint_near(sg, vtx_fit_pt(vertex));
+    Point vertex_point = seg_endpoint_near_vtx(ctx.self, 16, sg, vertex);
 
     // Stem direction: use start segment if long enough, else use shower direction
     Vector dir_shower;
@@ -1146,7 +1226,7 @@ static int mip_identification_sp(SpContext& ctx,
     else if (Eshower <  550*units::MeV) dQ_dx_cut = 1.3;
     if      (Eshower <  300*units::MeV) dQ_dx_cut = 1.3;
 
-    std::vector<double> vec_dQ_dx = shower->get_stem_dQ_dx(vertex, sg, 20);
+    std::vector<double> vec_dQ_dx = shower->get_stem_dQ_dx(vertex, sg, 20, ctx.self.m_mip_dqdx_median);
 
     std::vector<int> vec_threshold(vec_dQ_dx.size(), 0);
     for (size_t i = 0; i < vec_dQ_dx.size(); ++i)
@@ -1271,10 +1351,10 @@ static int mip_identification_sp(SpContext& ctx,
     int n_good_tracks = 0;
     if (vertex && vertex->descriptor_valid()) {
         auto vd = vertex->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
-            if (!sg1->dir_weak() || segment_track_length(sg1) > 10*units::cm) ++n_good_tracks;
+            if (!ctx.self.seg_dir_weak(sg1) || segment_track_length(sg1) > 10*units::cm) ++n_good_tracks;
         }
     }
     if (Eshower < 600*units::MeV) {
@@ -1398,7 +1478,10 @@ static int mip_identification_sp(SpContext& ctx,
 
         for (ShowerPtr shower1 : ctx.showers) {
             SegmentPtr sg1 = shower1->start_segment();
-            if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) continue;
+            if (!sg1 || !sg1->has_particle_info() || sg1->particle_info()->pdg() != 11) {
+                pr36_count_gate_skip(sg1, 10);  // doc pr/36 F2
+                continue;
+            }
             if (shower1 == shower) continue;
             auto [vtx1, conn1] = shower1->get_start_vertex_and_type();
             double E1 = shower_energy(shower1);
@@ -1496,13 +1579,29 @@ static int mip_identification_sp(SpContext& ctx,
         for (float d : dqdx7) mean_dqdx += d;
         mean_dqdx /= (float)dqdx7.size();
 
-        const float alpha = 1.0f, beta = 0.255f;
-        float median_dedx = (std::exp(median_dqdx * 43e3 * 23.6e-6 * beta / 1.38f / 0.273f) - alpha)
-                            / (beta / 1.38f / 0.273f);
+        float median_dedx = 0, mean_dedx = 0;
+        if (ctx.self.m_sp_dedx_use_recomb_model && ctx.self.m_recomb_model) {
+            // Route the stem dE/dx through the CONFIGURED recombination model
+            // (docs/pr/2 sec 2e(i) third correctness item).  The vec entries
+            // are MIP-normalized; un-normalize to e/cm and evaluate over 1 cm.
+            const double dx = 1 * units::cm;
+            const double mip = ctx.self.m_mip_dqdx_median * units::cm;  // e/cm
+            median_dedx = ctx.self.m_recomb_model->dE(median_dqdx * mip, dx) / units::MeV;
+            mean_dedx   = ctx.self.m_recomb_model->dE(mean_dqdx   * mip, dx) / units::MeV;
+        }
+        else {
+            // Legacy byte-identical path: inline float inverse Modified-Box
+            // frozen at the uBooNE field (A=1.0, B=0.255, rho=1.38, 0.273 kV/cm),
+            // bypassing the configured model (prototype
+            // NeutrinoID_singlephoton_tagger.h lines 2500-2519).
+            const float alpha = 1.0f, beta = 0.255f;
+            median_dedx = (std::exp(median_dqdx * (ctx.self.m_mip_dqdx_median*units::cm) * 23.6e-6 * beta / 1.38f / 0.273f) - alpha)
+                          / (beta / 1.38f / 0.273f);
+            mean_dedx   = (std::exp(mean_dqdx   * (ctx.self.m_mip_dqdx_median*units::cm) * 23.6e-6 * beta / 1.38f / 0.273f) - alpha)
+                          / (beta / 1.38f / 0.273f);
+        }
         if (median_dedx < 0) median_dedx = 0;
         if (median_dedx > 50) median_dedx = 50;
-        float mean_dedx   = (std::exp(mean_dqdx   * 43e3 * 23.6e-6 * beta / 1.38f / 0.273f) - alpha)
-                            / (beta / 1.38f / 0.273f);
         if (mean_dedx < 0) mean_dedx = 0;
         if (mean_dedx > 50) mean_dedx = 50;
 
@@ -1588,7 +1687,7 @@ static bool high_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerI
     auto [vtx, conn_type] = shower->get_start_vertex_and_type();
     SegmentPtr sg = shower->start_segment();
 
-    auto vec_dQ_dx = shower->get_stem_dQ_dx(vtx, sg, 20);
+    auto vec_dQ_dx = shower->get_stem_dQ_dx(vtx, sg, 20, ctx.self.m_mip_dqdx_median);
     double max_dQ_dx = 0;
     for (size_t i = 0; i < vec_dQ_dx.size(); ++i) {
         if (vec_dQ_dx[i] > max_dQ_dx) max_dQ_dx = vec_dQ_dx[i];
@@ -1614,13 +1713,13 @@ static bool high_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerI
         bool   flag_all_showers = true;
 
         auto vd = vtx->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             bool is_pdg11 = sg1->has_particle_info() && sg1->particle_info()->pdg() == 11;
             bool is_weak_muon = sg1->has_particle_info() &&
                                 sg1->particle_info()->pdg() == 13 &&
-                                sg1->dir_weak() &&
+                                ctx.self.seg_dir_weak(sg1) &&
                                 segment_track_length(sg1) < 6*units::cm;
             if (is_pdg11 || is_weak_muon) {
                 Point dp = vtx_point;
@@ -1634,9 +1733,9 @@ static bool high_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerI
             } else {
                 flag_all_showers = false;
             }
-            double norm_dQ = segment_median_dQ_dx(sg1) / (43e3 / units::cm);
+            double norm_dQ = segment_median_dQ_dx(sg1) / ctx.self.m_mip_dqdx_median;
             bool is_proton = sg1->has_particle_info() && sg1->particle_info()->pdg() == 2212;
-            if ((!sg1->dir_weak() || is_proton || segment_track_length(sg1) > 20*units::cm) &&
+            if ((!ctx.self.seg_dir_weak(sg1) || is_proton || segment_track_length(sg1) > 20*units::cm) &&
                 !seg_is_shower(sg1))
                 ++n_valid_tracks;
             else if (norm_dQ > 2.0 && segment_track_length(sg1) > 1.8*units::cm)
@@ -1686,8 +1785,8 @@ static bool high_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerI
             double min_ang2 = 180;
             SegmentPtr min_sg = nullptr;
 
-            for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-                SegmentPtr sg1 = ctx.graph[*eit].segment;
+            for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+                SegmentPtr sg1 = ctx.graph[eit].segment;
                 if (!sg1 || sg1 == sg) continue;
                 Point dp3 = vtx_point;
                 Vector dir2 = segment_cal_dir_3vector(sg1, dp3, 5*units::cm);
@@ -1700,9 +1799,8 @@ static bool high_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerI
             auto iterate_pts = [&](auto begin_it, auto end_it) {
                 for (auto it1 = begin_it; it1 != end_it; ++it1) {
                     double min_dis = 1e9;
-                    for (auto [eit2, eend2] = boost::out_edges(vd, ctx.graph);
-                         eit2 != eend2; ++eit2) {
-                        SegmentPtr sg2 = ctx.graph[*eit2].segment;
+                    for (auto eit2 : sorted_out_edges(vd, ctx.graph)) {
+                        SegmentPtr sg2 = ctx.graph[eit2].segment;
                         if (!sg2 || sg2 == sg) continue;
                         double dis = segment_get_closest_point(sg2, it1->point).first;
                         if (dis < min_dis) min_dis = dis;
@@ -1722,9 +1820,9 @@ static bool high_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerI
                     (ray_length(Ray{vtx_point, min_fits.front().point}) <=
                      ray_length(Ray{vtx_point, min_fits.back().point}));
                 if (min_front_near)
-                    medium_dQ_dx = segment_median_dQ_dx(min_sg, 0, ncount) / (43e3/units::cm);
+                    medium_dQ_dx = segment_median_dQ_dx(min_sg, 0, ncount) / ctx.self.m_mip_dqdx_median;
                 else
-                    medium_dQ_dx = segment_median_dQ_dx(min_sg, n_min-1-ncount, n_min-1) / (43e3/units::cm);
+                    medium_dQ_dx = segment_median_dQ_dx(min_sg, n_min-1-ncount, n_min-1) / ctx.self.m_mip_dqdx_median;
             }
 
             if (min_ang2 < 15 && medium_dQ_dx > 0.95 && ncount > 5  && Eshower < 1500*units::MeV)
@@ -1776,7 +1874,7 @@ static bool low_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerIn
 
     auto [vtx, conn_type] = shower->get_start_vertex_and_type();
     SegmentPtr sg = shower->start_segment();
-    Point vtx_point = seg_endpoint_near(sg, vtx_fit_pt(vtx));
+    Point vtx_point = seg_endpoint_near_vtx(ctx.self, 17, sg, vtx);
 
     IndexedSegmentSet shower_segs;
     IndexedVertexSet  shower_vtxs;
@@ -1797,15 +1895,15 @@ static bool low_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerIn
 
     if (vtx && vtx->descriptor_valid()) {
         auto vd = vtx->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             Point dp = vtx_point;
             Vector dir2 = segment_cal_dir_3vector(sg1, dp, 5*units::cm);
             double tmp_angle = dir2.angle(dir1_stem) / M_PI * 180.0;
             if (tmp_angle < min_angle_vtx) min_angle_vtx = tmp_angle;
             bool is_proton = sg1->has_particle_info() && sg1->particle_info()->pdg() == 2212;
-            if ((!sg1->dir_weak() || is_proton || segment_track_length(sg1) > 20*units::cm) &&
+            if ((!ctx.self.seg_dir_weak(sg1) || is_proton || segment_track_length(sg1) > 20*units::cm) &&
                 !seg_is_shower(sg1))
                 ++n_valid_tracks;
         }
@@ -1840,9 +1938,8 @@ static bool low_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerIn
         if (!vtx1->descriptor_valid()) continue;
 
         std::vector<SegmentPtr> vtx_ss;
-        for (auto [eit, eend] = boost::out_edges(vtx1->get_descriptor(), ctx.graph);
-             eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vtx1->get_descriptor(), ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (sg1 && shower_segs.count(sg1)) vtx_ss.push_back(sg1);
         }
         if (vtx_ss.empty()) continue;
@@ -1873,8 +1970,8 @@ static bool low_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerIn
     // ------------------------------------------------------------------
     if (vtx && vtx->descriptor_valid()) {
         auto vd = vtx->get_descriptor();
-        for (auto [eit, eend] = boost::out_edges(vd, ctx.graph); eit != eend; ++eit) {
-            SegmentPtr sg1 = ctx.graph[*eit].segment;
+        for (auto eit : sorted_out_edges(vd, ctx.graph)) {
+            SegmentPtr sg1 = ctx.graph[eit].segment;
             if (!sg1 || sg1 == sg) continue;
             bool flag_ov2 = false;
             Point dp = vtx_point;
@@ -1890,7 +1987,7 @@ static bool low_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerIn
                 n_vtx_segs_global > 1 && Eshower < 300*units::MeV && main_len < 20*units::cm)
                 flag_ov2 = true;
             // 7020_249_12479
-            if (sg1->dir_weak() && len1 < 8*units::cm && ang2 < 30 &&
+            if (ctx.self.seg_dir_weak(sg1) && len1 < 8*units::cm && ang2 < 30 &&
                 n_vtx_segs_global == 2 && Eshower < 400*units::MeV)
                 flag_ov2 = true;
 
@@ -1902,7 +1999,7 @@ static bool low_energy_overlapping_sp(SpContext& ctx, ShowerPtr shower, TaggerIn
             ti.shw_sp_lol_2_v_vtx_n_segs.push_back(n_vtx_segs_global);
             ti.shw_sp_lol_2_v_energy.push_back(Eshower / units::MeV);
             ti.shw_sp_lol_2_v_shower_main_length.push_back(main_len / units::cm);
-            ti.shw_sp_lol_2_v_flag_dir_weak.push_back(sg1->dir_weak());
+            ti.shw_sp_lol_2_v_flag_dir_weak.push_back(ctx.self.seg_dir_weak(sg1));
 
             if (flag_ov2) flag_overlap_2_save = true;
         }
@@ -2035,14 +2132,17 @@ static bool pi0_identification_sp(SpContext& ctx,
 
         if (dir1.magnitude() > 0) {
             // Precompute total track length per cluster
+            // ordered_edges (not boost::edges): FP += is order-sensitive.
             std::map<Facade::Cluster*, double> cluster_acc_length;
-            for (auto [eit, eend] = boost::edges(ctx.graph); eit != eend; ++eit) {
-                SegmentPtr sg1 = ctx.graph[*eit].segment;
+            for (const auto& ed : ordered_edges(ctx.graph)) {
+                SegmentPtr sg1 = ctx.graph[ed].segment;
                 if (sg1 && sg1->cluster())
                     cluster_acc_length[sg1->cluster()] += segment_track_length(sg1);
             }
 
-            for (const auto& vd : graph_nodes(ctx.graph)) {
+            // ordered_nodes (not graph_nodes): loop order IS the order of the
+            // shw_sp_pio_2_v_* output vectors.  graph_nodes() is pointer order.
+            for (const auto& vd : ordered_nodes(ctx.graph)) {
                 VertexPtr vtx1 = ctx.graph[vd].vertex;
                 if (!vtx1) continue;
                 if (vtx1->cluster() == vertex->cluster()) continue;
@@ -2111,9 +2211,8 @@ static bool low_energy_michel_sp(SpContext& ctx, ShowerPtr shower, TaggerInfo& t
         if (!vtx1->cluster() || vtx1->cluster() != start_cl) continue;
         if (!vtx1->descriptor_valid()) continue;
         int cnt = 0;
-        for (auto [eit, eend] = boost::out_edges(vtx1->get_descriptor(), ctx.graph);
-             eit != eend; ++eit)
-            if (sh_segs.count(ctx.graph[*eit].segment)) ++cnt;
+        for (auto eit : sorted_out_edges(vtx1->get_descriptor(), ctx.graph)) 
+            if (sh_segs.count(ctx.graph[eit].segment)) ++cnt;
         if (cnt >= 3) ++n_3seg;
     }
 
@@ -2176,6 +2275,7 @@ bool PatternAlgorithms::singlephoton_tagger(
     std::map<int, std::vector<ShowerPtr>>& map_pio_id_showers,
     std::map<int, std::pair<double,int>>& map_pio_id_mass,
     IDetectorVolumes::pointer dv,
+    WireCell::IClusGeomHelper::pointer geom_helper,
     TaggerInfo& ti)
 {
     bool flag_sp = false;
@@ -2184,20 +2284,46 @@ bool PatternAlgorithms::singlephoton_tagger(
 
     // Derive apa/face from the main vertex position so the tagger works
     // correctly for any detector geometry (multi-APA, multi-face, etc.).
+    // G1 (icarus/docs/04): fall back to (0,0) only where that face exists
+    // (unchanged for every pre-ICARUS detector); ICARUS west has no apa 0.
     int apa = 0, face = 0;
+    if (main_cluster && main_cluster->grouping()) {
+        std::tie(apa, face) = main_cluster->grouping()->fallback_apa_face();
+    }
     if (dv) {
         Point vtx_pt = main_vertex->fit().valid()
                        ? main_vertex->fit().point
                        : main_vertex->wcpt().point;
         auto wpid = dv->contained_by(vtx_pt);
-        apa  = wpid.apa();
-        face = wpid.face();
+        // Uncontained points give apa()/face() == -1; keep the legacy (0,0)
+        // rather than seeding SpContext with a sentinel that keyed lookups
+        // (wire_angles().at(-1) etc.) would abort on.  Same guard and reason
+        // as the sibling taggers (TaggerCheckNeutrino.cxx:683,
+        // NeutrinoTaggerNuE.cxx:2762).
+        if (wpid.apa() >= 0 && wpid.face() >= 0) {
+            apa  = wpid.apa();
+            face = wpid.face();
+        }
     }
 
     SpContext ctx{*this, graph, main_cluster, main_vertex, apa, face,
                   showers, map_vertex_to_shower,
                   map_shower_pio_id, map_pio_id_showers, map_pio_id_mass,
-                  dv, nullptr};
+                  dv, geom_helper};
+
+    // doc pr/36 §10.4 (F3 = P2).  The prototype SCE-corrects every position
+    // feeding the shw_sp_* distance features via func_pos_SCE_correction
+    // (NeutrinoID_singlephoton_tagger.h:13 nu vertex, :103 proton track
+    // start, :132 MIP track start, :317 shower start; the :222 block is
+    // commented out there).  max_shw_dis / shw_vtx_dis then derive from the
+    // corrected coordinates (:318-330), so correcting the four inputs also
+    // fixes the distances.  geom_helper is non-null only when the driver's
+    // sp_sce_correction knob is on AND clus_geom_helper is configured; null
+    // (the default) => raw positions, byte-identical legacy.
+    auto sp_corr = [&](const Point& p) -> Point {
+        if (!geom_helper) return p;
+        return geom_helper->get_corrected_point(p, IClusGeomHelper::SCE, apa, face);
+    };
 
     // ------------------------------------------------------------------
     // Aggregate shower statistics
@@ -2247,11 +2373,12 @@ bool PatternAlgorithms::singlephoton_tagger(
         // ------ proton bookkeeping ----------------------------------------
         if (std::abs(pdg) == 2212) {
             double length    = segment_track_length(sg);
-            double med_dqdx  = segment_median_dQ_dx(sg) / (43e3 / units::cm);
+            double med_dqdx  = segment_median_dQ_dx(sg) / m_mip_dqdx_median;
             double energy    = length / units::cm * med_dqdx;
             if (energy > 0) {
                 num_protons++;
-                Point trk_vtx = shower->get_start_point();
+                // prototype :101-106: SCE-corrected (sp_corr = identity when off)
+                Point trk_vtx = sp_corr(shower->get_start_point());
                 trk_x.push_back(trk_vtx.x() / units::cm);
                 trk_y.push_back(trk_vtx.y() / units::cm);
                 trk_z.push_back(trk_vtx.z() / units::cm);
@@ -2272,14 +2399,15 @@ bool PatternAlgorithms::singlephoton_tagger(
         // ------ muon/pion bookkeeping -------------------------------------
         if (std::abs(pdg) == 13 || std::abs(pdg) == 211) {
             double length   = segment_track_length(sg);
-            double med_dqdx = segment_median_dQ_dx(sg) / (43e3 / units::cm);
+            double med_dqdx = segment_median_dQ_dx(sg) / m_mip_dqdx_median;
             double energy   = length / units::cm * med_dqdx;
             if (energy > 0) {
                 num_mip_tracks++;
                 if (std::abs(pdg) == 13)  num_muons++;
                 if (std::abs(pdg) == 211) num_pions++;
             }
-            Point trk_vtx = shower->get_start_point();
+            // prototype :130-135: SCE-corrected (sp_corr = identity when off)
+            Point trk_vtx = sp_corr(shower->get_start_point());
             trk_x.push_back(trk_vtx.x() / units::cm);
             trk_y.push_back(trk_vtx.y() / units::cm);
             trk_z.push_back(trk_vtx.z() / units::cm);
@@ -2301,21 +2429,20 @@ bool PatternAlgorithms::singlephoton_tagger(
 
         // Is sg directly connected to main_vertex?
         bool sg_at_main = false;
-        for (auto [eit, eend] = boost::out_edges(main_vertex->get_descriptor(), graph);
-             eit != eend; ++eit)
-            if (graph[*eit].segment == sg) { sg_at_main = true; break; }
+        for (auto eit : sorted_out_edges(main_vertex->get_descriptor(), graph)) 
+            if (graph[eit].segment == sg) { sg_at_main = true; break; }
 
         // Count valid tracks at main_vertex for this shower (skipping sg).
         // Mirrors prototype lines 183-190.
         int first_pass_valid_tracks = 0;
         {
             auto vd = main_vertex->get_descriptor();
-            for (auto [eit, eend] = boost::out_edges(vd, graph); eit != eend; ++eit) {
-                SegmentPtr sg1 = graph[*eit].segment;
+            for (auto eit : sorted_out_edges(vd, graph)) {
+                SegmentPtr sg1 = graph[eit].segment;
                 if (!sg1 || sg1 == sg) continue;
                 double len1 = segment_track_length(sg1);
                 if (!seg_is_shower(sg1) &&
-                    (len1 > 8*units::cm || (!sg1->dir_weak() && len1 > 5*units::cm)))
+                    (len1 > 8*units::cm || (!seg_dir_weak(sg1) && len1 > 5*units::cm)))
                     ++first_pass_valid_tracks;
             }
         }
@@ -2412,9 +2539,8 @@ bool PatternAlgorithms::singlephoton_tagger(
 
     // Is max_shower's start segment at main_vertex?
     bool sg_at_main = false;
-    for (auto [eit, eend] = boost::out_edges(main_vertex->get_descriptor(), graph);
-         eit != eend; ++eit)
-        if (graph[*eit].segment == sg) { sg_at_main = true; break; }
+    for (auto eit : sorted_out_edges(main_vertex->get_descriptor(), graph)) 
+        if (graph[eit].segment == sg) { sg_at_main = true; break; }
 
     // Vertex to use for br2/br3 checks
     VertexPtr shw_vtx = find_vertices(ctx.graph, sg).first;
@@ -2422,24 +2548,24 @@ bool PatternAlgorithms::singlephoton_tagger(
 
     // Count valid tracks at main_vertex
     int num_valid_tracks = 0;
-    for (auto [eit, eend] = boost::out_edges(main_vertex->get_descriptor(), graph);
-         eit != eend; ++eit) {
-        SegmentPtr sg1 = graph[*eit].segment;
+    for (auto eit : sorted_out_edges(main_vertex->get_descriptor(), graph)) {
+        SegmentPtr sg1 = graph[eit].segment;
         if (!sg1 || sg1 == sg) continue;
         double len1 = segment_track_length(sg1);
         if (!seg_is_shower(sg1) &&
-            (len1 > 8*units::cm || (!sg1->dir_weak() && len1 > 5*units::cm)))
+            (len1 > 8*units::cm || (!seg_dir_weak(sg1) && len1 > 5*units::cm)))
             ++num_valid_tracks;
     }
 
-    // Shower start position (raw, no SCE correction)
-    Point shw_vtx_pt = max_shower->get_start_point();
+    // Shower start position (prototype :316-321: SCE-corrected; sp_corr is
+    // the identity when the correction is off => raw, the legacy behavior)
+    Point shw_vtx_pt = sp_corr(max_shower->get_start_point());
     float shw_x = shw_vtx_pt.x() / units::cm;
     float shw_y = shw_vtx_pt.y() / units::cm;
     float shw_z = shw_vtx_pt.z() / units::cm;
 
-    // Neutrino vertex position
-    Point nu_vtx = vtx_fit_pt(main_vertex);
+    // Neutrino vertex position (prototype :10-16: SCE-corrected)
+    Point nu_vtx = sp_corr(vtx_fit_pt(main_vertex));
     float nu_x   = nu_vtx.x() / units::cm;
     float nu_y   = nu_vtx.y() / units::cm;
     float nu_z   = nu_vtx.z() / units::cm;
@@ -2501,8 +2627,11 @@ bool PatternAlgorithms::singlephoton_tagger(
 
     if (flag_hol) flag_sp = false;
 
-    // Final threshold cuts
-    if (ti.shw_sp_vec_mean_dedx < 2.3f)                             flag_sp = false;
+    // Final threshold cuts.  The mean-dedx threshold is tuned against the
+    // legacy (uBooNE-field) dE/dx scale -- retune it together with
+    // sp_dedx_use_recomb_model (float member: default compares bit-identically
+    // to the legacy 2.3f literal).
+    if (ti.shw_sp_vec_mean_dedx < ctx.self.m_sp_mean_dedx_cut)      flag_sp = false;
     if (num_protons + num_mip_tracks > 0. && max_shw_dis < 2.)      flag_sp = false;
 
     (void)flag_lol;  // filled in TaggerInfo but not a direct cut in this port

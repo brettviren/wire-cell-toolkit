@@ -99,10 +99,20 @@ namespace WireCell::Clus::Facade {
         for(size_t i = 0; i < one.points()[0].size(); i += stride) {
             // Get K nearest neighbors from second cloud
             auto p1 = one.point(i);
-            auto knn = two.kd().knn(5, p1); // Get 5 nearest neighbors
+            // The knn(5) call that used to sit here had BOTH of its returned
+            // values overwritten on the first two statements of the loop body
+            // below -- it only fixed the iteration count at min(5, npoints).
+            // Take that count directly and skip the query (one kd search per
+            // seed, ~20 seeds per component pair).  nanoflann's KNNResultSet
+            // truncates, so knn(5, .).size() IS min(5, npoints) for a valid
+            // 3D query, and knn() returns empty on an empty cloud -- both
+            // reproduced exactly.  The alternating walk below is stateful in
+            // p1, so the iteration COUNT is load-bearing and is preserved.
             
             // Refine search around these neighbors
-            for(auto [idx2, dist] : knn) {
+            const size_t nrefine = std::min<size_t>(5, two.kd().npoints());
+            for(size_t refine = 0; refine != nrefine; ++refine) {
+                size_t idx2 = 0;
                 geo_point_t p2; // = two.point3d(idx2); // why call this?
                 
                 // Local refinement by checking neighboring points
@@ -256,7 +266,31 @@ namespace WireCell::Clus::Facade {
                       const double time);
     double drift2time(const IAnodeFace::pointer anodeface, const double time_offset, const double drift_speed,
                       const double drift);
+    // doc sbnd_xin/119 round 3: the same arithmetic with the per-(apa,face) constants already in
+    // hand.  The IAnodeFace form above re-derives xsign and xorig on EVERY call -- two by-value
+    // container copies (planes(), wires()), a shared_ptr refcount round trip and an IWire::center()
+    // -- for two numbers that are fixed for the whole job.  The IAnodeFace form now delegates here,
+    // so there is exactly one copy of the expression and the two cannot drift apart.
+    double drift2time(const double xsign, const double xorig, const double time_offset,
+                      const double drift_speed, const double drift);
     int point2wind(const geo_point_t& point, const double angle, const double pitch, const double center);
+    // doc pdvd/101: the continuous coordinate point2wind rounds; std::round(point2wind_cont(...)) == point2wind(...).
+    // That identity is NOT structural -- doc sbnd_xin/119 round 3 kept the two bodies as separate
+    // copies on purpose, because carrying each one across textually is what made the cos/sin hoist
+    // byte-identical.  Two spellings of `cos(a)*z - sin(a)*y` can be FMA-contracted differently, so
+    // the identity is CHECKED, in clus/test/doctest_projection_constant_hoist.cxx, over the three
+    // detectors' plane geometries and over inputs driven onto the .5 rounding boundary.  If you
+    // unify these bodies, that test is what tells you whether you changed a wire index.
+    double point2wind_cont(const geo_point_t& point, const double angle, const double pitch, const double center);
+    // doc sbnd_xin/119 round 3: as the two above, but taking cos(angle) and sin(angle) rather than
+    // the angle.  The angle is a per-(apa,face,plane) constant, so the two transcendentals were
+    // being recomputed once per projected point (line-level profile: 139 of point2wind's 223
+    // samples on SBND nuecc evt 2925, mostly libc_feholdsetround_sse_ctx around sin/cos).  The
+    // angle forms delegate here, so the expression exists once.
+    int point2wind_cs(const geo_point_t& point, const double cos_angle, const double sin_angle,
+                      const double pitch, const double center);
+    double point2wind_cont_cs(const geo_point_t& point, const double cos_angle, const double sin_angle,
+                              const double pitch, const double center);
     double wind2point2dproj(const int wind, const double angle, const double pitch, const double center);
 
     WirePlaneId get_wireplaneid(const geo_point_t& point, const WirePlaneId& wpid1, const WirePlaneId& wpid2, IDetectorVolumes::pointer dv);

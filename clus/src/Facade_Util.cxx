@@ -150,23 +150,23 @@ Facade::Simple3DPointCloud::results_type Facade::Simple3DPointCloud::get_closest
 }
 std::pair<size_t, geo_point_t> Facade::Simple3DPointCloud::get_closest_wcpoint(const geo_point_t& p) const {
     // global_counter_get_closest_wcpoint++;
-    const auto knn_res = kd().knn(1, p);
-    if (knn_res.size() != 1) {
+    size_t ind = 0;
+    double metric = 0;
+    if (!kd().knn1(p, ind, metric)) {
         raise<ValueError>("no points found");
     }
-    const auto ind = knn_res[0].first;
     geo_point_t pt = {points()[0][ind], points()[1][ind], points()[2][ind]};
-    // std::cout << "get_closest_wcpoint: " << p << " " << ind << " " << pt << " " << knn_res[0].second << std::endl;
     return std::make_pair(ind, pt);
 }
 
 double Facade::Simple3DPointCloud::get_closest_dis(const geo_point_t& p) const {
-    const auto knn_res = kd().knn(1, p);
-    if (knn_res.size() != 1) {
+    size_t ind = 0;
+    double metric = 0;
+    if (!kd().knn1(p, ind, metric)) {
         raise<ValueError>("no points found");
     }
     // KD-tree returns squared distance, so take sqrt for linear distance
-    return std::sqrt(knn_res[0].second);
+    return std::sqrt(metric);
 }
 
 std::vector<std::pair<size_t, geo_point_t>> Facade::Simple3DPointCloud::get_closest_wcpoints_radius(const geo_point_t& p, const double radius) const{
@@ -541,19 +541,43 @@ double Facade::time2drift(const IAnodeFace::pointer anodeface, const double time
 }
 
 // time = (drift - xorig) / (xsign * m_drift_speed) - m_time_offset
+// doc sbnd_xin/119 round 3: the arithmetic, with the per-(apa,face) constants supplied.  This is
+// the ONLY copy of the expression; the IAnodeFace form below derives xsign/xorig and calls it.
+double Facade::drift2time(const double xsign, const double xorig, const double time_offset, const double drift_speed, const double drift) {
+    return (drift - xorig) / (xsign * drift_speed) - time_offset;
+}
 double Facade::drift2time(const IAnodeFace::pointer anodeface, const double time_offset, const double drift_speed, double drift) {
     // const Pimpos* colpimpos = anodeface->planes()[2]->pimpos();
     double xsign = anodeface->dirx();
     double xorig = anodeface->planes()[2]->wires().front()->center().x();
-    return (drift - xorig) / (xsign * drift_speed) - time_offset;
+    return drift2time(xsign, xorig, time_offset, drift_speed, drift);
+}
+// doc sbnd_xin/119 round 3: the _cs forms carry each body TEXTUALLY UNCHANGED from the angle form
+// it replaces -- only cos(angle)/sin(angle) are hoisted to parameters.  Deliberately two copies
+// and not one delegating to the other: keeping each expression exactly as it compiles today is
+// what makes the hoist byte-identical, and doc pdvd/101's round(cont) == wind identity is a
+// separate claim this round does not lean on.
+int Facade::point2wind_cs(const geo_point_t& point, const double cos_angle, const double sin_angle, const double pitch, const double center)
+{
+    // y = mag * wind + center
+    double y = cos_angle * point[2] - sin_angle * point[1];
+    double wind = (y - center) / pitch - 0.5; // subtract 0.5 to match WCP (wire center vs. edge difference ...) ...
+    return std::round(wind);
+}
+double Facade::point2wind_cont_cs(const geo_point_t& point, const double cos_angle, const double sin_angle, const double pitch, const double center)
+{
+    // doc pdvd/101: point2wind before the rounding (same expression, so the rounding of this is point2wind).
+    double y = cos_angle * point[2] - sin_angle * point[1];
+    return (y - center) / pitch - 0.5;
 }
 int Facade::point2wind(const geo_point_t& point, const double angle, const double pitch, const double center)
 {
     // double y = cos(angles[pind]) * point[2] - sin(angles[pind]) * point[1];
-    // y = mag * wind + center
-    double y = cos(angle) * point[2] - sin(angle) * point[1];
-    double wind = (y - center) / pitch - 0.5; // subtract 0.5 to match WCP (wire center vs. edge difference ...) ...
-    return std::round(wind);
+    return point2wind_cs(point, cos(angle), sin(angle), pitch, center);
+}
+double Facade::point2wind_cont(const geo_point_t& point, const double angle, const double pitch, const double center)
+{
+    return point2wind_cont_cs(point, cos(angle), sin(angle), pitch, center);
 }
 
 

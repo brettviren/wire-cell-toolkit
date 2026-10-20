@@ -39,6 +39,121 @@ namespace WireCell::Clus::Steiner {
             // std::map<int, std::map<int, WireCell::IBlobSampler::pointer>> samplers;
             /// Enable per-step timing printouts (set via grapher_config.perf = true)
             bool perf{false};
+
+            /// doc pr/29 D1.  Wire slack, in wires, used ONLY by the Steiner
+            /// terminal filter (filter_by_reference_cluster).  The WCP
+            /// prototype tests terminal containment with one wire of slack on
+            /// each side of all three planes
+            /// (PR3DCluster_steiner.h:285-290, :310-315, :336-341) while its
+            /// get_extreme_wcps filter uses none (PR3DCluster_path.h:111-119).
+            /// The toolkit implements both with one function, so the slack has
+            /// to be a per-call-site parameter rather than an edit.
+            /// 0 = the historical toolkit behaviour (no slack anywhere);
+            /// 1 = prototype parity for the terminal filter alone.
+            int terminal_wire_tol{0};
+
+            /// doc pr/29 D12.  When true, the terminal filter's adjacent-slice
+            /// fallback steps by the face's nticks-per-slice instead of by 1.
+            /// The map it searches is keyed in TICKS, so the historical step of
+            /// 1 never resolves and the whole fallback is dead code on any
+            /// detector with more than one tick per slice (SBND: 4).
+            /// false = that historical dead branch, bit-for-bit;
+            /// true = the prototype's t, t+-1 slice search actually happens.
+            bool terminal_adjacent_slice{false};
+
+            /// doc pr/29 D2.  Forward create_steiner_tree's
+            /// disable_dead_mix_cell down to the edge-weight charge
+            /// calculation instead of letting create_enhanced_steiner_graph's
+            /// `= true` default win.  The prototype computes the Qs/Qt that
+            /// enter the edge weight with the SAME false it was called with
+            /// (PR3DCluster_steiner.h:514,:521 inheriting
+            /// Create_steiner_tree's parameter, passed false at
+            /// create_steiner_graph:46); the toolkit drops the argument at the
+            /// call and silently takes the other branch of calc_charge_wcp.
+            /// The two branches differ in which planes enter the RMS: `true`
+            /// sums all three then subtracts DEAD planes
+            /// (charge_uncertainty > 1e10), `false` sums only planes with a
+            /// NONZERO charge value.  Those predicates are independent, so
+            /// this is not a no-op wherever they disagree.
+            /// false = the historical toolkit behaviour (always `true`
+            /// downstream, whatever the caller asked for);
+            /// true = prototype parity, the caller's value is honoured.
+            bool edge_charge_forward_dead_mix{false};
+
+            /// doc pdvd/25 M3.  Per-point charge floor (electrons, per plane and
+            /// on the plane-RMS) below which a point cannot be a Steiner
+            /// terminal (find_peak_point_indices).  4000 is the WCP prototype
+            /// constant, tuned to uBooNE's 3 mm pitch: on PDVD (7.65 / 5.10 mm
+            /// pitch, stepped sampling) the W-plane per-point charge has a
+            /// median of ~1400 e and only ~12 % of points clear 4000 on all
+            /// three planes, so a fifth of the mains get NO terminals at all
+            /// (a 3 m track included).  Default 4000 = bit-for-bit the
+            /// historical behaviour; PDVD sets its own value.
+            double terminal_charge_threshold{4000.0};
+
+            /// doc pdvd/37 R1.  Minimum spacing, a real length in the WCT
+            /// system of units, enforced ACROSS blob boundaries on the Steiner
+            /// terminal set before the extreme points are added.
+            ///
+            /// Why a separate pass rather than a wider suppression radius:
+            /// find_peak_point_indices runs once per blob
+            /// (find_steiner_terminals, SteinerGrapher.cxx), and its
+            /// map_index_charge holds only that blob's points, so an
+            /// out-of-blob neighbour is skipped and the local-maximum test can
+            /// never remove a blob's LAST candidate.  Terminal density is
+            /// therefore floored at the candidate-bearing blob density (doc
+            /// pdvd/31 round 6 measured 1.02 terminals per such blob), i.e. it
+            /// is set by the time-slice pitch and the track's drift alignment
+            /// rather than by anything physical.  Doc pdvd/37 sec.3.2 confirms
+            /// that law on PDVD, SBND and uBooNE alike.
+            ///
+            /// 0 (the default) = no thinning, bit-for-bit the historical
+            /// behaviour.  A positive value keeps terminals greedily in
+            /// DECREASING charge order, admitting one only when no
+            /// already-kept terminal lies strictly within it.
+            double terminal_min_separation{0.0};
+
+            /// doc pdvd/114.  Blank-plane admission policy for the Phase-1
+            /// terminal candidates of one blob, applied BEFORE the per-blob
+            /// peak search (see WireCellClus/SteinerBlankPlane.h).
+            /// calc_charge_wcp (disable_dead_mix_cell = false, the value this
+            /// chain passes) lets a plane at charge exactly 0 pass and grades
+            /// the point on its other planes, so a point on two bright planes
+            /// and one empty (painted or dead) cell is a terminal candidate;
+            /// docs 112-114 measured that the Steiner seed leaves the image
+            /// through such points, and that about three in four of them sit
+            /// in a blob that ALSO holds a three-plane on-image candidate.
+            ///   "wcp"            no policy: bit-for-bit the historical
+            ///                    behaviour (the default);
+            ///   "prefer3"        a candidate with a zero plane is dropped when
+            ///                    the blob holds a three-plane candidate;
+            ///   "nearby"         ... when a three-plane candidate of the
+            ///                    cluster lies within terminal_blank_plane_radius;
+            ///   "prefer3+nearby" both.
+            /// A blob whose candidates all have a zero plane is never touched,
+            /// so a dead or inefficient region keeps its terminals and the
+            /// graph bridges it as before.
+            std::string terminal_blank_plane_mode{"wcp"};
+            /// Radius (WCT length units) of the "nearby" query; <= 0 disables
+            /// the nearby half.  Only read when the mode names "nearby".
+            double terminal_blank_plane_radius{0.0};
+
+            /// doc pdvd/115.  Charge-aware pricing of the BASE graph before
+            /// the Voronoi step of create_enhanced_steiner_graph (see
+            /// WireCellClus/SteinerBaseWeight.h).  Each base edge weight is
+            /// multiplied by 1 + alpha * 0.5 * (nz(s) + nz(t)), nz = number of
+            /// planes at charge exactly 0 at the endpoint, so the tree's
+            /// interiors (the vertices on the Dijkstra paths, admitted with no
+            /// charge test) prefer on-image routes where one exists.  0 (the
+            /// default) = no pricing: bit-for-bit the historical behaviour, the
+            /// priced copy is never built.
+            double base_weight_blank_alpha{0.0};
+            /// "tree" (default): the priced graph drives the Voronoi and the
+            /// bridge selection only; the reduced graph keeps the GEOMETRIC
+            /// length times the production charge factor.  "tree+path": the
+            /// priced length also enters the reduced graph, so the STM rough
+            /// path avoids blank interiors too.  Only read when alpha > 0.
+            std::string base_weight_scope{"tree"};
         };
         Log::logptr_t log;
 
@@ -138,13 +253,33 @@ namespace WireCell::Clus::Steiner {
         vertex_set find_peak_point_indices(const std::vector<const Facade::Blob*>& target_blobs, const std::string& graph_name,
                                    bool disable_dead_mix_cell = true, int nlevel = 1);
         /// Overload that accepts a precomputed point set for the target blobs, avoiding a rebuild of form_cell_points_map().
+        ///
+        /// doc pdvd/31 round 7: `n_candidate_points`, when non-null, receives the
+        /// number of points that cleared terminal_charge_threshold BEFORE the
+        /// local-maximum suppression ran.  That is the threshold's point-level
+        /// selectivity, which the blob-level counter alone cannot separate from
+        /// blob size -- PDVD blobs are geometrically larger than SBND's, so
+        /// equal candidate-BEARING-blob fractions do not imply equal
+        /// selectivity.  Measurement only; nullptr (the default) leaves every
+        /// caller unchanged.
         vertex_set find_peak_point_indices(const vertex_set& blob_point_indices, const std::string& graph_name,
-                                   bool disable_dead_mix_cell = true, int nlevel = 1);
+                                   bool disable_dead_mix_cell = true, int nlevel = 1,
+                                   size_t* n_candidate_points = nullptr);
 
         blob_vertex_map form_cell_points_map();
         vertex_set find_steiner_terminals(const std::string& graph_name, bool disable_dead_mix_cell=true);
         /// Overload that accepts a precomputed blob->points map to avoid calling form_cell_points_map() twice.
         vertex_set find_steiner_terminals(const std::string& graph_name, bool disable_dead_mix_cell, const blob_vertex_map& cell_points_map);
+
+        /// doc pdvd/37 R1.  Thin @p terminals so that no two survivors lie
+        /// closer than Config::terminal_min_separation, walking them in
+        /// decreasing charge order.  The charge is Cluster::calc_charge_wcp
+        /// evaluated with the SAME terminal_charge_threshold and
+        /// @p disable_dead_mix_cell that selected them in phase 1, so the
+        /// survivor of a crowd is the member the peak finder itself ranks
+        /// highest.  Returns @p terminals unchanged when the knob is <= 0.
+        vertex_set thin_terminals_by_separation(const vertex_set& terminals,
+                                                bool disable_dead_mix_cell);
 
         /// Establish edges between points in the same blob (mcell) with weighted connectivity
         /// This modifies the given graph and tracks added edges for later removal
@@ -225,6 +360,11 @@ namespace WireCell::Clus::Steiner {
         // Enable per-step timing printouts inside hot functions
         bool m_perf{false};
 
+        // doc pdvd/114: per-point cache for the "nearby" blank-plane policy
+        // (-1 unknown, 0 not a three-plane candidate, 1 is one).  Sized on
+        // first use in a nearby mode; never touched under "wcp".
+        mutable std::vector<signed char> m_live3_cache;
+
 
         // XIN: add any more data and methods you need here.  
          /// Track edges added by each graph modification operation.
@@ -269,10 +409,21 @@ namespace WireCell::Clus::Steiner {
 
 
         /// Check if a point is spatially related to reference cluster's time-blob mapping
+        /// @param wire_tol wire slack (Config::terminal_wire_tol); 0 = historical
+        /// @param slice_stride adjacent-slice key step in TICKS; 1 = historical
+        ///        (and, on any detector with >1 tick per slice, never matches)
         bool is_point_spatially_related_to_reference(
             size_t point_idx,
-            const Facade::Cluster::time_blob_map_t& ref_time_blob_map
+            const Facade::Cluster::time_blob_map_t& ref_time_blob_map,
+            int wire_tol = 0,
+            int slice_stride = 1
         ) const;
+
+        /// Ticks per slice for (apa, face), the correct step for an
+        /// adjacent-slice lookup in a time_blob_map.  Returns 1 -- the
+        /// historical, never-matching step -- when the grouping does not know
+        /// this face, rather than throwing out of a hot filter loop.
+        int nticks_per_slice_or_1(int apa, int face) const;
 
 
 
@@ -331,14 +482,26 @@ namespace WireCell::Clus::Graphs::Weighted {
             std::map<vertex_type, double> vertex_charges;        // calculated charges
         };
 
-        /// Create steiner graph with full prototype matching functionality
+        /// Create steiner graph with full prototype matching functionality.
+        ///
+        /// doc pdvd/115: `routing_graph`, when given, is a priced COPY of
+        /// base_graph (same vertex indices, same edge set,
+        /// SteinerBaseWeight.h) that drives the Voronoi tessellation, the
+        /// bridge selection and the path back-walk in place of base_graph.
+        /// The reduced graph's edge weight then multiplies the production
+        /// charge factor onto the base_graph (geometric) weight of the edge,
+        /// or onto the routing weight when `priced_path` is true.  With
+        /// routing_graph == nullptr (the default) the code path is the
+        /// historical one, bit for bit.
         EnhancedSteinerResult create_enhanced_steiner_graph(
             const graph_type& base_graph,
             const vertex_set& terminal_vertices,
             const PointCloud::Dataset& original_pc,
             const WireCell::Clus::Facade::Cluster& cluster,
             const ChargeWeightingConfig& charge_config = ChargeWeightingConfig{},
-            bool disable_dead_mix_cell = true
+            bool disable_dead_mix_cell = true,
+            const graph_type* routing_graph = nullptr,
+            bool priced_path = false
         );
 
         void establish_same_blob_steiner_edges_steiner_graph(EnhancedSteinerResult& result, 
